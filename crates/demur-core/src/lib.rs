@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod cost;
+pub mod delta;
 pub mod diff;
 pub mod ingest;
 pub mod pipeline;
