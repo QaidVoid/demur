@@ -226,6 +226,7 @@ mod tests {
             thinking_budget,
             extra_body: None,
             extra_headers: None,
+            cached_input_price: None,
         };
         AnthropicClient::new(&provider, &model, "sk-ant-test".to_string()).unwrap()
     }

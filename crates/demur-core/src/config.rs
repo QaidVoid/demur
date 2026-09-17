@@ -20,7 +20,8 @@ pub const DEFAULT_DEEP_CALLS: u32 = 12;
 /// Built-in maximum number of published findings per review.
 pub const DEFAULT_COMMENTS: u32 = 10;
 
-const MINIMAL_EXAMPLE: &str = r#"
+/// A minimal working configuration, shown when required settings are absent.
+pub const MINIMAL_EXAMPLE: &str = r#"
 [providers.openai]
 family = "openai"
 base_url = "https://api.openai.com/v1"
@@ -288,6 +289,9 @@ pub struct ModelDef {
     pub input_price: f64,
     /// Output price in USD per million tokens.
     pub output_price: f64,
+    /// Cached input price in USD per million tokens. Defaults to half the
+    /// input price when absent.
+    pub cached_input_price: Option<f64>,
     /// OpenAI reasoning effort: minimal, low, medium, or high.
     pub reasoning_effort: Option<String>,
     /// Anthropic thinking budget in tokens.
@@ -436,6 +440,12 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         if model.output_price < 0.0 {
             return Err(ConfigError::Invalid {
                 field: format!("{role}.output_price"),
+                message: "must be zero or positive".to_string(),
+            });
+        }
+        if model.cached_input_price.is_some_and(|price| price < 0.0) {
+            return Err(ConfigError::Invalid {
+                field: format!("{role}.cached_input_price"),
                 message: "must be zero or positive".to_string(),
             });
         }

@@ -261,6 +261,7 @@ mod tests {
             thinking_budget: None,
             extra_body: None,
             extra_headers: None,
+            cached_input_price: None,
         };
         OpenAiClient::new(&provider, &model, "sk-test-key".to_string()).unwrap()
     }
