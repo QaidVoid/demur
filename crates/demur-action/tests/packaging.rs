@@ -12,6 +12,32 @@ fn load(path: &str) -> Value {
 }
 
 #[test]
+fn release_workflow_builds_all_targets_and_attaches_artifacts() {
+    let workflow = load(".github/workflows/release.yml");
+    let matrix = &workflow["jobs"]["build"]["strategy"]["matrix"]["include"];
+    let targets: Vec<&str> = matrix
+        .as_sequence()
+        .expect("build matrix")
+        .iter()
+        .map(|entry| entry["target"].as_str().expect("target"))
+        .collect();
+    assert!(targets.contains(&"x86_64-unknown-linux-gnu"));
+    assert!(targets.contains(&"aarch64-unknown-linux-gnu"));
+    assert!(targets.contains(&"aarch64-apple-darwin"));
+    let release_job = &workflow["jobs"]["release"];
+    assert!(
+        release_job["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .any(|step| step["name"]
+                .as_str()
+                .is_some_and(|name| name.contains("Create the release"))),
+        "release job must attach artifacts to the release"
+    );
+}
+
+#[test]
 fn composite_action_declares_expected_surface() {
     let action = load("action.yml");
     assert_eq!(action["runs"]["using"], "composite");
