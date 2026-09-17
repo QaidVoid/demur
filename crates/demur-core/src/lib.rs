@@ -6,3 +6,4 @@
 //! GitHub Action binaries are thin wrappers over this library.
 
 pub mod config;
+pub mod provider;
