@@ -49,7 +49,7 @@ pub struct ModelFindings {
 }
 
 /// A validated finding anchored to the pull request diff.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
     /// File path the finding cites, matching a path in the diff.
     pub file: String,

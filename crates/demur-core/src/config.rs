@@ -103,7 +103,7 @@ pub enum Profile {
 }
 
 /// Finding severities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Below warning. Never blocks by itself.

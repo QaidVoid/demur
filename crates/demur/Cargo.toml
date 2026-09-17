@@ -11,8 +11,15 @@ name = "demur"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
 demur-core = { path = "../demur-core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"
