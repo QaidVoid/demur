@@ -107,7 +107,17 @@ async fn run() -> Result<(), String> {
     let workspace = std::env::var("GITHUB_WORKSPACE")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."));
-    let config = Config::load(&workspace.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
+    let mut config =
+        Config::load(&workspace.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
+    if let Ok(profile) = std::env::var("DEMUR_PROFILE")
+        && !profile.is_empty()
+    {
+        config.profile = Some(
+            profile
+                .parse()
+                .map_err(|err| format!("DEMUR_PROFILE: invalid profile `{profile}`: {err}"))?,
+        );
+    }
 
     // The fork path: without a provider key there is nothing this job can
     // do, so it explains itself in the job summary and exits successfully

@@ -1,0 +1,34 @@
+# Example workflow for repositories installing demur.
+#
+# The permissions block is exactly what the bot needs and nothing else:
+# write access to pull requests and check runs, read access to contents.
+# The concurrency group cancels an in-flight review when a new push
+# arrives, so a superseded verdict can never land on a newer head.
+name: demur review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  pull-requests: write
+  checks: write
+  contents: read
+
+concurrency:
+  group: demur-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: qaidvoid/review-bot@v0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          demur_version: v0.1.0
+        env:
+          # Name this variable exactly as key_env in your .demur.toml.
+          OPENAI_API_KEY: ${{ secrets.DEMUR_PROVIDER_KEY }}

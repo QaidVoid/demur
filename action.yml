@@ -1,0 +1,51 @@
+name: 'demur'
+description: >-
+  BYOK adversarial AI code review. Reviews a pull request with the
+  repository owner's own LLM key and argues why it should not be merged.
+branding:
+  icon: 'shield'
+  color: 'red'
+
+inputs:
+  github_token:
+    description: >-
+      GitHub token. The job must run with permissions limited to
+      pull-requests: write, checks: write, and contents: read. Nothing else.
+    required: false
+    default: ${{ github.token }}
+  demur_version:
+    description: 'demur release tag to download the prebuilt binary from.'
+    required: false
+    default: 'v0.1.0'
+  profile:
+    description: >-
+      Review depth profile override: quick, standard, or deep. Overrides the
+      profile in .demur.toml for this run.
+    required: false
+    default: ''
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Download demur binary
+      shell: bash
+      env:
+        DEMUR_VERSION: ${{ inputs.demur_version }}
+      run: |
+        set -euo pipefail
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target="x86_64-unknown-linux-gnu" ;;
+          Linux-aarch64) target="aarch64-unknown-linux-gnu" ;;
+          Darwin-arm64) target="aarch64-apple-darwin" ;;
+          *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+        esac
+        mkdir -p /tmp/demur-bin
+        url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${DEMUR_VERSION}/demur-${DEMUR_VERSION}-${target}.tar.gz"
+        curl --fail --silent --show-error --location "$url" | tar -xz -C /tmp/demur-bin
+        chmod +x /tmp/demur-bin/demur-action
+    - name: Run review
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        DEMUR_PROFILE: ${{ inputs.profile }}
+      run: /tmp/demur-bin/demur-action

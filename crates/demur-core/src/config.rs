@@ -91,7 +91,7 @@ pub enum Family {
 }
 
 /// Review depth profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
     /// Triage and verdict only.
@@ -100,6 +100,21 @@ pub enum Profile {
     Standard,
     /// All passes including cross-examination.
     Deep,
+}
+
+impl std::str::FromStr for Profile {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Profile, String> {
+        match text {
+            "quick" => Ok(Profile::Quick),
+            "standard" => Ok(Profile::Standard),
+            "deep" => Ok(Profile::Deep),
+            other => Err(format!(
+                "`{other}` is not a profile, allowed values: quick, standard, deep"
+            )),
+        }
+    }
 }
 
 /// Finding severities.

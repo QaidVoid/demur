@@ -20,5 +20,6 @@ tokio = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+serde_yaml = "0.9.34"
 tempfile = "3.27.0"
 wiremock = "0.6.5"
