@@ -1,0 +1,18 @@
+[package]
+name = "demur"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Local CLI for demur, a BYOK code review bot"
+
+[[bin]]
+name = "demur"
+path = "src/main.rs"
+
+[dependencies]
+demur-core = { path = "../demur-core" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

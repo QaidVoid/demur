@@ -1,0 +1,12 @@
+[package]
+name = "demur-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Review pipeline core for demur, a BYOK code review bot"
+
+[dependencies]
+
+[lints]
+workspace = true

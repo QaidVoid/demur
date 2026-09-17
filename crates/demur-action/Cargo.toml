@@ -1,0 +1,18 @@
+[package]
+name = "demur-action"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "GitHub Action binary for demur, a BYOK code review bot"
+
+[[bin]]
+name = "demur-action"
+path = "src/main.rs"
+
+[dependencies]
+demur-core = { path = "../demur-core" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true
