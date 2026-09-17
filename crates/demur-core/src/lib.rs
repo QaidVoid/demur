@@ -9,4 +9,5 @@ pub mod config;
 pub mod cost;
 pub mod diff;
 pub mod ingest;
+pub mod pipeline;
 pub mod provider;

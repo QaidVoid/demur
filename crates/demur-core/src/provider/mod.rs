@@ -195,6 +195,19 @@ impl ProviderRegistry {
             verdict: build_role(&config.models.verdict, config)?,
         })
     }
+
+    /// Build a registry of recorded providers, for fixture harness runs.
+    pub fn recorded(
+        triage: crate::pipeline::RecordedProvider,
+        deep: crate::pipeline::RecordedProvider,
+        verdict: crate::pipeline::RecordedProvider,
+    ) -> ProviderRegistry {
+        ProviderRegistry {
+            triage: AnyProvider::Recorded(triage),
+            deep: AnyProvider::Recorded(deep),
+            verdict: AnyProvider::Recorded(verdict),
+        }
+    }
 }
 
 fn build_role(model: &ModelDef, config: &Config) -> Result<AnyProvider, ProviderError> {
@@ -220,6 +233,8 @@ pub enum AnyProvider {
     OpenAi(OpenAiClient),
     /// The native Anthropic API.
     Anthropic(AnthropicClient),
+    /// Recorded responses, for the fixture harness and offline replay.
+    Recorded(crate::pipeline::RecordedProvider),
 }
 
 impl Provider for AnyProvider {
@@ -230,6 +245,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAi(client) => client.complete(request).await,
             AnyProvider::Anthropic(client) => client.complete(request).await,
+            AnyProvider::Recorded(client) => client.complete(request).await,
         }
     }
 }
