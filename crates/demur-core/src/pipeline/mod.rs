@@ -10,6 +10,7 @@ pub mod synthesis;
 mod tests;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use crate::config::{Config, Lenses, Profile};
 use crate::cost::{ModelPrice, estimate_tokens};
@@ -99,6 +100,9 @@ pub struct PipelineInput {
     pub prior_spend: f64,
     /// Unresolved findings carried forward from earlier runs.
     pub carried_findings: Vec<findings::Finding>,
+    /// Fingerprints a human dismissed. Fresh findings matching them stay
+    /// silent.
+    pub suppress_fingerprints: HashSet<String>,
 }
 
 /// Spend for one pass.
@@ -225,6 +229,20 @@ you can already anchor to an exact file and line range with its concrete harm.";
     });
     for raw in &triage_output.findings {
         if let Some(finding) = findings::validate(raw, &diff_paths) {
+            let hunks = input
+                .ingestion
+                .clusters
+                .iter()
+                .find(|cluster| cluster.path == finding.file)
+                .map(|cluster| &cluster.hunks);
+            let suppressed = hunks.is_some_and(|hunks| {
+                input
+                    .suppress_fingerprints
+                    .contains(&crate::delta::fingerprint(&finding, hunks))
+            });
+            if suppressed {
+                continue;
+            }
             all_findings.push(finding);
         }
     }
@@ -327,6 +345,12 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 });
                 for raw in &dive_output.findings {
                     if let Some(finding) = findings::validate(raw, &diff_paths) {
+                        if input
+                            .suppress_fingerprints
+                            .contains(&crate::delta::fingerprint(&finding, &cluster.hunks))
+                        {
+                            continue;
+                        }
                         all_findings.push(finding);
                     }
                 }
@@ -380,6 +404,20 @@ with their concrete harm.";
             });
             for raw in &cross_output.findings {
                 if let Some(finding) = findings::validate(raw, &diff_paths) {
+                    let hunks = input
+                        .ingestion
+                        .clusters
+                        .iter()
+                        .find(|cluster| cluster.path == finding.file)
+                        .map(|cluster| &cluster.hunks);
+                    let suppressed = hunks.is_some_and(|hunks| {
+                        input
+                            .suppress_fingerprints
+                            .contains(&crate::delta::fingerprint(&finding, hunks))
+                    });
+                    if suppressed {
+                        continue;
+                    }
                     all_findings.push(finding);
                 }
             }

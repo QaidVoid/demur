@@ -7,6 +7,11 @@ mod openai;
 pub use anthropic::AnthropicClient;
 pub use openai::OpenAiClient;
 
+/// First bytes of a provider response body, for error detail.
+pub fn excerpt(body: &str) -> String {
+    openai::body_excerpt(body)
+}
+
 use std::collections::BTreeMap;
 use std::env;
 use std::time::Duration;

@@ -241,7 +241,11 @@ name = "demur-action"
 version = "0.1.0"
 dependencies = [
  "demur-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

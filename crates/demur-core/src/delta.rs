@@ -598,11 +598,15 @@ mod tests {
         assert!(
             decisions
                 .iter()
-                .any(|(f, d)| *d == CarryDecision::Dismissed)
+                .any(|(_, decision)| *decision == CarryDecision::Dismissed)
         );
         // The reproduced finding is not carried twice; the new one is not
         // in the prior marker at all, so no carry decision covers it.
-        assert!(!decisions.iter().any(|(f, d)| *d == CarryDecision::Carried));
+        assert!(
+            !decisions
+                .iter()
+                .any(|(_, decision)| *decision == CarryDecision::Carried)
+        );
     }
 
     #[test]

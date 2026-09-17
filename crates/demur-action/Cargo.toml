@@ -12,7 +12,13 @@ path = "src/main.rs"
 
 [dependencies]
 demur-core = { path = "../demur-core" }
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+wiremock = "0.6.5"

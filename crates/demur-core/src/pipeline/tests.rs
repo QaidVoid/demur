@@ -81,6 +81,7 @@ fn input() -> PipelineInput {
         diff_text: DIFF.to_string(),
         prior_spend: 0.0,
         carried_findings: Vec::new(),
+        suppress_fingerprints: std::collections::HashSet::new(),
     }
 }
 
@@ -356,6 +357,7 @@ async fn carried_blocker_sets_the_verdict_on_a_clean_delta() {
     };
     let mut run_input = input();
     run_input.carried_findings = vec![carried];
+    let _ = &run_input;
     // Empty lens lists mean no deep dives: a clean delta.
     let providers = registry(vec![vec![triage], vec![], vec![summary_response()]]);
     let outcome = crate::pipeline::run(&providers, &config, &run_input)

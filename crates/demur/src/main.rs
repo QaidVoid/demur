@@ -5,6 +5,7 @@
 
 mod input;
 mod output;
+mod pr;
 
 use clap::Parser;
 use clap::Subcommand;
@@ -20,11 +21,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 /// Exit status for APPROVE.
-const EXIT_APPROVE: u8 = 0;
+pub(crate) const EXIT_APPROVE: u8 = 0;
 /// Exit status for REQUEST_CHANGES.
-const EXIT_REQUEST_CHANGES: u8 = 1;
+pub(crate) const EXIT_REQUEST_CHANGES: u8 = 1;
 /// Exit status for a run that failed to complete.
-const EXIT_FAILED: u8 = 2;
+pub(crate) const EXIT_FAILED: u8 = 2;
 
 #[derive(Parser)]
 #[command(
@@ -50,10 +51,25 @@ enum Command {
         #[arg(long, default_value = "markdown")]
         format: Format,
     },
+    /// Review a GitHub pull request by number or URL. Read-only unless
+    /// --publish is passed.
+    ReviewPr {
+        /// Pull request number or full URL.
+        target: String,
+        /// Repository root. Defaults to the current directory.
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, default_value = "markdown")]
+        format: Format,
+        /// Publish the review under your own identity.
+        #[arg(long)]
+        publish: bool,
+    },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
-enum Format {
+pub(crate) enum Format {
     /// Human-readable markdown.
     Markdown,
     /// Machine-readable JSON.
@@ -69,6 +85,18 @@ async fn main() -> ExitCode {
             repo,
             format,
         } => match review(range, repo, format).await {
+            Ok(status) => ExitCode::from(status),
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::from(EXIT_FAILED)
+            }
+        },
+        Command::ReviewPr {
+            target,
+            repo,
+            format,
+            publish,
+        } => match pr::review_pr(target, repo, format, publish).await {
             Ok(status) => ExitCode::from(status),
             Err(err) => {
                 eprintln!("{err}");
@@ -116,6 +144,7 @@ async fn review(
         diff_text: diff,
         prior_spend: 0.0,
         carried_findings: Vec::new(),
+        suppress_fingerprints: std::collections::HashSet::new(),
     };
 
     match demur_core::pipeline::run(&registry, &config, &pipeline_input).await {

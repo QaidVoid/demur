@@ -1,0 +1,68 @@
+//! Publication: exactly one review event carrying the synthesized verdict,
+//! inline comments with suggestion blocks, and the check run whose
+//! conclusion reflects that verdict. Nothing partial is published.
+
+use super::{GitHubClient, GitHubError, InlineComment, ReviewEvent};
+use crate::delta::Marker;
+use crate::pipeline::synthesis::Verdict;
+
+/// How publication went.
+#[derive(Debug, Clone)]
+pub struct Publication {
+    /// The event actually submitted, after any fallback.
+    pub event_submitted: ReviewEvent,
+    /// True when the approving review was rejected and a comment review
+    /// carried the same body instead.
+    pub fallback_used: bool,
+}
+
+/// Publish the review and the check run. The verdict is an input here:
+/// publication never recomputes it. Inline comments are only created for
+/// findings anchored in the current diff; carried findings live in the
+/// body so they are never posted twice.
+pub async fn publish_review(
+    client: &GitHubClient,
+    number: u64,
+    head_sha: &str,
+    verdict: Verdict,
+    body: &str,
+    marker: Option<&Marker>,
+    comments: &[InlineComment],
+) -> Result<Publication, GitHubError> {
+    let body_with_marker = match marker {
+        Some(marker) => format!("{}\n\n{}", body, marker.encode()),
+        None => body.to_string(),
+    };
+    let event = match verdict {
+        Verdict::Approve => ReviewEvent::Approve,
+        Verdict::RequestChanges => ReviewEvent::RequestChanges,
+    };
+    let approved = client
+        .create_review(number, event, &body_with_marker, comments)
+        .await?;
+    let (event_submitted, fallback_used, body) = if approved {
+        (event, false, body_with_marker)
+    } else {
+        let comment_body = format!(
+            "{body_with_marker}\n\nNote: the approval could not be submitted under the \
+current identity, so this review was posted as a comment. The check run carries \
+the verdict."
+        );
+        client
+            .create_review(number, ReviewEvent::Comment, &comment_body, comments)
+            .await?;
+        (ReviewEvent::Comment, true, comment_body)
+    };
+
+    let (title, conclusion) = match verdict {
+        Verdict::Approve => ("demur: no case against merging", "success"),
+        Verdict::RequestChanges => ("demur: changes requested", "failure"),
+    };
+    client
+        .create_check_run(head_sha, conclusion, title, &body)
+        .await?;
+    Ok(Publication {
+        event_submitted,
+        fallback_used,
+    })
+}
