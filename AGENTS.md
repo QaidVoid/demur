@@ -58,7 +58,15 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
-- Rebuild the VitePress docs after changing the configuration schema or
-  documented behavior.
+Run everything with one command:
+
+```bash
+scripts/gate.sh
+```
+
+- The docs build is part of the gate: a test fails when a configuration
+  schema key is missing from the configuration reference page, so rebuild
+  the VitePress docs after changing the configuration schema or documented
+  behavior.
 - Add dependencies only with `cargo add`. Never hand-edit `Cargo.toml` to
   add, remove, or bump one.

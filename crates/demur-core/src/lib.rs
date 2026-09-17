@@ -6,6 +6,8 @@
 //! GitHub Action binaries are thin wrappers over this library.
 
 pub mod config;
+#[cfg(test)]
+mod config_docs;
 pub mod cost;
 pub mod delta;
 pub mod diff;

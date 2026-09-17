@@ -6,6 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 
 /// Name of the configuration file at the repository root.
@@ -81,7 +82,7 @@ pub enum ConfigError {
 }
 
 /// Provider families the bot speaks natively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
     /// Any OpenAI-compatible endpoint with a configurable base URL.
@@ -141,7 +142,7 @@ impl Severity {
 }
 
 /// The parsed `.demur.toml` configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Review depth profile. Absent means standard.
@@ -168,7 +169,7 @@ pub struct Config {
 }
 
 /// Deep dive lens toggles.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Lenses {
     /// Logic errors, edge cases, broken contracts.
@@ -193,7 +194,7 @@ impl Default for Lenses {
 }
 
 /// The severities whose findings force REQUEST_CHANGES.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BlockOn {
     /// Blocking severities. Absent means blocker alone.
@@ -214,7 +215,7 @@ fn default_block_on() -> Vec<Severity> {
 }
 
 /// Path patterns excluded from every pass.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ignore {
     /// Glob patterns matched against repository-relative paths.
@@ -223,7 +224,7 @@ pub struct Ignore {
 }
 
 /// The per-pull-request spending cap.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     /// Cap in USD over the pull request's cumulative recorded spend.
@@ -254,7 +255,7 @@ pub enum BudgetCap {
 }
 
 /// Fan-out and publication limits.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Maximum deep dive calls per run.
@@ -273,7 +274,7 @@ impl Default for Limits {
 }
 
 /// A named provider endpoint.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDef {
     /// Provider family dialect.
@@ -293,7 +294,7 @@ pub struct ProviderDef {
 }
 
 /// The model assigned to a pipeline role.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
     /// Name of the provider in the providers table.
@@ -320,7 +321,7 @@ pub struct ModelDef {
 }
 
 /// The model role assignments. Every role is required.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Models {
     /// Cheap model for the triage pass.
