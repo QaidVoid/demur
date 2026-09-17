@@ -126,6 +126,7 @@ impl Severity {
 
 /// The parsed `.demur.toml` configuration.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     /// Review depth profile. Absent means standard.
     pub profile: Option<Profile>,
@@ -152,7 +153,7 @@ pub struct Config {
 
 /// Deep dive lens toggles.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Lenses {
     /// Logic errors, edge cases, broken contracts.
     pub correctness: bool,
@@ -177,6 +178,7 @@ impl Default for Lenses {
 
 /// The severities whose findings force REQUEST_CHANGES.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockOn {
     /// Blocking severities. Absent means blocker alone.
     #[serde(default = "default_block_on")]
@@ -197,6 +199,7 @@ fn default_block_on() -> Vec<Severity> {
 
 /// Path patterns excluded from every pass.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ignore {
     /// Glob patterns matched against repository-relative paths.
     #[serde(default)]
@@ -205,6 +208,7 @@ pub struct Ignore {
 
 /// The per-pull-request spending cap.
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Budget {
     /// Cap in USD over the pull request's cumulative recorded spend.
     pub per_pr_usd: Option<f64>,
@@ -235,7 +239,7 @@ pub enum BudgetCap {
 
 /// Fan-out and publication limits.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Maximum deep dive calls per run.
     pub deep_calls: u32,
@@ -254,6 +258,7 @@ impl Default for Limits {
 
 /// A named provider endpoint.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderDef {
     /// Provider family dialect.
     pub family: Family,
@@ -273,6 +278,7 @@ pub struct ProviderDef {
 
 /// The model assigned to a pipeline role.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelDef {
     /// Name of the provider in the providers table.
     pub provider: String,
@@ -296,6 +302,7 @@ pub struct ModelDef {
 
 /// The model role assignments. Every role is required.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Models {
     /// Cheap model for the triage pass.
     pub triage: ModelDef,
@@ -324,7 +331,10 @@ impl Config {
     pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
         let config: Config = toml::from_str(text).map_err(|err| {
             let mut message = err.message().to_string();
-            if message.starts_with("missing field") {
+            if let Some(location) = syntax_location(text, err.span()) {
+                message = format!("{message} at {location}");
+            }
+            if err.message().starts_with("missing field") {
                 message.push('\n');
                 message.push_str(REQUIRED_FIELDS);
                 message.push_str("\nminimal example:\n");
@@ -335,8 +345,135 @@ impl Config {
                 message,
             }
         })?;
+        validate(&config)?;
         Ok(config)
     }
+}
+
+/// Human-readable line and column for a TOML span, when the parser has one.
+fn syntax_location(text: &str, span: Option<std::ops::Range<usize>>) -> Option<String> {
+    let start = span?.start;
+    let before = &text[..start.min(text.len())];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rfind('\n')
+        .map_or(before.len(), |i| before.len() - i - 1)
+        + 1;
+    Some(format!("line {line}, column {column}"))
+}
+
+const REASONING_EFFORTS: &str = "minimal, low, medium, high";
+const SEVERITY_VALUES: &str = "blocker, warning, note";
+
+/// Enforce cross-field rules the schema cannot express.
+fn validate(config: &Config) -> Result<(), ConfigError> {
+    match config.budget.cap() {
+        BudgetCap::Limited(amount) if amount < 0.0 => {
+            return Err(ConfigError::Invalid {
+                field: "budget.per_pr_usd".to_string(),
+                message: "must be zero or positive".to_string(),
+            });
+        }
+        _ => {}
+    }
+    if config.budget.per_pr_usd.is_some() && config.budget.unlimited {
+        return Err(ConfigError::Invalid {
+            field: "budget".to_string(),
+            message: "set per_pr_usd or unlimited = true, not both".to_string(),
+        });
+    }
+    if config.block_on.severities.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "block_on.severities".to_string(),
+            message: format!("must name at least one of: {SEVERITY_VALUES}"),
+        });
+    }
+    for (name, provider) in &config.providers {
+        if !provider.base_url.starts_with("https://") && !provider.base_url.starts_with("http://") {
+            return Err(ConfigError::Invalid {
+                field: format!("providers.{name}.base_url"),
+                message: "must be an http or https URL".to_string(),
+            });
+        }
+        if provider.key_env.trim().is_empty() {
+            return Err(ConfigError::Invalid {
+                field: format!("providers.{name}.key_env"),
+                message: "must name the environment variable holding the key".to_string(),
+            });
+        }
+    }
+    let roles = [
+        ("models.triage", &config.models.triage),
+        ("models.deep", &config.models.deep),
+        ("models.verdict", &config.models.verdict),
+    ];
+    for (role, model) in roles {
+        let provider = config.providers.get(&model.provider);
+        let family = match provider {
+            Some(provider) => provider.family,
+            None => {
+                let defined = config
+                    .providers
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.provider"),
+                    message: format!(
+                        "names unknown provider `{}`, defined providers: {defined}",
+                        model.provider
+                    ),
+                });
+            }
+        };
+        if model.input_price < 0.0 {
+            return Err(ConfigError::Invalid {
+                field: format!("{role}.input_price"),
+                message: "must be zero or positive".to_string(),
+            });
+        }
+        if model.output_price < 0.0 {
+            return Err(ConfigError::Invalid {
+                field: format!("{role}.output_price"),
+                message: "must be zero or positive".to_string(),
+            });
+        }
+        if let Some(effort) = &model.reasoning_effort {
+            if family != Family::OpenAi {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.reasoning_effort"),
+                    message:
+                        "applies to openai-compatible providers; for anthropic use thinking_budget"
+                            .to_string(),
+                });
+            }
+            let allowed = ["minimal", "low", "medium", "high"];
+            if !allowed.contains(&effort.as_str()) {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.reasoning_effort"),
+                    message: format!(
+                        "`{effort}` is not valid, allowed values: {REASONING_EFFORTS}"
+                    ),
+                });
+            }
+        }
+        if let Some(budget) = model.thinking_budget {
+            if family != Family::Anthropic {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.thinking_budget"),
+                    message: "applies to the anthropic family; for openai-compatible providers use reasoning_effort".to_string(),
+                });
+            }
+            if budget == 0 {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.thinking_budget"),
+                    message: "must be at least one token".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -497,6 +634,163 @@ output_price = 10.00
         let text = minimal().replace("key_env = \"OPENAI_API_KEY\"\n", "");
         let text = err_text(&text);
         assert!(text.contains("missing field `key_env`"));
+    }
+
+    #[test]
+    fn malformed_toml_reports_syntax_location() {
+        let text = format!("{}\nprofile = quick\n", minimal());
+        let text = err_text(&text);
+        assert!(text.contains(".demur.toml"));
+        assert!(text.contains("line "));
+    }
+
+    #[test]
+    fn unknown_severity_names_field_and_allowed_values() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[block_on]\nseverities = [\"bloker\"]\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("bloker"));
+        assert!(text.contains("expected one of"));
+    }
+
+    #[test]
+    fn misspelled_budget_key_fails_naming_the_key() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[budgett]\nper_pr_usd = 1.0\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("budgett"));
+    }
+
+    #[test]
+    fn empty_block_on_fails() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[block_on]\nseverities = []\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("block_on.severities"));
+        assert!(text.contains(SEVERITY_VALUES));
+    }
+
+    #[test]
+    fn both_budget_settings_fail() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[budget]\nper_pr_usd = 1.0\nunlimited = true\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("budget"));
+        assert!(text.contains("not both"));
+    }
+
+    #[test]
+    fn negative_price_fails_naming_the_field() {
+        let text = minimal().replace("input_price = 2.50", "input_price = -1.0");
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.input_price"));
+    }
+
+    #[test]
+    fn unknown_provider_reference_fails() {
+        let text = minimal().replace(
+            "provider = \"openai\"\nname = \"gpt-4o\"\n",
+            "provider = \"staging\"\nname = \"gpt-4o\"\n",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.provider"));
+        assert!(text.contains("staging"));
+    }
+
+    #[test]
+    fn bad_base_url_fails_naming_the_field() {
+        let text = minimal().replace(
+            "base_url = \"https://api.openai.com/v1\"",
+            "base_url = \"api.openai.com/v1\"",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("providers.openai.base_url"));
+    }
+
+    fn deep_anthropic(extra: &str) -> String {
+        format!(
+            r#"
+[providers.openai]
+family = "openai"
+base_url = "https://api.openai.com/v1"
+key_env = "OPENAI_API_KEY"
+
+[providers.anthropic]
+family = "anthropic"
+base_url = "https://api.anthropic.com"
+key_env = "ANTHROPIC_API_KEY"
+
+[models.triage]
+provider = "openai"
+name = "gpt-4o-mini"
+input_price = 0.15
+output_price = 0.60
+
+[models.deep]
+provider = "anthropic"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+{extra}
+
+[models.verdict]
+provider = "openai"
+name = "gpt-4o-mini"
+input_price = 0.15
+output_price = 0.60
+"#
+        )
+    }
+
+    #[test]
+    fn reasoning_effort_on_anthropic_fails() {
+        let text = err_text(&deep_anthropic("reasoning_effort = \"high\""));
+        assert!(text.contains("models.deep.reasoning_effort"));
+        assert!(text.contains("thinking_budget"));
+    }
+
+    #[test]
+    fn thinking_budget_on_openai_fails() {
+        let text = minimal().replace(
+            "provider = \"openai\"\nname = \"gpt-4o\"\ninput_price = 2.50\noutput_price = 10.00",
+            "provider = \"openai\"\nname = \"gpt-4o\"\ninput_price = 2.50\noutput_price = 10.00\nthinking_budget = 4000",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.thinking_budget"));
+        assert!(text.contains("reasoning_effort"));
+    }
+
+    #[test]
+    fn invalid_reasoning_effort_value_fails_with_allowed_values() {
+        let text = minimal().replace(
+            "name = \"gpt-4o\"",
+            "name = \"gpt-4o\"\nreasoning_effort = \"maximum\"",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.reasoning_effort"));
+        assert!(text.contains(REASONING_EFFORTS));
+    }
+
+    #[test]
+    fn valid_effort_and_budget_translate() {
+        let config = Config::from_toml(&deep_anthropic("thinking_budget = 8000")).unwrap();
+        assert_eq!(config.models.deep.thinking_budget, Some(8000));
+        assert_eq!(config.models.deep.provider, "anthropic");
+
+        let openai_effort = minimal().replace(
+            "name = \"gpt-4o\"",
+            "name = \"gpt-4o\"\nreasoning_effort = \"high\"",
+        );
+        let config = Config::from_toml(&openai_effort).unwrap();
+        assert_eq!(config.models.deep.reasoning_effort, Some("high".into()));
     }
 
     /// Format a config error for assertions.
