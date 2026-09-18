@@ -237,6 +237,29 @@ recorded. A round the budget cannot fund is skipped and disclosed.
 Retrieval is off unless you turn it on, and it is never performed for a pull
 request from a fork.
 
+## `[app]`
+
+demur can act as an application you have authorized, so a review you publish
+is attributed to you and carries demur's mark beside your name.
+
+```toml
+[app]
+client_id = "Iv1.abc123def456"
+token_file = "~/.config/demur/authorization.json"
+```
+
+`client_id` names which application you are authorizing. It is not a secret.
+`token_file` is where to keep the authorization so later publications do not
+ask again; leave it out and demur authorizes afresh each time and writes
+nothing. A kept authorization is readable only by you, never logged, and never
+appears in a published review.
+
+Configuring `token_file` without `client_id` fails validation: a place to keep
+an authorization means nothing without an application to authorize.
+
+This affects `demur pr --publish` only. Workflows keep publishing with the
+token they already have. See the [setup guide](/guide/app).
+
 ## `[models.<role>]`
 
 Roles are `triage`, `deep`, and `verdict`; every role is required.

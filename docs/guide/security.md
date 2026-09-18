@@ -139,3 +139,22 @@ text, not a command.
 a fork. The allowlist stops such an author reaching past it, but not from
 steering which allowed file is read and therefore what appears in a review a
 maintainer reads.
+
+## A kept authorization
+
+Where you authorize demur to act on your behalf, the resulting credential is
+handled on the same terms as the provider key.
+
+It is written only where you named it, never to a default location, and only
+when you name one. On systems that have file permissions it is written
+readable by you alone. It is never logged, never included in a review, a check
+run, or any other published artifact, and never appears in an error message,
+including one that echoes request material.
+
+It permits what publishing a review requires and nothing further, so
+authorizing changes how a review is attributed and never what demur may do.
+The rules that it never merges and never edits are unchanged.
+
+Workflows deliberately do not use this credential. It acts as you, across every
+repository you can reach, and a repository secret is readable by every workflow
+run. See [the app guide](/guide/app) for why that trade is not worth making.

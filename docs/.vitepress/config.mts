@@ -36,7 +36,8 @@ export default defineConfig({
         items: [
           { text: 'What demur is', link: '/guide/what-demur-is' },
           { text: 'Setup', link: '/guide/setup' },
-          { text: 'Local CLI', link: '/guide/local-cli' }
+          { text: 'Local CLI', link: '/guide/local-cli' },
+          { text: 'Publishing as yourself', link: '/guide/app' }
         ]
       },
       {
