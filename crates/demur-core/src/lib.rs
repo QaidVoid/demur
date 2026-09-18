@@ -16,5 +16,6 @@ pub mod github;
 pub mod ingest;
 pub mod pipeline;
 pub mod provider;
+pub mod retrieval;
 pub mod rules;
 mod schema_check;
