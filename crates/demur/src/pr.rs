@@ -182,7 +182,7 @@ your name, not under a bot identity."
                 Verdict::RequestChanges => crate::EXIT_REQUEST_CHANGES,
             })
         }
-        Ok(RunOutcome::Skipped(notice)) => {
+        Ok(RunOutcome::Skipped { notice, .. }) => {
             eprintln!("{notice}");
             Ok(crate::EXIT_FAILED)
         }

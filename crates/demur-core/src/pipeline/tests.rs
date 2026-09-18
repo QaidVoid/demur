@@ -329,7 +329,7 @@ async fn fully_consumed_cap_skips_with_notice_and_no_review() {
     let outcome = crate::pipeline::run(&providers, &config, &consumed)
         .await
         .unwrap();
-    let RunOutcome::Skipped(notice) = outcome else {
+    let RunOutcome::Skipped { notice, .. } = outcome else {
         panic!("expected a skipped run");
     };
     assert!(notice.contains("Review skipped"));
@@ -590,5 +590,112 @@ async fn budget_downgrade_sends_the_pass_to_the_triage_model() {
     assert!(
         recorded(&providers.deep).requests().is_empty(),
         "a downgraded pass must not reach the deep model"
+    );
+}
+
+fn config_with_rules(rules: &str) -> Config {
+    config_with("standard", rules)
+}
+
+#[tokio::test]
+async fn metadata_violations_reach_the_review_without_a_provider_call() {
+    let config =
+        config_with_rules("[review.title]\npattern = '^(feat|fix): .+'\nseverity = \"blocker\"");
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let mut input = input();
+    input.meta.title = "added a token".to_string();
+    let outcome = crate::pipeline::run(&providers, &config, &input)
+        .await
+        .unwrap();
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert_eq!(
+        review.verdict,
+        crate::pipeline::synthesis::Verdict::RequestChanges
+    );
+    assert!(
+        review.body.contains("pull request title"),
+        "{}",
+        review.body
+    );
+    assert!(
+        review.body.contains("does not match the required format"),
+        "{}",
+        review.body
+    );
+    // The location names the field, never an invented line number.
+    assert!(
+        !review.body.contains("pull request title:0"),
+        "{}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn a_satisfied_rule_raises_nothing() {
+    let config = config_with_rules("[review.title]\npattern = '^(feat|fix): .+'");
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let mut input = input();
+    input.meta.title = "feat: add a token".to_string();
+    let outcome = crate::pipeline::run(&providers, &config, &input)
+        .await
+        .unwrap();
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert!(
+        !review.body.contains("pull request title"),
+        "{}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn violations_survive_a_run_that_can_fund_no_pass() {
+    // The budget is consumed before the run starts. Rules cost nothing, so
+    // the skipped run still reports what it established.
+    let config = config_with_rules(
+        "[budget]\nper_pr_usd = 0.000001\n\n[review.description]\nrequired = true\nseverity = \"blocker\"",
+    );
+    let providers = registry(vec![vec![], vec![], vec![]]);
+    let mut input = input();
+    input.meta.description = String::new();
+    let outcome = crate::pipeline::run(&providers, &config, &input)
+        .await
+        .unwrap();
+    let RunOutcome::Skipped { notice, violations } = outcome else {
+        panic!("expected a skipped run");
+    };
+    assert_eq!(violations.len(), 1);
+    assert_eq!(violations[0].severity, Severity::Blocker);
+    assert!(
+        notice.contains("Rule violations found without a provider call"),
+        "{notice}"
+    );
+    assert!(notice.contains("pull request description"), "{notice}");
+}
+
+#[tokio::test]
+async fn an_unapplicable_rule_never_reaches_a_run() {
+    // Configuration validation rejects it first, but the pipeline refuses
+    // it too rather than silently reviewing without the rule.
+    let mut config = config_with("standard", "");
+    config.review.title.pattern = Some("(unclosed".to_string());
+    let providers = registry(vec![vec![], vec![], vec![]]);
+    let error = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .expect_err("an uncompilable rule must stop the run");
+    assert!(
+        matches!(error, PipelineError::Rules(_)),
+        "expected a rules failure, got {error}"
     );
 }

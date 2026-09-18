@@ -606,3 +606,174 @@ async fn oversized_delta_diff_falls_back_to_compare_files() {
     assert_eq!(parsed[0].path, "src/delta.rs");
     assert_eq!(parsed[0].hunks[0].added(), 1);
 }
+
+#[tokio::test]
+async fn metadata_violations_are_not_posted_inline_and_not_recorded() {
+    // A metadata finding has no diff position. Posting it inline would be
+    // a lie about where the problem is, and GitHub would reject the whole
+    // review for it. It also never enters the marker, because a rule is
+    // re-derived every run rather than remembered.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7,
+            "draft": false,
+            "title": "added a token",
+            "body": "",
+            "head": {"sha": "newhead"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UNRELATED_DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("review body is json");
+            let comments = body["comments"].as_array().expect("comments array");
+            assert!(
+                comments.is_empty(),
+                "a metadata finding must not be posted inline: {comments:?}"
+            );
+            let text = body["body"].as_str().unwrap_or_default();
+            assert!(text.contains("pull request title"), "body: {text}");
+            assert!(
+                !text.contains("\"pull request title\""),
+                "the marker must not record a metadata finding: {text}"
+            );
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let mut config = config();
+    config.review.title.pattern = Some("^(feat|fix): .+".to_string());
+    config.review.title.severity = Some(crate::config::Severity::Blocker);
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [],
+            "cluster_lens": [{"path": "src/other.rs", "lenses": []}]
+        }))]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![Ok(json!({"summary": "The title breaks the rule."}))]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &config, 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+    assert_eq!(outcome.check_conclusion, "failure");
+}
+
+#[tokio::test]
+async fn diff_anchored_findings_post_as_threaded_inline_comments() {
+    // The review is inline and threaded: each finding anchored in the diff
+    // becomes its own resolvable thread on its own line, carrying a
+    // suggestion block where a fix can be expressed. Only findings with no
+    // diff position, such as a rule about the title, live in the body.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7, "draft": false, "title": "t", "body": "b",
+            "head": {"sha": "newhead"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UNRELATED_DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("review body is json");
+            let comments = body["comments"].as_array().expect("comments array");
+            assert_eq!(
+                comments.len(),
+                1,
+                "expected one inline comment: {comments:?}"
+            );
+            let comment = &comments[0];
+            assert_eq!(comment["path"], "src/other.rs");
+            assert_eq!(comment["line"], 1);
+            assert_eq!(comment["side"], "RIGHT");
+            let text = comment["body"].as_str().unwrap_or_default();
+            assert!(text.contains("**[blocker]**"), "{text}");
+            assert!(text.contains("```suggestion"), "{text}");
+            assert!(
+                text.contains("demur:fp"),
+                "the thread carries its fingerprint: {text}"
+            );
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [],
+            "cluster_lens": [{"path": "src/other.rs", "lenses": ["correctness"]}]
+        }))]),
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [{
+                "file": "src/other.rs",
+                "start_line": 1,
+                "end_line": 1,
+                "severity": "blocker",
+                "message": "unchecked index",
+                "harm": "Merging panics the request handler on an empty slice.",
+                "suggestion": "if let Some(first) = items.first() {"
+            }]
+        }))]),
+        RecordedProvider::new(vec![Ok(json!({"summary": "s"}))]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &config(), 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+}

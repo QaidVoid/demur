@@ -70,6 +70,11 @@ pub struct Finding {
 impl Finding {
     /// Location rendered as file:line-line for reports.
     pub fn location(&self) -> String {
+        // A metadata finding cites a pull request field, which has no
+        // line. Rendering `pull request title:0` would invent one.
+        if self.start_line == 0 && self.end_line == 0 {
+            return self.file.clone();
+        }
         if self.start_line == self.end_line {
             format!("{}:{}", self.file, self.start_line)
         } else {

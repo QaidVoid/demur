@@ -133,6 +133,48 @@ top_p = 0.9
 "X-Custom-Header" = "value"
 ```
 
+## `[review]`
+
+Rules the repository declares about the pull request itself. Everything here
+is optional; a section left out declares nothing and nothing is ever reported.
+
+Rules are evaluated in process before any provider call. They cost nothing,
+they produce the same answer every run, and no model response participates in
+deciding them, so text in a pull request body cannot argue one away.
+
+```toml
+[review.title]
+required = true              # a non-empty title is required
+min_length = 10              # characters, not bytes
+max_length = 68
+pattern = '^(feat|fix|docs|chore)(\(.+\))?: .+'
+severity = "warning"         # blocker | warning | note; defaults to warning
+
+[review.description]
+required = true
+min_length = 40
+max_length = 5000
+pattern = '...'
+required_sections = ["## Why", "## Testing"]
+severity = "blocker"
+```
+
+`pattern` is a regular expression, and it is anchored only where you anchor it:
+`^feat:` matches at the start, `feat` matches anywhere. Lookaround is not
+supported, because the engine is guaranteed linear time so that a pattern from
+a fork's configuration cannot burn the whole job.
+
+`required_sections` matches whole lines, ignoring case and runs of whitespace,
+so `##   why` satisfies `## Why`. Words mentioned inside a sentence do not.
+
+A violation becomes an ordinary finding at the severity its rule declares, so
+`block_on` alone decides whether it fails the check run. Violations are named
+in the review body rather than posted as inline comments, because a title has
+no diff line to anchor to.
+
+A `pattern` that is not a valid regular expression fails the run at validation
+with the field named, rather than being ignored.
+
 ## `[models.<role>]`
 
 Roles are `triage`, `deep`, and `verdict`; every role is required.

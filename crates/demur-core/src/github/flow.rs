@@ -140,15 +140,28 @@ pub async fn review_pull_request(
     let outcome = crate::pipeline::run(registry, config, &input).await?;
     let review = match outcome {
         RunOutcome::Review(review) => *review,
-        RunOutcome::Skipped(notice) => {
+        RunOutcome::Skipped { notice, violations } => {
             // The check run must not report success as if a review
-            // happened, and a carried blocker keeps it failed.
-            let carried_blocker = prior_marker.as_ref().is_some_and(|marker| {
-                marker.findings.iter().any(|record| {
-                    record.state == CarriedState::Unresolved
-                        && record.severity == crate::config::Severity::Blocker
-                })
-            });
+            // happened. A carried blocker keeps it failed, and so does a
+            // rule violation at a blocking severity, which costs nothing
+            // to establish and is therefore known even here.
+            let blocking_rank = config
+                .block_on
+                .severities
+                .iter()
+                .map(|severity| severity.rank())
+                .min()
+                .unwrap_or_else(|| crate::config::Severity::Blocker.rank());
+            let blocking_violation = violations
+                .iter()
+                .any(|violation| violation.severity.rank() >= blocking_rank);
+            let carried_blocker = blocking_violation
+                || prior_marker.as_ref().is_some_and(|marker| {
+                    marker.findings.iter().any(|record| {
+                        record.state == CarriedState::Unresolved
+                            && record.severity == crate::config::Severity::Blocker
+                    })
+                });
             return Ok(FlowOutcome {
                 published: false,
                 check_conclusion: if carried_blocker {

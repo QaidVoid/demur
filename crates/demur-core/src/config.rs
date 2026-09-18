@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -55,6 +56,35 @@ table with family, base_url, and key_env, and all three [models.triage], \
 [models.deep], [models.verdict] tables, each with provider, name, input_price, \
 and output_price";
 
+/// The JSON Schema describing the configuration file, derived from the
+/// types themselves so it cannot describe a shape the bot would reject.
+pub fn json_schema() -> serde_json::Value {
+    let schema = schemars::schema_for!(Config);
+    let mut value = serde_json::to_value(schema).expect("schema serializes");
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "title".to_string(),
+            serde_json::Value::String(CONFIG_FILE_NAME.to_string()),
+        );
+        object.insert(
+            "description".to_string(),
+            serde_json::Value::String(
+                "Configuration for demur, a BYOK adversarial code review bot.".to_string(),
+            ),
+        );
+    }
+    value
+}
+
+/// The schema serialized for publication, newline terminated so the
+/// committed file compares cleanly.
+pub fn json_schema_text() -> String {
+    format!(
+        "{}\n",
+        serde_json::to_string_pretty(&json_schema()).expect("schema serializes")
+    )
+}
+
 /// Failures from loading, parsing, or validating configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -85,7 +115,7 @@ pub enum ConfigError {
 }
 
 /// Provider families the bot speaks natively.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Family {
     /// Any OpenAI-compatible endpoint with a configurable base URL.
@@ -95,7 +125,7 @@ pub enum Family {
 }
 
 /// Review depth profiles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Profile {
     /// Triage and verdict only.
@@ -122,7 +152,7 @@ impl std::str::FromStr for Profile {
 }
 
 /// Finding severities.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
     /// Below warning. Never blocks by itself.
@@ -145,7 +175,7 @@ impl Severity {
 }
 
 /// The parsed `.demur.toml` configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Review depth profile. Absent means standard.
@@ -165,6 +195,9 @@ pub struct Config {
     /// Fan-out and publication limits.
     #[serde(default)]
     pub limits: Limits,
+    /// Rules the repository declares about the pull request itself.
+    #[serde(default)]
+    pub review: Review,
     /// Named provider endpoints.
     pub providers: BTreeMap<String, ProviderDef>,
     /// Model assigned to each pipeline role.
@@ -172,7 +205,7 @@ pub struct Config {
 }
 
 /// Deep dive lens toggles.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Lenses {
     /// Logic errors, edge cases, broken contracts.
@@ -197,7 +230,7 @@ impl Default for Lenses {
 }
 
 /// The severities whose findings force REQUEST_CHANGES.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct BlockOn {
     /// Blocking severities. Absent means blocker alone.
@@ -218,7 +251,7 @@ fn default_block_on() -> Vec<Severity> {
 }
 
 /// Path patterns excluded from every pass.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Ignore {
     /// Glob patterns matched against repository-relative paths.
@@ -227,7 +260,7 @@ pub struct Ignore {
 }
 
 /// The per-pull-request spending cap.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Budget {
     /// Cap in USD over the pull request's cumulative recorded spend.
@@ -258,7 +291,7 @@ pub enum BudgetCap {
 }
 
 /// Fan-out and publication limits.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     /// Maximum deep dive calls per run.
@@ -280,8 +313,88 @@ impl Default for Limits {
     }
 }
 
+/// Rules a repository declares about the pull request carrying a change.
+/// Every rule is optional; a section left out declares nothing.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Review {
+    /// Rules for the pull request title.
+    pub title: TitleRules,
+    /// Rules for the pull request description.
+    pub description: DescriptionRules,
+}
+
+impl Review {
+    /// True when any rule is declared. Used to skip evaluation entirely.
+    pub fn is_empty(&self) -> bool {
+        !self.title.declared() && !self.description.declared()
+    }
+}
+
+/// Rules for the pull request title.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct TitleRules {
+    /// Require a non-empty title.
+    pub required: bool,
+    /// Minimum length in characters.
+    pub min_length: Option<usize>,
+    /// Maximum length in characters.
+    pub max_length: Option<usize>,
+    /// Regular expression the title must match. Anchored only where the
+    /// pattern anchors itself.
+    pub pattern: Option<String>,
+    /// Severity carried by a violation of these rules.
+    pub severity: Option<Severity>,
+}
+
+impl TitleRules {
+    /// True when at least one rule is declared.
+    pub fn declared(&self) -> bool {
+        self.required
+            || self.min_length.is_some()
+            || self.max_length.is_some()
+            || self.pattern.is_some()
+    }
+}
+
+/// Rules for the pull request description.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct DescriptionRules {
+    /// Require a non-empty description.
+    pub required: bool,
+    /// Minimum length in characters.
+    pub min_length: Option<usize>,
+    /// Maximum length in characters.
+    pub max_length: Option<usize>,
+    /// Regular expression the description must match.
+    pub pattern: Option<String>,
+    /// Headings that must appear, matched case-insensitively against
+    /// trimmed lines.
+    pub required_sections: Vec<String>,
+    /// Severity carried by a violation of these rules.
+    pub severity: Option<Severity>,
+}
+
+impl DescriptionRules {
+    /// True when at least one rule is declared.
+    pub fn declared(&self) -> bool {
+        self.required
+            || self.min_length.is_some()
+            || self.max_length.is_some()
+            || self.pattern.is_some()
+            || !self.required_sections.is_empty()
+    }
+}
+
+/// Severity a metadata violation carries when the rule does not name one.
+/// Warning rather than blocker: declaring a rule should not silently start
+/// blocking merges.
+pub const DEFAULT_RULE_SEVERITY: Severity = Severity::Warning;
+
 /// A named provider endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDef {
     /// Provider family dialect.
@@ -294,6 +407,7 @@ pub struct ProviderDef {
     pub key_file: Option<PathBuf>,
     /// Extra body fields forwarded to the provider unmodified.
     #[serde(default)]
+    #[schemars(with = "Option<std::collections::BTreeMap<String, serde_json::Value>>")]
     pub extra_body: Option<toml::Table>,
     /// Extra headers forwarded to the provider unmodified.
     #[serde(default)]
@@ -301,7 +415,7 @@ pub struct ProviderDef {
 }
 
 /// The model assigned to a pipeline role.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ModelDef {
     /// Name of the provider in the providers table.
@@ -321,6 +435,7 @@ pub struct ModelDef {
     pub thinking_budget: Option<u32>,
     /// Extra body fields forwarded to the provider unmodified.
     #[serde(default)]
+    #[schemars(with = "Option<std::collections::BTreeMap<String, serde_json::Value>>")]
     pub extra_body: Option<toml::Table>,
     /// Extra headers forwarded to the provider unmodified.
     #[serde(default)]
@@ -328,7 +443,7 @@ pub struct ModelDef {
 }
 
 /// The model role assignments. Every role is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Models {
     /// Cheap model for the triage pass.
@@ -409,6 +524,9 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             message: "set per_pr_usd or unlimited = true, not both".to_string(),
         });
     }
+    // Compile declared patterns here so an unusable rule fails the run
+    // before anything is spent, rather than at evaluation time.
+    crate::rules::Rules::compile(&config.review)?;
     if config.block_on.severities.is_empty() {
         return Err(ConfigError::Invalid {
             field: "block_on.severities".to_string(),
@@ -703,6 +821,86 @@ output_price = 10.00
         );
         let text = err_text(&text);
         assert!(text.contains("budgett"));
+    }
+
+    #[test]
+    fn review_rules_parse_in_full() {
+        let text = minimal().replace(
+            "[models.triage]",
+            r###"[review.title]
+required = true
+min_length = 10
+max_length = 68
+pattern = '^(feat|fix): .+'
+severity = "warning"
+
+[review.description]
+required = true
+min_length = 40
+required_sections = ["## Why", "## Testing"]
+severity = "blocker"
+
+[models.triage]"###,
+        );
+        let config = Config::from_toml(&text).expect("review rules parse");
+        assert!(config.review.title.required);
+        assert_eq!(config.review.title.max_length, Some(68));
+        assert_eq!(config.review.title.severity, Some(Severity::Warning));
+        assert_eq!(
+            config.review.description.required_sections,
+            vec!["## Why".to_string(), "## Testing".to_string()]
+        );
+        assert_eq!(config.review.description.severity, Some(Severity::Blocker));
+    }
+
+    #[test]
+    fn absent_review_section_declares_nothing() {
+        let config = Config::from_toml(&minimal()).expect("minimal config parses");
+        assert!(config.review.is_empty());
+    }
+
+    #[test]
+    fn partial_review_section_leaves_the_rest_undeclared() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[review.title]\nmax_length = 68\n\n[models.triage]",
+        );
+        let config = Config::from_toml(&text).expect("partial rules parse");
+        assert!(config.review.title.declared());
+        assert!(!config.review.description.declared());
+        assert!(!config.review.title.required);
+    }
+
+    #[test]
+    fn misspelled_review_key_is_rejected() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[review.title]\nmax_lenght = 68\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("max_lenght"), "{text}");
+    }
+
+    #[test]
+    fn required_sections_on_the_title_is_rejected() {
+        // Sections are a description rule. Accepting them on the title
+        // would silently declare a rule that never fires.
+        let text = minimal().replace(
+            "[models.triage]",
+            "[review.title]\nrequired_sections = [\"## Why\"]\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("required_sections"), "{text}");
+    }
+
+    #[test]
+    fn invalid_review_pattern_fails_validation() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[review.title]\npattern = '(unclosed'\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("review.title.pattern"), "{text}");
     }
 
     #[test]

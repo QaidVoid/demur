@@ -51,6 +51,8 @@ enum Command {
         #[arg(long, default_value = "markdown")]
         format: Format,
     },
+    /// Print the JSON schema for the configuration file.
+    Schema,
     /// Review a GitHub pull request by number or URL. Read-only unless
     /// --publish is passed.
     #[command(visible_alias = "pr")]
@@ -95,6 +97,10 @@ async fn main() -> ExitCode {
                 ExitCode::from(EXIT_FAILED)
             }
         },
+        Command::Schema => {
+            print!("{}", demur_core::config::json_schema_text());
+            ExitCode::from(EXIT_APPROVE)
+        }
         Command::ReviewPr {
             target,
             repo,
@@ -166,7 +172,7 @@ async fn review(
                 Verdict::RequestChanges => Ok(EXIT_REQUEST_CHANGES),
             }
         }
-        Ok(RunOutcome::Skipped(notice)) => {
+        Ok(RunOutcome::Skipped { notice, .. }) => {
             eprintln!("{notice}");
             Ok(EXIT_FAILED)
         }

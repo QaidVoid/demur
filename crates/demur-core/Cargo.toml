@@ -9,7 +9,9 @@ description = "Review pipeline core for demur, a BYOK code review bot"
 [dependencies]
 globset = "0.4.20"
 log = "0.4.34"
+regex = "1.13.1"
 reqwest.workspace = true
+schemars = "1.2.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true

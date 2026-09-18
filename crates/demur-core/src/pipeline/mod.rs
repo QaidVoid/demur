@@ -105,6 +105,10 @@ pub enum PipelineError {
     /// A provider call failed after its bounded retries.
     #[error(transparent)]
     Provider(#[from] ProviderError),
+    /// A declared rule could not be applied. Configuration validation
+    /// normally catches this first.
+    #[error("review rules cannot be applied: {0}")]
+    Rules(String),
 }
 
 /// The pull request under review plus everything earlier runs established.
@@ -171,8 +175,14 @@ pub struct Review {
 pub enum RunOutcome {
     /// A review was synthesized and is ready for publication.
     Review(Box<Review>),
-    /// No review could be produced. The string is the explanatory notice.
-    Skipped(String),
+    /// No review could be produced.
+    Skipped {
+        /// The explanatory notice.
+        notice: String,
+        /// Metadata rule violations, which are evaluated without a
+        /// provider call and therefore survive a run that funds no pass.
+        violations: Vec<findings::Finding>,
+    },
 }
 
 /// Run the pipeline for the configured profile.
@@ -181,6 +191,19 @@ pub async fn run(
     config: &Config,
     input: &PipelineInput,
 ) -> Result<RunOutcome, PipelineError> {
+    // Rules are mechanical and free, so they are evaluated before the
+    // budget is consulted. A run that can afford no pass still knows
+    // whether the pull request itself breaks a rule.
+    let rules = crate::rules::Rules::compile(&config.review)
+        .map_err(|err| PipelineError::Rules(err.to_string()))?;
+    let violations = if rules.is_empty() {
+        Vec::new()
+    } else {
+        let found = rules.evaluate(&input.meta.title, &input.meta.description);
+        log::info!("metadata rules: {} violation(s)", found.len());
+        found
+    };
+
     let profile = config.profile.unwrap_or(Profile::Standard);
     let triage_price = ModelPrice::from_model(&config.models.triage);
     let deep_price = ModelPrice::from_model(&config.models.deep);
@@ -188,7 +211,7 @@ pub async fn run(
     let mut gate = BudgetGate::new(config.budget.cap(), input.prior_spend);
     let mut degradations: Vec<Degradation> = Vec::new();
     let mut spend: Vec<PassSpend> = Vec::new();
-    let mut all_findings: Vec<findings::Finding> = Vec::new();
+    let mut all_findings: Vec<findings::Finding> = violations.clone();
     let diff_paths: Vec<String> = input
         .ingestion
         .clusters
@@ -246,7 +269,10 @@ you can already anchor to an exact file and line range with its concrete harm.";
             if shrink { triage_shrunk } else { triage_full }
         }
         LadderDecision::StandDown => {
-            return Ok(RunOutcome::Skipped(skip_notice(input, &gate)));
+            return Ok(RunOutcome::Skipped {
+                notice: skip_notice(input, &gate, &violations),
+                violations,
+            });
         }
     };
     let (triage_output, usage) = call_pass::<findings::TriageOutput>(
@@ -879,7 +905,11 @@ fn severity_word(severity: crate::config::Severity) -> &'static str {
     }
 }
 
-fn skip_notice(input: &PipelineInput, gate: &BudgetGate) -> String {
+fn skip_notice(
+    input: &PipelineInput,
+    gate: &BudgetGate,
+    violations: &[findings::Finding],
+) -> String {
     let carried: Vec<String> = input
         .carried_findings
         .iter()
@@ -901,5 +931,24 @@ Cumulative spend for this pull request: {:.4} USD (earlier runs: {:.4}).\n\
                 carried.join(", ")
             )
         }
-    )
+    ) + &render_violations(violations)
+}
+
+/// Rule violations rendered for a notice. They cost nothing to find, so a
+/// skipped run still reports them rather than staying silent about the one
+/// thing it did establish.
+fn render_violations(violations: &[findings::Finding]) -> String {
+    if violations.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\nRule violations found without a provider call:\n");
+    for violation in violations {
+        out.push_str(&format!(
+            "- **[{}]** `{}`: {}\n",
+            severity_word(violation.severity),
+            violation.file,
+            violation.message
+        ));
+    }
+    out
 }
