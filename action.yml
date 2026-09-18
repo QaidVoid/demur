@@ -23,6 +23,14 @@ inputs:
       profile in .demur.toml for this run.
     required: false
     default: ''
+  cache:
+    description: >-
+      Keep completed review passes between attempts of the same job, so a
+      retried run does not pay twice for work that already finished. Off by
+      default. It can only change what a run costs, never what it concludes,
+      and it is never read on a pull request from a fork.
+    required: false
+    default: 'false'
 
 runs:
   using: 'composite'
@@ -43,9 +51,22 @@ runs:
         url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${DEMUR_VERSION}/demur-${DEMUR_VERSION}-${target}.tar.gz"
         curl --fail --silent --show-error --location "$url" | tar -xz -C /tmp/demur-bin
         chmod +x /tmp/demur-bin/demur-action
+    - name: Restore review cache
+      if: inputs.cache == 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: /tmp/demur-cache
+        key: demur-${{ github.event.pull_request.head.sha }}
     - name: Run review
       shell: bash
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         DEMUR_PROFILE: ${{ inputs.profile }}
+        DEMUR_CACHE_DIR: ${{ inputs.cache == 'true' && '/tmp/demur-cache' || '' }}
       run: /tmp/demur-bin/demur-action
+    - name: Save review cache
+      if: inputs.cache == 'true' && always()
+      uses: actions/cache/save@v4
+      with:
+        path: /tmp/demur-cache
+        key: demur-${{ github.event.pull_request.head.sha }}-${{ github.run_id }}-${{ github.run_attempt }}

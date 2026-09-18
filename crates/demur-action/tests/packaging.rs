@@ -46,12 +46,42 @@ fn composite_action_declares_expected_surface() {
     assert!(inputs.contains_key(Value::from("github_token")));
     assert!(inputs.contains_key(Value::from("demur_version")));
     assert!(inputs.contains_key(Value::from("profile")));
+    assert!(inputs.contains_key(Value::from("cache")));
     let runs = action["runs"]["steps"].as_sequence().expect("steps");
-    let last = runs.last().unwrap();
-    let env = last["env"].as_mapping().expect("step env");
+    // Find the step by name: the cache steps sit around it, so its
+    // position is not something to assert on.
+    let review = runs
+        .iter()
+        .find(|step| step["name"] == Value::from("Run review"))
+        .expect("a step that runs the review");
+    let env = review["env"].as_mapping().expect("step env");
     assert!(env.contains_key(Value::from("GITHUB_TOKEN")));
     assert!(env.contains_key(Value::from("DEMUR_PROFILE")));
-    assert_eq!(last["shell"], "bash");
+    assert!(env.contains_key(Value::from("DEMUR_CACHE_DIR")));
+    assert_eq!(review["shell"], "bash");
+}
+
+#[test]
+fn the_cache_is_off_unless_the_workflow_asks_for_it() {
+    let action = load("action.yml");
+    assert_eq!(action["inputs"]["cache"]["default"], Value::from("false"));
+    let steps = action["runs"]["steps"].as_sequence().expect("steps");
+    let cache_steps: Vec<&Value> = steps
+        .iter()
+        .filter(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/cache"))
+        })
+        .collect();
+    assert_eq!(cache_steps.len(), 2, "one restore and one save");
+    for step in cache_steps {
+        let condition = step["if"].as_str().expect("a condition");
+        assert!(
+            condition.contains("inputs.cache == 'true'"),
+            "a cache step must be conditional on the input: {condition}"
+        );
+    }
 }
 
 #[test]

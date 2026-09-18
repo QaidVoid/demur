@@ -112,6 +112,7 @@ pub async fn review_pr(
     repo: Option<PathBuf>,
     format: crate::Format,
     publish: bool,
+    cache_dir: Option<PathBuf>,
 ) -> Result<u8, String> {
     let repo =
         repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -121,7 +122,11 @@ pub async fn review_pr(
         std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_string());
     let client = GitHubClient::new(&api, token, &parsed.owner, &parsed.repo);
 
-    let config = Config::load(&repo.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
+    let mut config = Config::load(&repo.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
+    if let Some(dir) = cache_dir {
+        config.cache.enabled = true;
+        config.cache.dir = Some(dir);
+    }
     let registry = ProviderRegistry::from_config(&config).map_err(|err| err.to_string())?;
 
     let pr = client
@@ -135,8 +140,12 @@ pub async fn review_pr(
     let files = parse_unified_diff(&diff);
     let pipeline_input = PipelineInput {
         meta: PullRequestMeta {
-            title: format!("pull request #{}", parsed.number),
-            description: String::new(),
+            title: if pr.title.is_empty() {
+                format!("pull request #{}", parsed.number)
+            } else {
+                pr.title.clone()
+            },
+            description: pr.body.clone().unwrap_or_default(),
             head_sha: pr.head_sha().to_string(),
         },
         ingestion: ingest(&files, &config),

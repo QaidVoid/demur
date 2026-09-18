@@ -189,3 +189,46 @@ async fn missing_key_fails_with_setup_guidance() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(KEY_ENV));
 }
+
+#[tokio::test]
+async fn a_working_copy_review_refuses_a_cache_directory() {
+    // A working copy has no commit to key entries to, and it changes
+    // without recording that it did, so caching one could serve an answer
+    // about code that is no longer there.
+    let server = mount_responses(vec![]).await;
+    let repo = fixture_repo("working-copy-cache", &server.uri());
+    let cache = repo.path().join("cache");
+    let output = Command::new(env!("CARGO_BIN_EXE_demur"))
+        .args(["review"])
+        .args(["--repo", repo.path().to_str().unwrap()])
+        .args(["--cache-dir", cache.to_str().unwrap()])
+        .env(KEY_ENV, KEY_VALUE)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("needs a revision range"),
+        "expected a refusal naming the reason: {stderr}"
+    );
+    assert!(!cache.exists(), "the refused run creates no cache location");
+}
+
+#[tokio::test]
+async fn a_local_review_without_the_flag_writes_no_cache() {
+    let server = mount_responses(vec![triage_response(), summary_response()]).await;
+    let repo = fixture_repo("no-cache", &server.uri());
+    let before: Vec<_> = std::fs::read_dir(repo.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect();
+    run_cli(repo.path(), "json");
+    let after: Vec<_> = std::fs::read_dir(repo.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+        .collect();
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "a run without --cache-dir leaves nothing behind"
+    );
+}

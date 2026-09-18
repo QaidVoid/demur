@@ -50,6 +50,10 @@ enum Command {
         /// Output format.
         #[arg(long, default_value = "markdown")]
         format: Format,
+        /// Reuse completed passes from this directory when a run is
+        /// retried. Nothing is cached unless this names one.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
     /// Print the JSON schema for the configuration file.
     Schema,
@@ -68,6 +72,10 @@ enum Command {
         /// Publish the review under your own identity.
         #[arg(long)]
         publish: bool,
+        /// Reuse completed passes from this directory when a run is
+        /// retried. Nothing is cached unless this names one.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
 }
 
@@ -90,7 +98,8 @@ async fn main() -> ExitCode {
             range,
             repo,
             format,
-        } => match review(range, repo, format).await {
+            cache_dir,
+        } => match review(range, repo, format, cache_dir).await {
             Ok(status) => ExitCode::from(status),
             Err(err) => {
                 eprintln!("{err}");
@@ -106,7 +115,8 @@ async fn main() -> ExitCode {
             repo,
             format,
             publish,
-        } => match pr::review_pr(target, repo, format, publish).await {
+            cache_dir,
+        } => match pr::review_pr(target, repo, format, publish, cache_dir).await {
             Ok(status) => ExitCode::from(status),
             Err(err) => {
                 eprintln!("{err}");
@@ -120,11 +130,12 @@ async fn review(
     range: Option<String>,
     repo: Option<PathBuf>,
     format: Format,
+    cache_dir: Option<PathBuf>,
 ) -> Result<u8, String> {
     let repo =
         repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config_path = repo.join(CONFIG_FILE_NAME);
-    let config = Config::load(&config_path).map_err(|err| err.to_string())?;
+    let mut config = Config::load(&config_path).map_err(|err| err.to_string())?;
 
     let target = match range {
         Some(range) => {
@@ -135,6 +146,20 @@ async fn review(
         }
         None => input::Target::WorkingCopy,
     };
+    if let Some(dir) = cache_dir {
+        // A working copy has no commit to key an entry to, and it changes
+        // without anything recording that it did. Caching one would risk
+        // serving an answer about code that is no longer there.
+        if matches!(target, input::Target::WorkingCopy) {
+            return Err(
+                "--cache-dir needs a revision range: a working copy has no commit to key \
+cache entries to, so caching it could reuse an answer about code you have since changed"
+                    .to_string(),
+            );
+        }
+        config.cache.enabled = true;
+        config.cache.dir = Some(dir);
+    }
     let diff = input::diff_text(&repo, &target)?;
     let files = parse_unified_diff(&diff);
     let ingestion = ingest(&files, &config);

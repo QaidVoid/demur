@@ -122,10 +122,24 @@ async fn run() -> Result<(), String> {
         );
     }
 
+    // The workflow decides whether the runner keeps a cache between job
+    // attempts, and points the binary at it. Nothing is cached unless it
+    // does.
+    if let Ok(dir) = std::env::var("DEMUR_CACHE_DIR")
+        && !dir.trim().is_empty()
+    {
+        config.cache.enabled = true;
+        config.cache.dir = Some(std::path::PathBuf::from(dir.trim()));
+    }
+
     // The fork path: without a provider key there is nothing this job can
     // do, so it explains itself in the job summary and exits successfully
     // without any provider or review API call.
     let is_fork = pr.head.repo.as_ref().is_some_and(|head| head.fork);
+
+    if is_fork && config.cache.disable_for_untrusted_head() {
+        eprintln!("fork pull request: the resume cache is not read");
+    }
     let registry = match ProviderRegistry::from_config(&config) {
         Ok(registry) => registry,
         Err(key_error) => {
