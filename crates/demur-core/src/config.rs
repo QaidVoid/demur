@@ -21,6 +21,9 @@ pub const DEFAULT_DEEP_CALLS: u32 = 12;
 /// Built-in maximum number of published findings per review.
 pub const DEFAULT_COMMENTS: u32 = 10;
 
+/// Built-in per-pass output token ceiling.
+pub const DEFAULT_MAX_TOKENS: u32 = 2000;
+
 /// A minimal working configuration, shown when required settings are absent.
 pub const MINIMAL_EXAMPLE: &str = r#"
 [providers.openai]
@@ -262,6 +265,9 @@ pub struct Limits {
     pub deep_calls: u32,
     /// Maximum findings published in one review.
     pub comments: u32,
+    /// Output token ceiling for every pass. Raised 4x automatically when
+    /// a response comes back truncated.
+    pub max_tokens: u32,
 }
 
 impl Default for Limits {
@@ -269,6 +275,7 @@ impl Default for Limits {
         Limits {
             deep_calls: DEFAULT_DEEP_CALLS,
             comments: DEFAULT_COMMENTS,
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 }
@@ -459,6 +466,12 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 message: "must be zero or positive".to_string(),
             });
         }
+        if config.limits.max_tokens == 0 {
+            return Err(ConfigError::Invalid {
+                field: "limits.max_tokens".to_string(),
+                message: "must be at least one token".to_string(),
+            });
+        }
         if model.cached_input_price.is_some_and(|price| price < 0.0) {
             return Err(ConfigError::Invalid {
                 field: format!("{role}.cached_input_price"),
@@ -518,6 +531,7 @@ mod tests {
         assert_eq!(config.budget.cap(), BudgetCap::Limited(DEFAULT_BUDGET_USD));
         assert_eq!(config.limits.deep_calls, DEFAULT_DEEP_CALLS);
         assert_eq!(config.limits.comments, DEFAULT_COMMENTS);
+        assert_eq!(config.limits.max_tokens, DEFAULT_MAX_TOKENS);
         assert!(config.lenses.correctness);
         assert!(config.lenses.security);
         assert!(config.lenses.performance);
@@ -689,6 +703,16 @@ output_price = 10.00
         );
         let text = err_text(&text);
         assert!(text.contains("budgett"));
+    }
+
+    #[test]
+    fn zero_max_tokens_fails() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[limits]\nmax_tokens = 0\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("limits.max_tokens"));
     }
 
     #[test]

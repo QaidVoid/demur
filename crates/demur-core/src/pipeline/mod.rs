@@ -27,13 +27,12 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use synthesis::{SynthesisInput, Verdict, synthesize};
 
-const TRIAGE_MAX_OUTPUT: u32 = 2000;
-const DIVE_MAX_OUTPUT: u32 = 2000;
-const CROSS_MAX_OUTPUT: u32 = 2000;
-const VERDICT_MAX_OUTPUT: u32 = 1000;
-
 /// Bounded attempts for responses that deserialize but fail schema checks.
 const SCHEMA_ATTEMPTS: u32 = 3;
+
+/// How often a truncated response may raise the output ceiling, which
+/// grows 4x per escalation.
+const MAX_CEILING_ESCALATIONS: u32 = 2;
 
 /// A provider replaying recorded responses. Used by the fixture harness for
 /// end-to-end pipeline tests and for offline replay runs.
@@ -212,7 +211,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
         pass: "triage",
         full_tokens: estimate_prompt_tokens(&context),
         shrunk_tokens: estimate_prompt_tokens(&shrunk_context),
-        max_output_tokens: TRIAGE_MAX_OUTPUT,
+        max_output_tokens: config.limits.max_tokens,
         price: &triage_price,
         downgrade_price: None,
     };
@@ -228,7 +227,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
         prompt::assemble(&context, triage_task, &prompt::findings_schema()),
         prompt::findings_schema(),
         "triage",
-        TRIAGE_MAX_OUTPUT,
+        config.limits.max_tokens,
     )
     .await?;
     spend.push(PassSpend {
@@ -304,7 +303,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     pass: "deep dive",
                     full_tokens: estimate_prompt_tokens(&context),
                     shrunk_tokens: estimate_prompt_tokens(&shrunk),
-                    max_output_tokens: DIVE_MAX_OUTPUT,
+                    max_output_tokens: config.limits.max_tokens,
                     price: &deep_price,
                     downgrade_price: Some(&triage_price),
                 });
@@ -331,7 +330,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     prompt::assemble(&context, &task, &prompt::findings_schema()),
                     prompt::findings_schema(),
                     "deep dive",
-                    DIVE_MAX_OUTPUT,
+                    config.limits.max_tokens,
                 )
                 .await;
                 let (dive_output, usage) = match dived {
@@ -343,7 +342,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                             prompt::assemble(&shrunk, &task, &prompt::findings_schema()),
                             prompt::findings_schema(),
                             "deep dive",
-                            DIVE_MAX_OUTPUT,
+                            config.limits.max_tokens,
                         )
                         .await
                         {
@@ -408,7 +407,7 @@ with their concrete harm.";
             pass: "cross-examination",
             full_tokens: estimate_prompt_tokens(&context),
             shrunk_tokens: estimate_prompt_tokens(&shrunk_context),
-            max_output_tokens: CROSS_MAX_OUTPUT,
+            max_output_tokens: config.limits.max_tokens,
             price: &deep_price,
             downgrade_price: Some(&triage_price),
         };
@@ -429,7 +428,7 @@ with their concrete harm.";
                 prompt::assemble(&context, task, &prompt::cross_examination_schema()),
                 prompt::cross_examination_schema(),
                 "cross-examination",
-                CROSS_MAX_OUTPUT,
+                config.limits.max_tokens,
             )
             .await?;
             spend.push(PassSpend {
@@ -522,7 +521,7 @@ coverage was complete and no defect was established.";
             pass: "verdict summary",
             full_tokens: estimate_prompt_tokens(&context),
             shrunk_tokens: estimate_prompt_tokens(&context),
-            max_output_tokens: VERDICT_MAX_OUTPUT,
+            max_output_tokens: config.limits.max_tokens,
             price: verdict_price,
             downgrade_price: Some(&cheap_verdict_price),
         });
@@ -536,7 +535,7 @@ coverage was complete and no defect was established.";
                     prompt::assemble(&context, task, &summary_schema()),
                     summary_schema(),
                     "verdict summary",
-                    VERDICT_MAX_OUTPUT,
+                    config.limits.max_tokens,
                 )
                 .await?;
                 spend.push(PassSpend {
@@ -607,19 +606,78 @@ async fn call_pass<T: DeserializeOwned>(
     schema_name: &str,
     max_output: u32,
 ) -> Result<(T, TokenUsage), ProviderError> {
-    let request = CompletionRequest {
-        system: prompt.system,
-        user: prompt.user,
-        schema,
-        schema_name: schema_name.to_string(),
-        max_output_tokens: max_output,
+    let make_request = {
+        let system = prompt.system.clone();
+        let user = prompt.user.clone();
+        let schema = schema.clone();
+        let schema_name = schema_name.to_string();
+        move |ceiling: u32| CompletionRequest {
+            system: system.clone(),
+            user: user.clone(),
+            schema: schema.clone(),
+            schema_name: schema_name.clone(),
+            max_output_tokens: ceiling,
+        }
     };
-    let mut last_error: Option<serde_json::Error> = None;
-    for _ in 0..SCHEMA_ATTEMPTS {
-        let response = complete_with_retries(provider, &request, &RetryPolicy::default()).await?;
+    let mut ceiling = max_output;
+    let mut escalations: u32 = 0;
+    let mut attempts: u32 = 0;
+    let mut carried_usage = TokenUsage::default();
+    let mut last_error;
+    loop {
+        let response =
+            match complete_with_retries(provider, &make_request(ceiling), &RetryPolicy::default())
+                .await
+            {
+                Ok(response) => response,
+                Err(ProviderError::OutputTruncated { message, usage }) => {
+                    carried_usage.input_tokens = carried_usage
+                        .input_tokens
+                        .saturating_add(usage.input_tokens);
+                    carried_usage.cached_input_tokens = carried_usage
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
+                    carried_usage.output_tokens = carried_usage
+                        .output_tokens
+                        .saturating_add(usage.output_tokens);
+                    if escalations >= MAX_CEILING_ESCALATIONS {
+                        return Err(ProviderError::OutputTruncated {
+                            message,
+                            usage: carried_usage,
+                        });
+                    }
+                    escalations += 1;
+                    let raised = ceiling.saturating_mul(4);
+                    log::warn!(
+                        "{schema_name}: output ceiling {ceiling} truncated the response, \
+retrying with {raised} output tokens"
+                    );
+                    ceiling = raised;
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
+        attempts += 1;
         match serde_json::from_value::<T>(response.content.clone()) {
-            Ok(parsed) => return Ok((parsed, response.usage)),
-            Err(err) => last_error = Some(err),
+            Ok(parsed) => {
+                let mut usage = response.usage;
+                usage.input_tokens = usage
+                    .input_tokens
+                    .saturating_add(carried_usage.input_tokens);
+                usage.cached_input_tokens = usage
+                    .cached_input_tokens
+                    .saturating_add(carried_usage.cached_input_tokens);
+                usage.output_tokens = usage
+                    .output_tokens
+                    .saturating_add(carried_usage.output_tokens);
+                return Ok((parsed, usage));
+            }
+            Err(err) => {
+                last_error = Some(err);
+                if attempts >= SCHEMA_ATTEMPTS {
+                    break;
+                }
+            }
         }
     }
     Err(ProviderError::Malformed {

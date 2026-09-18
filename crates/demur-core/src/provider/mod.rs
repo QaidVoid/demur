@@ -96,6 +96,15 @@ pub enum ProviderError {
         /// Redacted detail about the violation.
         message: String,
     },
+    /// The model spent its whole output budget without producing usable
+    /// text. Retryable only with a raised ceiling.
+    #[error("provider hit the output token ceiling: {message}")]
+    OutputTruncated {
+        /// Redacted detail, including the stop reason and an excerpt.
+        message: String,
+        /// Usage of the wasted call, so spend stays honest.
+        usage: TokenUsage,
+    },
     /// The provider rejected the request permanently. No retries help.
     #[error("provider rejected the request: {message}")]
     Rejected {
@@ -110,7 +119,8 @@ pub enum ProviderError {
     },
 }
 
-/// True when a retry within bounds can still change the outcome.
+/// True when a retry at the same output ceiling can still change the
+/// outcome. Truncation is excluded: the same ceiling repeats the failure.
 pub fn is_retryable(error: &ProviderError) -> bool {
     matches!(
         error,

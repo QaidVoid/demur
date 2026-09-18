@@ -108,15 +108,43 @@ impl Provider for OpenAiClient {
             serde_json::from_str(&text).map_err(|err| ProviderError::Malformed {
                 message: redact(&format!("body is not a chat completion: {err}"), &self.key),
             })?;
+        let finish_reason = parsed
+            .choices
+            .first()
+            .and_then(|choice| choice.finish_reason.clone())
+            .unwrap_or_default();
         let content = parsed
             .choices
             .first()
             .and_then(|choice| choice.message.content.clone())
             .unwrap_or_default();
         if content.trim().is_empty() {
-            return Err(empty_content_error(&text, &self.key));
+            return Err(truncated_or_malformed(
+                &format!(
+                    "empty message content: finish_reason={finish_reason}; raw response excerpt: {}",
+                    body_excerpt(&text)
+                ),
+                &finish_reason,
+                parsed.usage,
+                &text,
+                &self.key,
+            ));
         }
-        let content = parse_json_content(&content)?;
+        let content = match parse_json_content(&content) {
+            Ok(value) => value,
+            Err(err) => {
+                if finish_reason == "length" {
+                    return Err(truncated_or_malformed(
+                        &format!("{err}; the ceiling cut the JSON mid-output"),
+                        &finish_reason,
+                        parsed.usage,
+                        &text,
+                        &self.key,
+                    ));
+                }
+                return Err(err);
+            }
+        };
         let usage = parsed.usage.unwrap_or_default();
         let cached = usage.prompt_tokens_details.and_then(|d| d.cached_tokens);
         Ok(CompletionResponse {
@@ -210,31 +238,36 @@ struct WireResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
-    #[allow(dead_code)]
     finish_reason: Option<String>,
 }
 
-/// Build a diagnostic Malformed error for a choice with no text: it names
-/// the finish reason and carries a redacted excerpt of the raw body.
-fn empty_content_error(raw_body: &str, key: &str) -> ProviderError {
-    let parsed: serde_json::Value =
-        serde_json::from_str(raw_body).unwrap_or(serde_json::Value::Null);
-    let finish_reason = parsed["choices"][0]["finish_reason"]
-        .as_str()
-        .unwrap_or("unknown");
-    let hint = match finish_reason {
-        "length" => "the output hit the token ceiling before any text was produced",
-        _ => "the endpoint returned no message content",
+/// OutputTruncated when the finish reason says the ceiling was hit,
+/// Malformed otherwise, carrying usage and a redacted excerpt either way.
+fn truncated_or_malformed(
+    detail: &str,
+    finish_reason: &str,
+    usage: Option<WireUsage>,
+    raw_body: &str,
+    key: &str,
+) -> ProviderError {
+    let usage = usage.unwrap_or_default();
+    let cached = usage
+        .prompt_tokens_details
+        .and_then(|details| details.cached_tokens)
+        .unwrap_or(0);
+    let usage = TokenUsage {
+        input_tokens: usage.prompt_tokens.saturating_sub(cached),
+        cached_input_tokens: cached,
+        output_tokens: usage.completion_tokens,
     };
-    ProviderError::Malformed {
-        message: redact(
-            &format!(
-                "empty response content: finish_reason={finish_reason}, {hint}; \
-raw response excerpt: {}",
-                body_excerpt(raw_body)
-            ),
-            key,
-        ),
+    let message = redact(
+        &format!("{detail}; raw response excerpt: {}", body_excerpt(raw_body)),
+        key,
+    );
+    if finish_reason == "length" {
+        ProviderError::OutputTruncated { message, usage }
+    } else {
+        ProviderError::Malformed { message }
     }
 }
 

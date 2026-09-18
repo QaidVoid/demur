@@ -135,9 +135,33 @@ impl Provider for AnthropicClient {
             .collect::<Vec<_>>()
             .join("");
         if joined.trim().is_empty() {
-            return Err(empty_content_error(&text, &self.key));
+            let detail = empty_content_detail(&text);
+            if parsed.stop_reason.as_deref() == Some("max_tokens") {
+                return Err(truncated_error(
+                    &format!("{detail}; no text was produced"),
+                    parsed.usage,
+                    &text,
+                    &self.key,
+                ));
+            }
+            return Err(ProviderError::Malformed {
+                message: redact(&detail, &self.key),
+            });
         }
-        let content = parse_json_content(&joined)?;
+        let content = match parse_json_content(&joined) {
+            Ok(value) => value,
+            Err(err) => {
+                if parsed.stop_reason.as_deref() == Some("max_tokens") {
+                    return Err(truncated_error(
+                        &format!("{err}; the ceiling cut the JSON mid-output"),
+                        parsed.usage,
+                        &text,
+                        &self.key,
+                    ));
+                }
+                return Err(err);
+            }
+        };
         let usage = parsed.usage.unwrap_or_default();
         let cache_reads = usage.cache_read_input_tokens.unwrap_or(0);
         Ok(CompletionResponse {
@@ -177,14 +201,15 @@ fn anthropic_error(
 #[derive(Debug, Deserialize)]
 struct WireResponse {
     content: Vec<Block>,
+    #[serde(default)]
+    stop_reason: Option<String>,
     usage: Option<WireUsage>,
 }
 
-/// Build a diagnostic Malformed error for a response that carried no text:
-/// it names the stop reason, the content block types seen, and a redacted
-/// excerpt of the raw body, which is what a gateway shape mismatch needs
+/// Describe a response that carried no text: the stop reason and the
+/// content block types seen, which is what a gateway shape mismatch needs
 /// to be diagnosed.
-fn empty_content_error(raw_body: &str, key: &str) -> ProviderError {
+fn empty_content_detail(raw_body: &str) -> String {
     let parsed: serde_json::Value =
         serde_json::from_str(raw_body).unwrap_or(serde_json::Value::Null);
     let stop_reason = parsed["stop_reason"].as_str().unwrap_or("unknown");
@@ -197,20 +222,34 @@ fn empty_content_error(raw_body: &str, key: &str) -> ProviderError {
                 .collect()
         })
         .unwrap_or_default();
-    let hint = if stop_reason == "max_tokens" {
-        "the output hit the token ceiling before any text was produced"
-    } else {
-        "the endpoint returned no text content"
-    };
-    ProviderError::Malformed {
+    format!(
+        "empty response content: stop_reason={stop_reason}, block_types={block_types:?}; \
+raw response excerpt: {}",
+        body_excerpt(raw_body)
+    )
+}
+
+/// Build an OutputTruncated error carrying the wasted call's usage so
+/// spend stays honest.
+fn truncated_error(
+    detail: &str,
+    usage: Option<WireUsage>,
+    raw_body: &str,
+    key: &str,
+) -> ProviderError {
+    let usage = usage.unwrap_or_default();
+    ProviderError::OutputTruncated {
         message: redact(
-            &format!(
-                "empty response content: stop_reason={stop_reason}, block_types={block_types:?}, \
-{hint}; raw response excerpt: {}",
-                body_excerpt(raw_body)
-            ),
+            &format!("{detail}; raw response excerpt: {}", body_excerpt(raw_body)),
             key,
         ),
+        usage: TokenUsage {
+            input_tokens: usage
+                .input_tokens
+                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
+            cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+            output_tokens: usage.output_tokens,
+        },
     }
 }
 

@@ -99,12 +99,19 @@ degradation is disclosed in the published review.
 [limits]
 deep_calls = 12   # maximum deep dive calls per run. Default: 12.
 comments = 10     # maximum published findings per review. Default: 10.
+max_tokens = 2000 # output token ceiling per pass. Default: 2000.
 ```
 
-When the ceiling binds, the highest-risk clusters are reviewed first and
-the review states how many clusters went unreviewed. The comment budget
-never changes the verdict: a verdict-setting finding cut for space is
-still named in the review body.
+When the deep call ceiling binds, the highest-risk clusters are reviewed
+first and the review states how many clusters went unreviewed. The comment
+budget never changes the verdict: a verdict-setting finding cut for space
+is still named in the review body.
+
+Raise `max_tokens` when your provider runs reasoning-style models that
+spend output tokens before writing an answer: a response that comes back
+truncated is retried automatically at 4x and then 16x the configured
+ceiling, and the tokens spent on truncated attempts still count against
+the budget.
 
 ## `[providers.<name>]`
 

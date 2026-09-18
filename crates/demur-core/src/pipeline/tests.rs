@@ -337,6 +337,87 @@ async fn fully_consumed_cap_skips_with_notice_and_no_review() {
 }
 
 #[tokio::test]
+async fn truncated_output_escalates_the_ceiling_and_succeeds() {
+    use crate::config::{Family, ModelDef, ProviderDef};
+    use crate::provider::{AnyProvider, OpenAiClient};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+    // First attempts run at the configured 2000-token ceiling and come
+    // back truncated; the 4x retries succeed.
+    struct Escalation(std::sync::Mutex<Vec<u64>>);
+
+    impl Respond for Escalation {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let ceiling = body["max_tokens"].as_u64().unwrap();
+            self.0.lock().unwrap().push(ceiling);
+            if ceiling <= 2000 {
+                return ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 50, "completion_tokens": 2000}
+                }));
+            }
+            let valid = if self.0.lock().unwrap().iter().filter(|c| **c > 2000).count() == 1 {
+                serde_json::json!({
+                    "findings": [],
+                    "cluster_lens": [{"path": "src/auth/token.rs", "lenses": []},
+                                     {"path": "src/util.rs", "lenses": []}]
+                })
+            } else {
+                serde_json::json!({"summary": "Nothing to argue against."})
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"content": valid.to_string()}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 10}
+            }))
+        }
+    }
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(Escalation(std::sync::Mutex::new(Vec::new())))
+        .mount(&server)
+        .await;
+
+    let provider = ProviderDef {
+        family: Family::OpenAi,
+        base_url: server.uri(),
+        key_env: "TEST".to_string(),
+        key_file: None,
+        extra_body: None,
+        extra_headers: None,
+    };
+    let model = ModelDef {
+        provider: "test".to_string(),
+        name: "m".to_string(),
+        input_price: 1.0,
+        output_price: 2.0,
+        reasoning_effort: None,
+        thinking_budget: None,
+        extra_body: None,
+        extra_headers: None,
+        cached_input_price: None,
+    };
+    let make =
+        || AnyProvider::OpenAi(OpenAiClient::new(&provider, &model, "k".to_string()).unwrap());
+    let registry = ProviderRegistry {
+        triage: make(),
+        deep: make(),
+        verdict: make(),
+    };
+    let config = config_with("quick", "");
+    let outcome = crate::pipeline::run(&registry, &config, &input())
+        .await
+        .unwrap();
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert_eq!(review.verdict, crate::pipeline::synthesis::Verdict::Approve);
+}
+
+#[tokio::test]
 async fn carried_blocker_sets_the_verdict_on_a_clean_delta() {
     let config = config_with("standard", "");
     let triage = json!({
