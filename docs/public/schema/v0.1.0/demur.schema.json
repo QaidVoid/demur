@@ -1,0 +1,555 @@
+{
+  "$defs": {
+    "BlockOn": {
+      "additionalProperties": false,
+      "description": "The severities whose findings force REQUEST_CHANGES.",
+      "properties": {
+        "severities": {
+          "default": [
+            "blocker"
+          ],
+          "description": "Blocking severities. Absent means blocker alone.",
+          "items": {
+            "$ref": "#/$defs/Severity"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Budget": {
+      "additionalProperties": false,
+      "description": "The per-pull-request spending cap.",
+      "properties": {
+        "per_pr_usd": {
+          "description": "Cap in USD over the pull request's cumulative recorded spend.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "unlimited": {
+          "default": false,
+          "description": "True removes the cap entirely. Explicit only.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "DescriptionRules": {
+      "additionalProperties": false,
+      "description": "Rules for the pull request description.",
+      "properties": {
+        "max_length": {
+          "default": null,
+          "description": "Maximum length in characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_length": {
+          "default": null,
+          "description": "Minimum length in characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pattern": {
+          "default": null,
+          "description": "Regular expression the description must match.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "default": false,
+          "description": "Require a non-empty description.",
+          "type": "boolean"
+        },
+        "required_sections": {
+          "default": [],
+          "description": "Headings that must appear, matched case-insensitively against\ntrimmed lines.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Severity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Severity carried by a violation of these rules."
+        }
+      },
+      "type": "object"
+    },
+    "Family": {
+      "description": "Provider families the bot speaks natively.",
+      "oneOf": [
+        {
+          "const": "openai",
+          "description": "Any OpenAI-compatible endpoint with a configurable base URL.",
+          "type": "string"
+        },
+        {
+          "const": "anthropic",
+          "description": "The native Anthropic API.",
+          "type": "string"
+        }
+      ]
+    },
+    "Ignore": {
+      "additionalProperties": false,
+      "description": "Path patterns excluded from every pass.",
+      "properties": {
+        "paths": {
+          "default": [],
+          "description": "Glob patterns matched against repository-relative paths.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "Lenses": {
+      "additionalProperties": false,
+      "description": "Deep dive lens toggles.",
+      "properties": {
+        "correctness": {
+          "default": true,
+          "description": "Logic errors, edge cases, broken contracts.",
+          "type": "boolean"
+        },
+        "performance": {
+          "default": true,
+          "description": "Regressions, complexity, allocation churn.",
+          "type": "boolean"
+        },
+        "security": {
+          "default": true,
+          "description": "Injection, authorization, secret handling.",
+          "type": "boolean"
+        },
+        "style": {
+          "default": false,
+          "description": "Style and idiom. Off unless explicitly enabled.",
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "Limits": {
+      "additionalProperties": false,
+      "description": "Fan-out and publication limits.",
+      "properties": {
+        "comments": {
+          "default": 10,
+          "description": "Maximum findings published in one review.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "deep_calls": {
+          "default": 12,
+          "description": "Maximum deep dive calls per run.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_tokens": {
+          "default": 2000,
+          "description": "Output token ceiling for every pass. Raised 4x automatically when\na response comes back truncated.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "ModelDef": {
+      "additionalProperties": false,
+      "description": "The model assigned to a pipeline role.",
+      "properties": {
+        "cached_input_price": {
+          "description": "Cached input price in USD per million tokens. Defaults to half the\ninput price when absent.",
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "extra_body": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Extra body fields forwarded to the provider unmodified.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "extra_headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Extra headers forwarded to the provider unmodified.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "input_price": {
+          "description": "Input price in USD per million tokens.",
+          "format": "double",
+          "type": "number"
+        },
+        "name": {
+          "description": "Model identifier sent to the provider.",
+          "type": "string"
+        },
+        "output_price": {
+          "description": "Output price in USD per million tokens.",
+          "format": "double",
+          "type": "number"
+        },
+        "provider": {
+          "description": "Name of the provider in the providers table.",
+          "type": "string"
+        },
+        "reasoning_effort": {
+          "description": "OpenAI reasoning effort: minimal, low, medium, or high.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "thinking_budget": {
+          "description": "Anthropic thinking budget in tokens.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "provider",
+        "name",
+        "input_price",
+        "output_price"
+      ],
+      "type": "object"
+    },
+    "Models": {
+      "additionalProperties": false,
+      "description": "The model role assignments. Every role is required.",
+      "properties": {
+        "deep": {
+          "$ref": "#/$defs/ModelDef",
+          "description": "Deep model for deep dives and cross-examination."
+        },
+        "triage": {
+          "$ref": "#/$defs/ModelDef",
+          "description": "Cheap model for the triage pass."
+        },
+        "verdict": {
+          "$ref": "#/$defs/ModelDef",
+          "description": "Model for verdict synthesis."
+        }
+      },
+      "required": [
+        "triage",
+        "deep",
+        "verdict"
+      ],
+      "type": "object"
+    },
+    "Profile": {
+      "description": "Review depth profiles.",
+      "oneOf": [
+        {
+          "const": "quick",
+          "description": "Triage and verdict only.",
+          "type": "string"
+        },
+        {
+          "const": "standard",
+          "description": "Triage, deep dives, verdict.",
+          "type": "string"
+        },
+        {
+          "const": "deep",
+          "description": "All passes including cross-examination.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProviderDef": {
+      "additionalProperties": false,
+      "description": "A named provider endpoint.",
+      "properties": {
+        "base_url": {
+          "description": "API base URL.",
+          "type": "string"
+        },
+        "extra_body": {
+          "additionalProperties": true,
+          "default": null,
+          "description": "Extra body fields forwarded to the provider unmodified.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "extra_headers": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": null,
+          "description": "Extra headers forwarded to the provider unmodified.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "family": {
+          "$ref": "#/$defs/Family",
+          "description": "Provider family dialect."
+        },
+        "key_env": {
+          "description": "Environment variable holding the API key.",
+          "type": "string"
+        },
+        "key_file": {
+          "description": "File holding the API key, for local runs.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "family",
+        "base_url",
+        "key_env"
+      ],
+      "type": "object"
+    },
+    "Review": {
+      "additionalProperties": false,
+      "description": "Rules a repository declares about the pull request carrying a change.\nEvery rule is optional; a section left out declares nothing.",
+      "properties": {
+        "description": {
+          "$ref": "#/$defs/DescriptionRules",
+          "default": {
+            "max_length": null,
+            "min_length": null,
+            "pattern": null,
+            "required": false,
+            "required_sections": [],
+            "severity": null
+          },
+          "description": "Rules for the pull request description."
+        },
+        "title": {
+          "$ref": "#/$defs/TitleRules",
+          "default": {
+            "max_length": null,
+            "min_length": null,
+            "pattern": null,
+            "required": false,
+            "severity": null
+          },
+          "description": "Rules for the pull request title."
+        }
+      },
+      "type": "object"
+    },
+    "Severity": {
+      "description": "Finding severities.",
+      "oneOf": [
+        {
+          "const": "note",
+          "description": "Below warning. Never blocks by itself.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Serious but not necessarily merge-blocking.",
+          "type": "string"
+        },
+        {
+          "const": "blocker",
+          "description": "Merge-blocking when listed in block_on.",
+          "type": "string"
+        }
+      ]
+    },
+    "TitleRules": {
+      "additionalProperties": false,
+      "description": "Rules for the pull request title.",
+      "properties": {
+        "max_length": {
+          "default": null,
+          "description": "Maximum length in characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "min_length": {
+          "default": null,
+          "description": "Minimum length in characters.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "pattern": {
+          "default": null,
+          "description": "Regular expression the title must match. Anchored only where the\npattern anchors itself.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "required": {
+          "default": false,
+          "description": "Require a non-empty title.",
+          "type": "boolean"
+        },
+        "severity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Severity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Severity carried by a violation of these rules."
+        }
+      },
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Configuration for demur, a BYOK adversarial code review bot.",
+  "properties": {
+    "block_on": {
+      "$ref": "#/$defs/BlockOn",
+      "default": {
+        "severities": [
+          "blocker"
+        ]
+      },
+      "description": "Severities whose findings force REQUEST_CHANGES."
+    },
+    "budget": {
+      "$ref": "#/$defs/Budget",
+      "default": {
+        "per_pr_usd": null,
+        "unlimited": false
+      },
+      "description": "Per-pull-request spending cap."
+    },
+    "ignore": {
+      "$ref": "#/$defs/Ignore",
+      "default": {
+        "paths": []
+      },
+      "description": "Path patterns excluded from every pass."
+    },
+    "lenses": {
+      "$ref": "#/$defs/Lenses",
+      "default": {
+        "correctness": true,
+        "performance": true,
+        "security": true,
+        "style": false
+      },
+      "description": "Lens toggles for deep dives."
+    },
+    "limits": {
+      "$ref": "#/$defs/Limits",
+      "default": {
+        "comments": 10,
+        "deep_calls": 12,
+        "max_tokens": 2000
+      },
+      "description": "Fan-out and publication limits."
+    },
+    "models": {
+      "$ref": "#/$defs/Models",
+      "description": "Model assigned to each pipeline role."
+    },
+    "profile": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Profile"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Review depth profile. Absent means standard."
+    },
+    "providers": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ProviderDef"
+      },
+      "description": "Named provider endpoints.",
+      "type": "object"
+    },
+    "review": {
+      "$ref": "#/$defs/Review",
+      "default": {
+        "description": {
+          "max_length": null,
+          "min_length": null,
+          "pattern": null,
+          "required": false,
+          "required_sections": [],
+          "severity": null
+        },
+        "title": {
+          "max_length": null,
+          "min_length": null,
+          "pattern": null,
+          "required": false,
+          "severity": null
+        }
+      },
+      "description": "Rules the repository declares about the pull request itself."
+    }
+  },
+  "required": [
+    "providers",
+    "models"
+  ],
+  "title": ".demur.toml",
+  "type": "object"
+}

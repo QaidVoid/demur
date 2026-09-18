@@ -21,5 +21,14 @@ sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
 for binary in demur demur-action; do
   test -x "$out/$binary"
 done
+
+# The stable schema describes the current release; the versioned copy is an
+# immutable snapshot, so a pinned binary can be matched by a pinned schema.
+schema_dir="docs/public/schema/v${version}"
+mkdir -p "$schema_dir"
+"$out/demur" schema > "$schema_dir/demur.schema.json"
+diff -q "$schema_dir/demur.schema.json" docs/public/demur.schema.json >/dev/null
+
 echo "artifacts:"
 ls -l "$out.tar.gz" "$out.tar.gz.sha256"
+ls -l docs/public/demur.schema.json "$schema_dir/demur.schema.json"

@@ -9,11 +9,19 @@ cargo fmt --check
 cargo clippy -- -D warnings
 cargo test
 
-if command -v npm >/dev/null 2>&1; then
+# The published schema is generated from the configuration types. The test
+# above fails when it drifts; this says what to run when it does.
+if ! cargo run --quiet -p demur -- schema | diff -q - docs/public/demur.schema.json >/dev/null; then
+  echo "docs/public/demur.schema.json is stale." >&2
+  echo "regenerate it: cargo run -p demur -- schema > docs/public/demur.schema.json" >&2
+  exit 1
+fi
+
+if command -v bun >/dev/null 2>&1; then
   if [ ! -d docs/node_modules ]; then
-    (cd docs && npm install --no-audit --no-fund)
+    (cd docs && bun install --frozen-lockfile)
   fi
-  (cd docs && npm run docs:build)
+  (cd docs && bun run docs:build)
 else
-  echo "npm not found: skipping the docs build" >&2
+  echo "bun not found: skipping the docs build" >&2
 fi
