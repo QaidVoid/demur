@@ -31,6 +31,19 @@ is used. The key is never logged, never published in a review or check run,
 and never appears in an error message: error text that echoes request
 material is redacted before it can reach any output.
 
+When using `key_file`, give an absolute path, because `~` is not expanded.
+Create the file with the key on the first line and restrict its
+permissions:
+
+```bash
+mkdir -p ~/.secrets
+printf '%s\n' 'sk-your-key' > ~/.secrets/ajam-key
+chmod 600 ~/.secrets/ajam-key
+```
+
+The environment variable takes precedence: when the variable named by
+`key_env` is set, the file is not read.
+
 ## Model roles and prices
 
 Every role is required, and every model requires a price, because budgets
