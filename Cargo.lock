@@ -325,6 +325,7 @@ dependencies = [
 name = "demur-core"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "globset",
  "log",
  "regex",

@@ -21,6 +21,7 @@ use crate::provider::{
     TokenUsage, complete_with_retries,
 };
 use budget::{BudgetGate, Degradation, LadderDecision, PassEstimate};
+use futures::StreamExt;
 use prompt::PullRequestMeta;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -47,7 +48,15 @@ const MAX_FAILED_DIVES: u32 = 2;
 /// end-to-end pipeline tests and for offline replay runs.
 pub struct RecordedProvider {
     steps: std::sync::Mutex<std::collections::VecDeque<Result<Value, ProviderError>>>,
+    /// Responses matched to a marker in the request rather than to call
+    /// order. Concurrency makes call order arbitrary, so a fixture that
+    /// models per-cluster answers has to key on the request.
+    keyed: Vec<(String, Result<Value, ProviderError>, std::time::Duration)>,
     seen: std::sync::Mutex<Vec<CompletionRequest>>,
+    /// Calls currently inside `complete`, and the high water mark. A
+    /// fixture can assert that a concurrency limit was actually honored.
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak_in_flight: std::sync::atomic::AtomicUsize,
     usage: TokenUsage,
 }
 
@@ -57,7 +66,31 @@ impl RecordedProvider {
     pub fn new(steps: Vec<Result<Value, ProviderError>>) -> RecordedProvider {
         RecordedProvider {
             steps: std::sync::Mutex::new(steps.into()),
+            keyed: Vec::new(),
             seen: std::sync::Mutex::new(Vec::new()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
+            usage: TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 20,
+            },
+        }
+    }
+
+    /// Build from responses keyed by a marker that must appear in the
+    /// request, each with a delay before it answers. The delay lets a
+    /// fixture force completions to arrive in a different order than the
+    /// calls were made.
+    pub fn keyed(
+        responses: Vec<(String, Result<Value, ProviderError>, std::time::Duration)>,
+    ) -> RecordedProvider {
+        RecordedProvider {
+            steps: std::sync::Mutex::new(std::collections::VecDeque::new()),
+            keyed: responses,
+            seen: std::sync::Mutex::new(Vec::new()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            peak_in_flight: std::sync::atomic::AtomicUsize::new(0),
             usage: TokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 0,
@@ -70,6 +103,21 @@ impl RecordedProvider {
     pub fn requests(&self) -> Vec<CompletionRequest> {
         self.seen.lock().expect("recorded requests lock").clone()
     }
+
+    /// The most calls this provider ever had in flight at once.
+    pub fn peak_in_flight(&self) -> usize {
+        self.peak_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+/// Decrements the in-flight count however the call leaves.
+struct InFlight<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl crate::provider::Provider for RecordedProvider {
@@ -77,10 +125,35 @@ impl crate::provider::Provider for RecordedProvider {
         &self,
         request: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        use std::sync::atomic::Ordering;
         self.seen
             .lock()
             .expect("recorded requests lock")
             .push(request.clone());
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak_in_flight.fetch_max(now, Ordering::SeqCst);
+        let _guard = InFlight(&self.in_flight);
+        if !self.keyed.is_empty() {
+            let (_, response, delay) = self
+                .keyed
+                .iter()
+                .find(|(marker, _, _)| request.user.contains(marker.as_str()))
+                .ok_or_else(|| ProviderError::Malformed {
+                    message: "no recorded response matches this request".to_string(),
+                })?;
+            if !delay.is_zero() {
+                tokio::time::sleep(*delay).await;
+            }
+            return match response {
+                Ok(content) => Ok(CompletionResponse {
+                    content: content.clone(),
+                    usage: self.usage,
+                }),
+                Err(error) => Err(ProviderError::Rejected {
+                    message: error.to_string(),
+                }),
+            };
+        }
         let step = self
             .steps
             .lock()
@@ -289,14 +362,15 @@ you can already anchor to an exact file and line range with its concrete harm.";
         price: &triage_price,
         downgrade_price: None,
     };
-    let triage_prompt = match gate.authorize(estimate) {
+    let (triage_prompt, triage_hold) = match gate.authorize(estimate) {
         LadderDecision::Run {
             shrink,
             degradations: disclosed,
+            hold,
             ..
         } => {
             degradations.extend(disclosed);
-            if shrink { triage_shrunk } else { triage_full }
+            (if shrink { triage_shrunk } else { triage_full }, hold)
         }
         LadderDecision::StandDown => {
             return Ok(RunOutcome::Skipped {
@@ -305,7 +379,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
             });
         }
     };
-    let triage_result = call_pass::<findings::TriageOutput>(
+    let triage_result = match call_pass::<findings::TriageOutput>(
         &registry.triage,
         triage_prompt,
         prompt::findings_schema(),
@@ -313,7 +387,14 @@ you can already anchor to an exact file and line range with its concrete harm.";
         config.limits.max_tokens,
         triage_cache,
     )
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => {
+            gate.release(triage_hold);
+            return Err(err.into());
+        }
+    };
     let (triage_output, usage, resumed) = (
         triage_result.output,
         triage_result.usage,
@@ -322,7 +403,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
     spend.push(PassSpend {
         pass: "triage".to_string(),
         usage,
-        cost: record_pass(&mut gate, &usage, &triage_price, resumed),
+        cost: settle_pass(&mut gate, triage_hold, &usage, &triage_price, resumed),
         resumed,
     });
     log::info!(
@@ -359,154 +440,102 @@ you can already anchor to an exact file and line range with its concrete harm.";
         .map(|entry| (entry.path.clone(), entry.lenses.clone()))
         .collect();
 
-    // Deep dives.
+    // Deep dives. Planned in full before any of them runs, so the ceiling
+    // bounds what is launched rather than what has finished, then executed
+    // concurrently because no dive reads another's output.
     let mut unreviewed: Vec<String> = Vec::new();
     if profile != Profile::Quick {
-        let ceiling = config.limits.deep_calls;
-        let mut calls: u32 = 0;
-        let mut failed_dives: u32 = 0;
-        log::info!(
-            "deep dives: {} cluster(s) to consider, ceiling {} call(s)",
-            input.ingestion.clusters.len(),
-            ceiling
-        );
-        'clusters: for cluster in &input.ingestion.clusters {
-            if calls >= ceiling {
-                unreviewed.push(cluster.path.clone());
-                continue;
-            }
+        let ceiling = config.limits.deep_calls as usize;
+        let mut planned: Vec<PlannedDive<'_>> = Vec::new();
+        for cluster in &input.ingestion.clusters {
             let lenses = select_lenses(cluster, &lens_map, &config.lenses);
             if lenses.is_empty() {
                 continue;
             }
             for lens in lenses {
-                if calls >= ceiling {
-                    unreviewed.push(cluster.path.clone());
-                    break;
+                if planned.len() >= ceiling {
+                    if !unreviewed.contains(&cluster.path) {
+                        unreviewed.push(cluster.path.clone());
+                    }
+                    continue;
                 }
-                log::info!("deep dive [{}]: {}", lens, cluster.path);
-                let dive_started = std::time::Instant::now();
-                let context = prompt::cluster_context(&input.meta, &cluster.path, &cluster.hunks);
-                let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
-                let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
-                let task = deep_dive_task(&lens);
-                let full_prompt = prompt::assemble(&context, &task, &prompt::findings_schema());
-                let shrunk_prompt = prompt::assemble(&shrunk, &task, &prompt::findings_schema());
-                let decision = gate.authorize(PassEstimate {
-                    pass: "deep dive",
-                    full_tokens: estimate_prompt(&full_prompt),
-                    shrunk_tokens: estimate_prompt(&shrunk_prompt),
-                    max_output_tokens: config.limits.max_tokens,
-                    price: &deep_price,
-                    downgrade_price: Some(&triage_price),
-                });
-                let (shrink, downgraded) = match decision {
-                    LadderDecision::Run {
-                        shrink,
-                        downgrade,
-                        degradations: disclosed,
-                    } => {
-                        degradations.extend(disclosed);
-                        (shrink, downgrade)
-                    }
-                    LadderDecision::StandDown => {
-                        degradations.push(Degradation::SummaryOnly {
-                            skipped: vec!["remaining deep dives".to_string()],
-                        });
-                        break 'clusters;
-                    }
-                };
-                let provider = if downgraded {
-                    &registry.triage
-                } else {
-                    &registry.deep
-                };
-                let chosen = if shrink {
-                    shrunk_prompt.clone()
-                } else {
-                    full_prompt
-                };
-                let pass_cache = if downgraded { triage_cache } else { deep_cache };
-                let dived = call_pass::<findings::ModelFindings>(
-                    provider,
-                    chosen,
-                    prompt::findings_schema(),
-                    "deep dive",
-                    config.limits.max_tokens,
-                    pass_cache,
-                )
-                .await;
-                let dived = match dived {
-                    Err(ProviderError::ContextOverflow { .. }) if !shrink => {
-                        // Shrink to the first hunk and retry once.
-                        call_pass::<findings::ModelFindings>(
-                            provider,
-                            shrunk_prompt,
-                            prompt::findings_schema(),
-                            "deep dive",
-                            config.limits.max_tokens,
-                            pass_cache,
-                        )
-                        .await
-                        .inspect(|_| {
-                            degradations.push(Degradation::ContextShrunk {
-                                pass: format!("deep dive ({lens})"),
-                            });
-                        })
-                    }
-                    other => other,
-                };
-                let (dive_output, usage, resumed) = match dived {
-                    Ok(result) => (result.output, result.usage, result.resumed),
-                    // A key problem repeats on every remaining cluster, so
-                    // failing fast beats burning the ceiling to learn it.
-                    Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
-                    Err(err) => {
-                        log::warn!("deep dive [{lens}] on {} failed: {err}", cluster.path);
-                        degradations.push(Degradation::PassFailed {
-                            pass: format!("deep dive ({lens}) on {}", cluster.path),
-                            reason: err.to_string(),
-                        });
-                        failed_dives += 1;
-                        if failed_dives > MAX_FAILED_DIVES {
-                            return Err(err.into());
-                        }
-                        calls += 1;
-                        continue;
-                    }
-                };
-                let paid_price = if downgraded {
-                    &triage_price
-                } else {
-                    &deep_price
-                };
-                let dive_cost = record_pass(&mut gate, &usage, paid_price, resumed);
-                spend.push(PassSpend {
-                    pass: format!("deep dive {lens}"),
-                    usage,
-                    cost: dive_cost,
-                    resumed,
-                });
-                log::info!(
-                    "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
+                planned.push(PlannedDive {
+                    index: planned.len(),
+                    cluster,
                     lens,
-                    dive_output.findings.len(),
-                    dive_started.elapsed(),
-                    dive_cost
-                );
-                for raw in &dive_output.findings {
-                    if let Some(finding) = findings::validate(raw, &diff_paths) {
-                        if input
-                            .suppress_fingerprints
-                            .contains(&crate::delta::fingerprint(&finding, &cluster.hunks))
-                        {
-                            continue;
-                        }
-                        all_findings.push(finding);
-                    }
-                }
-                calls += 1;
+                });
             }
+        }
+        log::info!(
+            "deep dives: {} planned from {} cluster(s), ceiling {}, concurrency {}",
+            planned.len(),
+            input.ingestion.clusters.len(),
+            ceiling,
+            config.limits.concurrency
+        );
+
+        let gate_cell = std::sync::Mutex::new(std::mem::replace(
+            &mut gate,
+            BudgetGate::new(config.budget.cap(), input.prior_spend),
+        ));
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let failures = std::sync::atomic::AtomicU32::new(0);
+
+        let dives = planned.iter().map(|dive| {
+            run_deep_dive(
+                dive,
+                config,
+                registry,
+                input,
+                &diff_paths,
+                &gate_cell,
+                &deep_price,
+                &triage_price,
+                triage_cache,
+                deep_cache,
+                &stop,
+                &failures,
+            )
+        });
+        let mut outcomes: Vec<Option<DiveOutcome>> = (0..planned.len()).map(|_| None).collect();
+        let mut stream = futures::stream::iter(dives)
+            .buffer_unordered(config.limits.concurrency.max(1) as usize);
+        while let Some(outcome) = stream.next().await {
+            let index = outcome.index;
+            outcomes[index] = Some(outcome);
+        }
+        drop(stream);
+        gate = gate_cell.into_inner().expect("budget gate lock");
+
+        // Results are placed by position, so the sequence entering
+        // synthesis is the one a serial run would have produced.
+        let mut stood_down = false;
+        for outcome in outcomes.into_iter().flatten() {
+            if let Some(err) = outcome.fatal {
+                return Err(err.into());
+            }
+            degradations.extend(outcome.degradations);
+            if outcome.stood_down {
+                stood_down = true;
+            }
+            if let Some(pass_spend) = outcome.spend {
+                spend.push(pass_spend);
+            }
+            all_findings.extend(outcome.findings);
+        }
+        if stood_down {
+            degradations.push(Degradation::SummaryOnly {
+                skipped: vec!["remaining deep dives".to_string()],
+            });
+        }
+        if failures.load(std::sync::atomic::Ordering::SeqCst) > MAX_FAILED_DIVES {
+            return Err(PipelineError::Provider(ProviderError::Rejected {
+                message: format!(
+                    "{} deep dives failed against the provider; the run stopped rather than \
+publishing coverage it could not establish",
+                    failures.load(std::sync::atomic::Ordering::SeqCst)
+                ),
+            }));
         }
         if !unreviewed.is_empty() {
             degradations.push(Degradation::DeepCallsCapped { unreviewed });
@@ -541,9 +570,10 @@ with their concrete harm.";
                 shrink,
                 downgrade,
                 degradations: disclosed,
+                hold,
             } => {
                 degradations.extend(disclosed);
-                Some((shrink, downgrade))
+                Some((shrink, downgrade, hold))
             }
             LadderDecision::StandDown => {
                 degradations.push(Degradation::SummaryOnly {
@@ -552,7 +582,7 @@ with their concrete harm.";
                 None
             }
         };
-        if let Some((shrink, downgrade)) = plan {
+        if let Some((shrink, downgrade, cross_hold)) = plan {
             let provider = if downgrade {
                 &registry.triage
             } else {
@@ -580,28 +610,38 @@ with their concrete harm.";
                 if downgrade { triage_cache } else { deep_cache },
             )
             .await;
-            let (cross_output, usage, resumed) = match cross {
-                Ok(result) => (result.output, result.usage, result.resumed),
-                Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
+            // A failed pass releases its hold and contributes no spend
+            // line, because it spent nothing.
+            let cross_output = match cross {
+                Ok(result) => {
+                    spend.push(PassSpend {
+                        pass: "cross-examination".to_string(),
+                        usage: result.usage,
+                        cost: settle_pass(
+                            &mut gate,
+                            cross_hold,
+                            &result.usage,
+                            paid_price,
+                            result.resumed,
+                        ),
+                        resumed: result.resumed,
+                    });
+                    result.output
+                }
+                Err(err @ ProviderError::Auth { .. }) => {
+                    gate.release(cross_hold);
+                    return Err(err.into());
+                }
                 Err(err) => {
+                    gate.release(cross_hold);
                     log::warn!("cross-examination failed: {err}");
                     degradations.push(Degradation::PassFailed {
                         pass: "cross-examination".to_string(),
                         reason: err.to_string(),
                     });
-                    (
-                        findings::ModelFindings::default(),
-                        TokenUsage::default(),
-                        false,
-                    )
+                    findings::ModelFindings::default()
                 }
             };
-            spend.push(PassSpend {
-                pass: "cross-examination".to_string(),
-                usage,
-                cost: record_pass(&mut gate, &usage, paid_price, resumed),
-                resumed,
-            });
             log::info!(
                 "cross-examination: {} finding(s) in {:.1?}",
                 cross_output.findings.len(),
@@ -697,6 +737,7 @@ coverage was complete and no defect was established.";
             LadderDecision::Run {
                 downgrade,
                 degradations: disclosed,
+                hold,
                 ..
             } => {
                 degradations.extend(disclosed);
@@ -738,8 +779,9 @@ coverage was complete and no defect was established.";
                         spend.push(PassSpend {
                             pass: "verdict summary".to_string(),
                             usage: result.usage,
-                            cost: record_pass(
+                            cost: settle_pass(
                                 &mut *gate,
+                                hold,
                                 &result.usage,
                                 paid_price,
                                 result.resumed,
@@ -750,6 +792,7 @@ coverage was complete and no defect was established.";
                     }
                     Err(err) => {
                         log::warn!("verdict summary failed, publishing without it: {err}");
+                        gate.release(hold);
                         if let ProviderError::OutputTruncated { usage, .. } = &err {
                             spend.push(PassSpend {
                                 pass: "verdict summary (failed)".to_string(),
@@ -1046,19 +1089,216 @@ fn open_cache(config: &Config) -> Option<crate::cache::FsStore> {
     store
 }
 
-/// Price a completed pass. A pass served from cache made no provider call
-/// this run, so it consumes no budget, but its original cost is still
-/// reported because those dollars were spent.
-fn record_pass(
+/// One deep dive decided before any of them runs.
+struct PlannedDive<'a> {
+    index: usize,
+    cluster: &'a crate::ingest::Cluster,
+    lens: String,
+}
+
+/// What one deep dive produced. Collected by position so the order
+/// entering synthesis never depends on which call returned first.
+struct DiveOutcome {
+    index: usize,
+    findings: Vec<findings::Finding>,
+    spend: Option<PassSpend>,
+    degradations: Vec<Degradation>,
+    /// The budget stood down on this dive, so no further dive should run.
+    stood_down: bool,
+    /// A failure no amount of degrading survives, such as a bad key.
+    fatal: Option<ProviderError>,
+}
+
+/// Run one planned deep dive. Everything it touches is either its own or
+/// shared behind a lock held only for bookkeeping, never across a call.
+#[allow(clippy::too_many_arguments)]
+async fn run_deep_dive(
+    dive: &PlannedDive<'_>,
+    config: &Config,
+    registry: &ProviderRegistry,
+    input: &PipelineInput,
+    diff_paths: &[String],
+    gate: &std::sync::Mutex<BudgetGate>,
+    deep_price: &ModelPrice,
+    triage_price: &ModelPrice,
+    triage_cache: PassCache<'_>,
+    deep_cache: PassCache<'_>,
+    stop: &std::sync::atomic::AtomicBool,
+    failures: &std::sync::atomic::AtomicU32,
+) -> DiveOutcome {
+    use std::sync::atomic::Ordering;
+
+    let empty = |stood_down: bool| DiveOutcome {
+        index: dive.index,
+        findings: Vec::new(),
+        spend: None,
+        degradations: Vec::new(),
+        stood_down,
+        fatal: None,
+    };
+    if stop.load(Ordering::SeqCst) {
+        return empty(false);
+    }
+
+    let cluster = dive.cluster;
+    let lens = &dive.lens;
+    let context = prompt::cluster_context(&input.meta, &cluster.path, &cluster.hunks);
+    let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
+    let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
+    let task = deep_dive_task(lens);
+    let full_prompt = prompt::assemble(&context, &task, &prompt::findings_schema());
+    let shrunk_prompt = prompt::assemble(&shrunk, &task, &prompt::findings_schema());
+
+    // The lock is held for the decision only, never across the call.
+    let decision = {
+        let mut gate = gate.lock().expect("budget gate lock");
+        gate.authorize(PassEstimate {
+            pass: "deep dive",
+            full_tokens: estimate_prompt(&full_prompt),
+            shrunk_tokens: estimate_prompt(&shrunk_prompt),
+            max_output_tokens: config.limits.max_tokens,
+            price: deep_price,
+            downgrade_price: Some(triage_price),
+        })
+    };
+    let (shrink, downgraded, hold, mut degradations) = match decision {
+        LadderDecision::Run {
+            shrink,
+            downgrade,
+            degradations,
+            hold,
+        } => (shrink, downgrade, hold, degradations),
+        LadderDecision::StandDown => {
+            stop.store(true, Ordering::SeqCst);
+            return empty(true);
+        }
+    };
+
+    log::info!("deep dive [{}]: {}", lens, cluster.path);
+    let started = std::time::Instant::now();
+    let provider = if downgraded {
+        &registry.triage
+    } else {
+        &registry.deep
+    };
+    let pass_cache = if downgraded { triage_cache } else { deep_cache };
+    let chosen = if shrink {
+        shrunk_prompt.clone()
+    } else {
+        full_prompt
+    };
+    let dived = call_pass::<findings::ModelFindings>(
+        provider,
+        chosen,
+        prompt::findings_schema(),
+        "deep dive",
+        config.limits.max_tokens,
+        pass_cache,
+    )
+    .await;
+    let dived = match dived {
+        Err(ProviderError::ContextOverflow { .. }) if !shrink => {
+            // Shrink to the first hunk and retry once.
+            call_pass::<findings::ModelFindings>(
+                provider,
+                shrunk_prompt,
+                prompt::findings_schema(),
+                "deep dive",
+                config.limits.max_tokens,
+                pass_cache,
+            )
+            .await
+            .inspect(|_| {
+                degradations.push(Degradation::ContextShrunk {
+                    pass: format!("deep dive ({lens})"),
+                });
+            })
+        }
+        other => other,
+    };
+
+    let result = match dived {
+        Ok(result) => result,
+        // A key problem repeats on every remaining cluster, so failing fast
+        // beats burning the ceiling to learn it.
+        Err(err @ ProviderError::Auth { .. }) => {
+            gate.lock().expect("budget gate lock").release(hold);
+            stop.store(true, Ordering::SeqCst);
+            return DiveOutcome {
+                fatal: Some(err),
+                ..empty(false)
+            };
+        }
+        Err(err) => {
+            gate.lock().expect("budget gate lock").release(hold);
+            log::warn!("deep dive [{lens}] on {} failed: {err}", cluster.path);
+            degradations.push(Degradation::PassFailed {
+                pass: format!("deep dive ({lens}) on {}", cluster.path),
+                reason: err.to_string(),
+            });
+            if failures.fetch_add(1, Ordering::SeqCst) + 1 > MAX_FAILED_DIVES {
+                stop.store(true, Ordering::SeqCst);
+            }
+            return DiveOutcome {
+                degradations,
+                ..empty(false)
+            };
+        }
+    };
+
+    let paid_price = if downgraded { triage_price } else { deep_price };
+    let cost = {
+        let mut gate = gate.lock().expect("budget gate lock");
+        settle_pass(&mut gate, hold, &result.usage, paid_price, result.resumed)
+    };
+    log::info!(
+        "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
+        lens,
+        result.output.findings.len(),
+        started.elapsed(),
+        cost
+    );
+    let mut found = Vec::new();
+    for raw in &result.output.findings {
+        if let Some(finding) = findings::validate(raw, diff_paths)
+            && !input
+                .suppress_fingerprints
+                .contains(&crate::delta::fingerprint(&finding, &cluster.hunks))
+        {
+            found.push(finding);
+        }
+    }
+    DiveOutcome {
+        index: dive.index,
+        findings: found,
+        spend: Some(PassSpend {
+            pass: format!("deep dive {lens}"),
+            usage: result.usage,
+            cost,
+            resumed: result.resumed,
+        }),
+        degradations,
+        stood_down: false,
+        fatal: None,
+    }
+}
+
+/// Settle a completed pass against its hold. A pass served from cache made
+/// no provider call this run, so its hold is released and it consumes no
+/// budget, but its original cost is still reported because those dollars
+/// were spent.
+fn settle_pass(
     gate: &mut BudgetGate,
+    hold: budget::Hold,
     usage: &TokenUsage,
     price: &ModelPrice,
     resumed: bool,
 ) -> f64 {
     if resumed {
+        gate.release(hold);
         price.cost_of_usage(usage)
     } else {
-        gate.record(usage, price)
+        gate.settle(hold, usage, price)
     }
 }
 

@@ -1042,3 +1042,341 @@ async fn a_skipped_local_run_reports_no_violation_but_explains_itself() {
         "{notice}"
     );
 }
+
+/// A deep dive answer naming the cluster it came from, so a test can tell
+/// which dive produced which finding.
+fn keyed_dive(file: &str, message: &str) -> serde_json::Value {
+    json!({
+        "findings": [{
+            "file": file,
+            "start_line": 2,
+            "end_line": 2,
+            "severity": "warning",
+            "message": message,
+            "harm": "Merging this leaves the defect reachable in production."
+        }]
+    })
+}
+
+/// Deep dives that deliberately finish in the opposite order to the one
+/// they were started in.
+fn out_of_order_registry() -> ProviderRegistry {
+    use std::time::Duration;
+    ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(triage_response())]),
+        RecordedProvider::keyed(vec![
+            // The first cluster planned answers last.
+            (
+                "src/auth/token.rs".to_string(),
+                Ok(keyed_dive("src/auth/token.rs", "token defect")),
+                Duration::from_millis(120),
+            ),
+            (
+                "src/util.rs".to_string(),
+                Ok(keyed_dive("src/util.rs", "util defect")),
+                Duration::from_millis(10),
+            ),
+        ]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    )
+}
+
+fn concurrent_config(limit: u32) -> Config {
+    let mut config = config_with("standard", "");
+    config.limits.concurrency = limit;
+    config
+}
+
+#[tokio::test]
+async fn the_dive_planned_first_wins_deduplication() {
+    // Two lenses on one file report the same defect at different
+    // severities. Deduplication keeps the first occurrence, so if results
+    // were collected as they arrived, the slower lens would lose its
+    // severity and the verdict would follow whichever call happened to
+    // return first.
+    use std::time::Duration;
+    let triage = json!({
+        "findings": [],
+        "cluster_lens": [{"path": "src/auth/token.rs", "lenses": ["security", "correctness"]}]
+    });
+    let same_defect = |severity: &str| {
+        json!({
+            "findings": [{
+                "file": "src/auth/token.rs",
+                "start_line": 2,
+                "end_line": 3,
+                "severity": severity,
+                "message": "hardcoded credential",
+                "harm": "Merging publishes a live credential reachable by attackers."
+            }]
+        })
+    };
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(triage)]),
+        RecordedProvider::keyed(vec![
+            // Planned first, answers last.
+            (
+                "through the security lens".to_string(),
+                Ok(same_defect("blocker")),
+                Duration::from_millis(120),
+            ),
+            (
+                "through the correctness lens".to_string(),
+                Ok(same_defect("note")),
+                Duration::from_millis(5),
+            ),
+        ]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    );
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&providers, &concurrent_config(4), &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert_eq!(review.published.len(), 1, "the two are one finding");
+    assert_eq!(
+        review.published[0].severity,
+        Severity::Blocker,
+        "the dive planned first must win, whatever order they returned in"
+    );
+    assert_eq!(
+        review.verdict,
+        crate::pipeline::synthesis::Verdict::RequestChanges
+    );
+}
+
+#[tokio::test]
+async fn disclosed_spend_follows_the_planned_order() {
+    // The spend lines are rendered in the order passes were planned, so a
+    // review of the same pull request always reads the same way.
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&out_of_order_registry(), &concurrent_config(4), &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let dives: Vec<&str> = review
+        .spend
+        .passes
+        .iter()
+        .map(|pass| pass.pass.as_str())
+        .filter(|name| name.starts_with("deep dive"))
+        .collect();
+    assert_eq!(
+        dives,
+        vec!["deep dive security", "deep dive correctness"],
+        "spend must follow the planned order, not the completion order"
+    );
+}
+
+#[tokio::test]
+async fn a_concurrent_run_and_a_serial_run_agree_exactly() {
+    let serial = crate::pipeline::run(&out_of_order_registry(), &concurrent_config(1), &input())
+        .await
+        .unwrap();
+    let concurrent =
+        crate::pipeline::run(&out_of_order_registry(), &concurrent_config(4), &input())
+            .await
+            .unwrap();
+    let (RunOutcome::Review(serial), RunOutcome::Review(concurrent)) = (serial, concurrent) else {
+        panic!("expected reviews");
+    };
+    assert_eq!(serial.verdict, concurrent.verdict);
+    assert_eq!(serial.omitted, concurrent.omitted);
+    assert_eq!(serial.degradations, concurrent.degradations);
+    assert_eq!(serial.published.len(), concurrent.published.len());
+    for (a, b) in serial.published.iter().zip(concurrent.published.iter()) {
+        assert_eq!(a.file, b.file);
+        assert_eq!(a.message, b.message);
+        assert_eq!(a.severity, b.severity);
+    }
+    assert!(
+        (serial.spend.total - concurrent.spend.total).abs() < 1e-12,
+        "concurrency must not change spend: {} vs {}",
+        serial.spend.total,
+        concurrent.spend.total
+    );
+    assert_eq!(serial.body, concurrent.body);
+}
+
+#[tokio::test]
+async fn concurrency_of_one_is_the_serial_path() {
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&out_of_order_registry(), &concurrent_config(1), &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let order: Vec<&str> = review
+        .published
+        .iter()
+        .map(|finding| finding.file.as_str())
+        .collect();
+    assert_eq!(order, vec!["src/auth/token.rs", "src/util.rs"]);
+}
+
+#[tokio::test]
+async fn the_deep_call_ceiling_bounds_what_is_launched() {
+    let mut config = concurrent_config(4);
+    config.limits.deep_calls = 1;
+    let providers = out_of_order_registry();
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let dives = review
+        .spend
+        .passes
+        .iter()
+        .filter(|pass| pass.pass.starts_with("deep dive"))
+        .count();
+    assert_eq!(dives, 1, "the ceiling bounds launches, not completions");
+    assert!(
+        review.body.contains("deep call ceiling left"),
+        "{}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn one_concurrent_failure_keeps_the_other_dives() {
+    use std::time::Duration;
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(triage_response())]),
+        RecordedProvider::keyed(vec![
+            (
+                "src/auth/token.rs".to_string(),
+                Err(ProviderError::Rejected {
+                    message: "provider said no".to_string(),
+                }),
+                Duration::from_millis(5),
+            ),
+            (
+                "src/util.rs".to_string(),
+                Ok(keyed_dive("src/util.rs", "util defect")),
+                Duration::from_millis(40),
+            ),
+        ]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    );
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&providers, &concurrent_config(4), &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(review.body.contains("util defect"), "{}", review.body);
+    assert!(
+        review.body.contains("failed and was skipped"),
+        "{}",
+        review.body
+    );
+}
+
+/// Six dives over three clusters, each slow enough to overlap.
+fn many_dives_registry() -> ProviderRegistry {
+    use std::time::Duration;
+    let triage = json!({
+        "findings": [],
+        "cluster_lens": [
+            {"path": "src/auth/token.rs", "lenses": ["security", "correctness"]},
+            {"path": "src/util.rs", "lenses": ["security", "correctness"]}
+        ]
+    });
+    ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(triage)]),
+        RecordedProvider::keyed(vec![
+            (
+                "through the security lens".to_string(),
+                Ok(keyed_dive("src/auth/token.rs", "security defect")),
+                Duration::from_millis(60),
+            ),
+            (
+                "through the correctness lens".to_string(),
+                Ok(keyed_dive("src/util.rs", "correctness defect")),
+                Duration::from_millis(60),
+            ),
+            (
+                "Cross-examine".to_string(),
+                Ok(json!({"findings": []})),
+                Duration::from_millis(5),
+            ),
+        ]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    )
+}
+
+#[tokio::test]
+async fn in_flight_calls_never_exceed_the_limit() {
+    for limit in [1u32, 2, 3] {
+        let providers = many_dives_registry();
+        let mut config = concurrent_config(limit);
+        config.limits.deep_calls = 4;
+        crate::pipeline::run(&providers, &config, &input())
+            .await
+            .unwrap();
+        let deep = recorded(&providers.deep);
+        assert_eq!(
+            deep.requests().len(),
+            4,
+            "every planned dive must run at limit {limit}"
+        );
+        assert!(
+            deep.peak_in_flight() <= limit as usize,
+            "limit {limit} exceeded: peak was {}",
+            deep.peak_in_flight()
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrency_above_one_actually_overlaps() {
+    // Without this the limit could be honored by never running anything
+    // concurrently at all, which would make the feature a no-op.
+    let providers = many_dives_registry();
+    let mut config = concurrent_config(4);
+    config.limits.deep_calls = 4;
+    crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+    assert!(
+        recorded(&providers.deep).peak_in_flight() > 1,
+        "dives must actually overlap"
+    );
+}
+
+#[tokio::test]
+async fn stages_stay_ordered() {
+    let providers = many_dives_registry();
+    let mut config = concurrent_config(4);
+    config.limits.deep_calls = 4;
+    config.profile = Some(crate::config::Profile::Deep);
+    crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+    // Triage is asked exactly once, and its answer is what decides which
+    // dives exist, so the dives cannot precede it.
+    assert_eq!(recorded(&providers.triage).requests().len(), 1);
+    let deep = recorded(&providers.deep);
+    let names: Vec<String> = deep
+        .requests()
+        .iter()
+        .map(|request| request.schema_name.clone())
+        .collect();
+    assert_eq!(
+        names.last().map(String::as_str),
+        Some("cross-examination"),
+        "cross-examination runs only after every deep dive: {names:?}"
+    );
+    assert_eq!(
+        names.iter().filter(|n| n.as_str() == "deep dive").count(),
+        4
+    );
+}
