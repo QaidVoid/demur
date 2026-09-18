@@ -268,18 +268,21 @@ pub async fn review_pr(
                 ),
             }
             if publish {
-                let login = client
-                    .authenticated_login()
-                    .await
-                    .map_err(|err| err.to_string())?;
+                // Naming the identity is courtesy; failing to look it up
+                // must not cost a review that is already paid for.
+                let login = client.authenticated_login().await.ok();
+                let whose = login
+                    .as_deref()
+                    .map(|login| format!("@{login}"))
+                    .unwrap_or_else(|| "your account".to_string());
                 if identity.badged {
                     println!(
-                        "Publishing as @{login}, marked as demur's work: the review is yours \
+                        "Publishing as {whose}, marked as demur's work: the review is yours \
 and carries demur's mark beside your name."
                     );
                 } else {
                     println!(
-                        "Publishing under your identity @{login}: findings will appear under \
+                        "Publishing under your identity {whose}: findings will appear under \
 your name, not under a bot identity, and without demur's mark."
                     );
                 }

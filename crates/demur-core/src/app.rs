@@ -10,9 +10,40 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
-/// Where the code-entry flow starts and finishes. Overridable so tests
-/// never talk to the real service.
+/// Where the code-entry flow starts and finishes on github.com.
 const DEFAULT_ENDPOINT: &str = "https://github.com";
+
+/// The web host an authorization flow runs against, derived from what the
+/// environment says about which GitHub this is. An installation that is not
+/// github.com serves the flow from its own host, so hardcoding the public
+/// one locks enterprise users out of authorizing entirely.
+///
+/// Taken as arguments rather than read here so the derivation can be tested
+/// without an environment.
+pub fn web_host(server_url: Option<&str>, api_url: Option<&str>) -> String {
+    // Workflows are told the server URL outright.
+    if let Some(server) = server_url.map(str::trim).filter(|value| !value.is_empty()) {
+        return server.trim_end_matches('/').to_string();
+    }
+    let Some(api) = api_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return DEFAULT_ENDPOINT.to_string();
+    };
+    let api = api.trim_end_matches('/');
+    if api == "https://api.github.com" {
+        return DEFAULT_ENDPOINT.to_string();
+    }
+    // An enterprise instance serves its API under the same host as its web
+    // interface.
+    api.strip_suffix("/api/v3").unwrap_or(api).to_string()
+}
+
+/// The web host for this process, from the environment.
+pub fn web_host_from_env() -> String {
+    web_host(
+        std::env::var("GITHUB_SERVER_URL").ok().as_deref(),
+        std::env::var("GITHUB_API_URL").ok().as_deref(),
+    )
+}
 
 /// Longest a run waits for someone to finish authorizing.
 const AUTHORIZE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -114,11 +145,12 @@ pub struct Authorizer {
 }
 
 impl Authorizer {
-    /// Build an authorizer for an application.
+    /// Build an authorizer for an application, against whichever GitHub
+    /// this process is pointed at.
     pub fn new(client_id: &str) -> Authorizer {
         Authorizer {
             http: reqwest::Client::new(),
-            endpoint: DEFAULT_ENDPOINT.to_string(),
+            endpoint: web_host_from_env(),
             client_id: client_id.to_string(),
         }
     }
@@ -455,6 +487,45 @@ mod tests {
     }
 
     #[test]
+    fn the_public_instance_uses_the_public_host() {
+        assert_eq!(web_host(None, None), "https://github.com");
+        assert_eq!(
+            web_host(None, Some("https://api.github.com")),
+            "https://github.com"
+        );
+    }
+
+    #[test]
+    fn an_enterprise_instance_authorizes_against_itself() {
+        // Hardcoding the public host locks enterprise users out of
+        // authorizing at all.
+        assert_eq!(
+            web_host(None, Some("https://ghe.example.com/api/v3")),
+            "https://ghe.example.com"
+        );
+        assert_eq!(
+            web_host(None, Some("https://ghe.example.com/api/v3/")),
+            "https://ghe.example.com"
+        );
+    }
+
+    #[test]
+    fn a_stated_server_url_wins() {
+        assert_eq!(
+            web_host(
+                Some("https://ghe.example.com/"),
+                Some("https://api.github.com")
+            ),
+            "https://ghe.example.com"
+        );
+        // Empty is the same as unset.
+        assert_eq!(
+            web_host(Some("  "), Some("https://api.github.com")),
+            "https://github.com"
+        );
+    }
+
+    #[test]
     fn an_authorization_without_an_expiry_never_needs_renewal() {
         let forever = Authorization {
             token: "ghu".to_string(),
@@ -497,6 +568,30 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o077, 0, "no other user may read it: {mode:o}");
         }
+    }
+
+    #[test]
+    fn nothing_here_authenticates_as_the_application() {
+        // The application can be registered without a private key, which is
+        // what stops its owner from acting on every installation. That holds
+        // only while no code path wants one.
+        // Scan the implementation, not this list of words describing it.
+        let implementation = |source: &'static str| -> &'static str {
+            source.split("#[cfg(test)]").next().unwrap_or(source)
+        };
+        let auth = implementation(include_str!("app.rs"));
+        let config = implementation(include_str!("config.rs"));
+        for forbidden in ["private", "installations/", "app_id", "jwt"] {
+            for (name, source) in [("app.rs", auth), ("config.rs", config)] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{name}: `{forbidden}` suggests a path that acts as the application itself"
+                );
+            }
+        }
+        // What the flow needs is the public identifier and nothing else.
+        assert!(auth.contains("client_id"));
+        assert!(config.contains("client_id"));
     }
 
     #[test]
