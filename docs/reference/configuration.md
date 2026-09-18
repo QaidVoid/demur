@@ -176,6 +176,47 @@ no diff line to anchor to.
 A `pattern` that is not a valid regular expression fails the run at validation
 with the field named, rather than being ignored.
 
+## `[review.template]`
+
+The shape of the published review body: which sections it contains, in what
+order, and your own prose around them.
+
+```toml
+[review.template]
+header = "### Automated review\nRun by the platform team's demur setup."
+sections = [
+    "verdict", "summary", "findings", "omitted",
+    "beyond_budget", "coverage", "spend", "models",
+]
+footer = "Disagree? Resolve the thread and say why."
+```
+
+`header` and `footer` are rendered exactly as given. Nothing in them is
+substituted, so a token that looks like a variable is published literally.
+
+Omit the section entirely and you get the default body, which is every section
+above except `models`.
+
+**Five sections cannot be left out**, because they are how a review admits what
+it did not cover: `findings`, `omitted`, `beyond_budget`, `coverage`, and
+`spend`. Put them anywhere you like, but a template that omits one fails the
+run naming it, rather than publishing a review that conceals something.
+Naming an unknown section, or the same section twice, fails the same way.
+
+| Section | What it renders |
+| --- | --- |
+| `verdict` | The verdict heading and the stance sentence. |
+| `summary` | The paragraph the verdict model drafted. |
+| `findings` | The ranked findings. **Required.** |
+| `omitted` | How many findings the comment budget cut. **Required.** |
+| `beyond_budget` | Verdict-setting findings the budget cut. **Required.** |
+| `coverage` | What ran, and every degradation applied. **Required.** |
+| `spend` | What each pass cost, and the totals. **Required.** |
+| `models` | Which model each pass actually used. |
+
+A section with nothing to say renders nothing, so a run with no omitted
+findings shows no omitted heading.
+
 ## `[cache]`
 
 The resume cache keeps completed passes so a retried run does not pay twice

@@ -458,6 +458,23 @@
           },
           "description": "Rules for the pull request description."
         },
+        "template": {
+          "$ref": "#/$defs/Template",
+          "default": {
+            "footer": null,
+            "header": null,
+            "sections": [
+              "verdict",
+              "summary",
+              "findings",
+              "omitted",
+              "beyond_budget",
+              "coverage",
+              "spend"
+            ]
+          },
+          "description": "The shape of the published review body."
+        },
         "title": {
           "$ref": "#/$defs/TitleRules",
           "default": {
@@ -471,6 +488,51 @@
         }
       },
       "type": "object"
+    },
+    "Section": {
+      "description": "Sections a review body is assembled from. Ordering them is the\nrepository's business; whether a review admits what it did not cover is\nnot, so the sections that carry an admission cannot be left out.",
+      "oneOf": [
+        {
+          "const": "verdict",
+          "description": "The verdict header and the stance sentence.",
+          "type": "string"
+        },
+        {
+          "const": "summary",
+          "description": "The paragraph the verdict model drafted.",
+          "type": "string"
+        },
+        {
+          "const": "findings",
+          "description": "The ranked findings.",
+          "type": "string"
+        },
+        {
+          "const": "omitted",
+          "description": "How many findings the comment budget cut.",
+          "type": "string"
+        },
+        {
+          "const": "beyond_budget",
+          "description": "Verdict-setting findings the comment budget cut.",
+          "type": "string"
+        },
+        {
+          "const": "coverage",
+          "description": "What the run covered, and every degradation it applied.",
+          "type": "string"
+        },
+        {
+          "const": "spend",
+          "description": "What the run spent, per pass and in total.",
+          "type": "string"
+        },
+        {
+          "const": "models",
+          "description": "Which model each pass actually used.",
+          "type": "string"
+        }
+      ]
     },
     "Severity": {
       "description": "Finding severities.",
@@ -491,6 +553,45 @@
           "type": "string"
         }
       ]
+    },
+    "Template": {
+      "additionalProperties": false,
+      "description": "The shape of the published review body.",
+      "properties": {
+        "footer": {
+          "default": null,
+          "description": "Text rendered after the sections, exactly as given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "header": {
+          "default": null,
+          "description": "Text rendered before the sections, exactly as given.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sections": {
+          "default": [
+            "verdict",
+            "summary",
+            "findings",
+            "omitted",
+            "beyond_budget",
+            "coverage",
+            "spend"
+          ],
+          "description": "The sections, in the order they are published.",
+          "items": {
+            "$ref": "#/$defs/Section"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
     },
     "TitleRules": {
       "additionalProperties": false,
@@ -652,6 +753,19 @@
           "required": false,
           "required_sections": [],
           "severity": null
+        },
+        "template": {
+          "footer": null,
+          "header": null,
+          "sections": [
+            "verdict",
+            "summary",
+            "findings",
+            "omitted",
+            "beyond_budget",
+            "coverage",
+            "spend"
+          ]
         },
         "title": {
           "max_length": null,

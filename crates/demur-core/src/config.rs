@@ -61,6 +61,64 @@ table with family, base_url, and key_env, and all three [models.triage], \
 [models.deep], [models.verdict] tables, each with provider, name, input_price, \
 and output_price";
 
+/// A template arranges a review; it cannot edit what the review admits. A
+/// list that omits a required section fails here, where it can be fixed,
+/// rather than producing a review that conceals something.
+fn validate_template(template: &Template) -> Result<(), ConfigError> {
+    if template.sections.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "review.template.sections".to_string(),
+            message: format!(
+                "names no sections; a review must at least carry: {}",
+                names(Section::REQUIRED)
+            ),
+        });
+    }
+    let mut seen: Vec<Section> = Vec::new();
+    for section in &template.sections {
+        if seen.contains(section) {
+            return Err(ConfigError::Invalid {
+                field: "review.template.sections".to_string(),
+                message: format!(
+                    "names `{}` more than once; a review that states the same thing twice is a \
+mistake rather than a preference",
+                    section.name()
+                ),
+            });
+        }
+        seen.push(*section);
+    }
+    let missing: Vec<Section> = Section::REQUIRED
+        .iter()
+        .filter(|required| !seen.contains(required))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        return Err(ConfigError::Invalid {
+            field: "review.template.sections".to_string(),
+            message: format!(
+                "omits {}, which a review cannot be published without because {} what the run \
+did not cover; reorder them anywhere, but they must be present",
+                names(&missing),
+                if missing.len() == 1 {
+                    "it states"
+                } else {
+                    "they state"
+                }
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn names(sections: &[Section]) -> String {
+    sections
+        .iter()
+        .map(|section| format!("`{}`", section.name()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The JSON Schema describing the configuration file, derived from the
 /// types themselves so it cannot describe a shape the bot would reject.
 pub fn json_schema() -> serde_json::Value {
@@ -465,6 +523,107 @@ pub struct Review {
     pub title: TitleRules,
     /// Rules for the pull request description.
     pub description: DescriptionRules,
+    /// The shape of the published review body.
+    pub template: Template,
+}
+
+/// Sections a review body is assembled from. Ordering them is the
+/// repository's business; whether a review admits what it did not cover is
+/// not, so the sections that carry an admission cannot be left out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Section {
+    /// The verdict header and the stance sentence.
+    Verdict,
+    /// The paragraph the verdict model drafted.
+    Summary,
+    /// The ranked findings.
+    Findings,
+    /// How many findings the comment budget cut.
+    Omitted,
+    /// Verdict-setting findings the comment budget cut.
+    BeyondBudget,
+    /// What the run covered, and every degradation it applied.
+    Coverage,
+    /// What the run spent, per pass and in total.
+    Spend,
+    /// Which model each pass actually used.
+    Models,
+}
+
+impl Section {
+    /// Every section, for error messages that name the alternatives.
+    pub const ALL: &'static [Section] = &[
+        Section::Verdict,
+        Section::Summary,
+        Section::Findings,
+        Section::Omitted,
+        Section::BeyondBudget,
+        Section::Coverage,
+        Section::Spend,
+        Section::Models,
+    ];
+
+    /// Sections a review cannot be published without. Drawn from what the
+    /// specifications require a review to admit, not from taste: findings,
+    /// what the comment budget cut, what coverage was achieved, and what
+    /// the run spent.
+    pub const REQUIRED: &'static [Section] = &[
+        Section::Findings,
+        Section::Omitted,
+        Section::BeyondBudget,
+        Section::Coverage,
+        Section::Spend,
+    ];
+
+    /// The name this section is configured by.
+    pub fn name(self) -> &'static str {
+        match self {
+            Section::Verdict => "verdict",
+            Section::Summary => "summary",
+            Section::Findings => "findings",
+            Section::Omitted => "omitted",
+            Section::BeyondBudget => "beyond_budget",
+            Section::Coverage => "coverage",
+            Section::Spend => "spend",
+            Section::Models => "models",
+        }
+    }
+}
+
+/// The default body: what demur publishes when a repository says nothing.
+fn default_sections() -> Vec<Section> {
+    vec![
+        Section::Verdict,
+        Section::Summary,
+        Section::Findings,
+        Section::Omitted,
+        Section::BeyondBudget,
+        Section::Coverage,
+        Section::Spend,
+    ]
+}
+
+/// The shape of the published review body.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Template {
+    /// Text rendered before the sections, exactly as given.
+    pub header: Option<String>,
+    /// The sections, in the order they are published.
+    pub sections: Vec<Section>,
+    /// Text rendered after the sections, exactly as given.
+    pub footer: Option<String>,
+}
+
+impl Default for Template {
+    fn default() -> Self {
+        Template {
+            header: None,
+            sections: default_sections(),
+            footer: None,
+        }
+    }
 }
 
 impl Review {
@@ -667,6 +826,7 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
             message: "set per_pr_usd or unlimited = true, not both".to_string(),
         });
     }
+    validate_template(&config.review.template)?;
     // Compile declared patterns here so an unusable rule fails the run
     // before anything is spent, rather than at evaluation time.
     crate::rules::Rules::compile(&config.review)?;
@@ -1079,6 +1239,101 @@ severity = "blocker"
         );
         let text = err_text(&text);
         assert!(text.contains("review.title.pattern"), "{text}");
+    }
+
+    fn with_template(body: &str) -> String {
+        minimal().replace("[models.triage]", &format!("{body}\n\n[models.triage]"))
+    }
+
+    #[test]
+    fn the_default_template_is_todays_body() {
+        let config = Config::from_toml(&minimal()).expect("minimal config parses");
+        let names: Vec<&str> = config
+            .review
+            .template
+            .sections
+            .iter()
+            .map(|section| section.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "verdict",
+                "summary",
+                "findings",
+                "omitted",
+                "beyond_budget",
+                "coverage",
+                "spend"
+            ]
+        );
+        assert!(config.review.template.header.is_none());
+    }
+
+    #[test]
+    fn sections_may_be_reordered_with_prose_around_them() {
+        let text = with_template(
+            "[review.template]\nheader = \"top\"\nfooter = \"bottom\"\nsections = [\"findings\", \"spend\", \"coverage\", \"omitted\", \"beyond_budget\", \"models\"]",
+        );
+        let config = Config::from_toml(&text).expect("a reordered template is valid");
+        assert_eq!(config.review.template.header.as_deref(), Some("top"));
+        assert_eq!(config.review.template.footer.as_deref(), Some("bottom"));
+        assert_eq!(config.review.template.sections[0].name(), "findings");
+    }
+
+    #[test]
+    fn an_unknown_section_is_rejected() {
+        let text = with_template("[review.template]\nsections = [\"findings\", \"epilogue\"]");
+        let text = err_text(&text);
+        assert!(text.contains("epilogue"), "{text}");
+    }
+
+    #[test]
+    fn a_repeated_section_is_rejected() {
+        let text = with_template(
+            "[review.template]\nsections = [\"findings\", \"omitted\", \"beyond_budget\", \"coverage\", \"spend\", \"spend\"]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("`spend` more than once"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_section_list_is_rejected() {
+        let text = with_template("[review.template]\nsections = []");
+        let text = err_text(&text);
+        assert!(text.contains("no sections"), "{text}");
+    }
+
+    #[test]
+    fn every_required_section_is_individually_required() {
+        // Checked one at a time so adding a required section later cannot
+        // be forgotten here.
+        let all = ["findings", "omitted", "beyond_budget", "coverage", "spend"];
+        for omitted in all {
+            let kept: Vec<String> = all
+                .iter()
+                .filter(|name| **name != omitted)
+                .map(|name| format!("\"{name}\""))
+                .collect();
+            let text = with_template(&format!(
+                "[review.template]\nsections = [{}]",
+                kept.join(", ")
+            ));
+            let text = err_text(&text);
+            assert!(
+                text.contains(&format!("`{omitted}`")),
+                "omitting {omitted} must be refused, got: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_sections_may_be_left_out() {
+        let text = with_template(
+            "[review.template]\nsections = [\"findings\", \"omitted\", \"beyond_budget\", \"coverage\", \"spend\"]",
+        );
+        let config = Config::from_toml(&text).expect("verdict and summary are not required");
+        assert_eq!(config.review.template.sections.len(), 5);
     }
 
     #[test]

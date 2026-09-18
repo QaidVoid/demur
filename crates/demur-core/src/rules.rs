@@ -221,7 +221,11 @@ mod tests {
     use crate::config::{DescriptionRules, Review, TitleRules};
 
     fn review(title: TitleRules, description: DescriptionRules) -> Review {
-        Review { title, description }
+        Review {
+            title,
+            description,
+            template: crate::config::Template::default(),
+        }
     }
 
     fn rules(review: Review) -> Rules {
