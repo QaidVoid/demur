@@ -14,6 +14,7 @@ reqwest.workspace = true
 schemars = "1.2.2"
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2 = "0.11.0"
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
@@ -22,4 +23,5 @@ toml.workspace = true
 workspace = true
 
 [dev-dependencies]
+tempfile = "3.27.0"
 wiremock = "0.6.5"

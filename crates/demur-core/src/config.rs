@@ -198,6 +198,9 @@ pub struct Config {
     /// Rules the repository declares about the pull request itself.
     #[serde(default)]
     pub review: Review,
+    /// The resume cache. Off unless asked for.
+    #[serde(default)]
+    pub cache: Cache,
     /// Named provider endpoints.
     pub providers: BTreeMap<String, ProviderDef>,
     /// Model assigned to each pipeline role.
@@ -310,6 +313,63 @@ impl Default for Limits {
             comments: DEFAULT_COMMENTS,
             max_tokens: DEFAULT_MAX_TOKENS,
         }
+    }
+}
+
+/// Built-in age bound for cache entries, in hours.
+pub const DEFAULT_CACHE_MAX_AGE_HOURS: u64 = 24;
+
+/// Built-in size bound for the cache, in megabytes.
+pub const DEFAULT_CACHE_MAX_MB: u64 = 256;
+
+/// The resume cache: completed pass outputs kept so a retried run does not
+/// pay twice. It can only change what a run costs, never what it concludes.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Cache {
+    /// Off by default. A cache that appears without being asked for is a
+    /// surprise in a tool whose point is that nothing is hidden.
+    pub enabled: bool,
+    /// Directory holding entries. The Action supplies one; a local run
+    /// caches only when this names a directory.
+    pub dir: Option<PathBuf>,
+    /// Entries older than this are dropped.
+    pub max_age_hours: u64,
+    /// Total size the cache may occupy, in megabytes.
+    pub max_mb: u64,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Cache {
+            enabled: false,
+            dir: None,
+            max_age_hours: DEFAULT_CACHE_MAX_AGE_HOURS,
+            max_mb: DEFAULT_CACHE_MAX_MB,
+        }
+    }
+}
+
+impl Cache {
+    /// Age bound as a duration.
+    pub fn max_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_age_hours.saturating_mul(3600))
+    }
+
+    /// Size bound in bytes.
+    pub fn max_bytes(&self) -> u64 {
+        self.max_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// Turn the cache off because the head is not trusted. A fork can write
+    /// the runner's cache for its own pull request, and an entry carries
+    /// model output derived from that fork's content, so reading one would
+    /// let a fork place a finding under this repository's own reviewer.
+    /// Returns true when a cache was actually turned off.
+    pub fn disable_for_untrusted_head(&mut self) -> bool {
+        let was_enabled = self.enabled;
+        self.enabled = false;
+        was_enabled
     }
 }
 
@@ -527,6 +587,12 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
     // Compile declared patterns here so an unusable rule fails the run
     // before anything is spent, rather than at evaluation time.
     crate::rules::Rules::compile(&config.review)?;
+    if config.cache.enabled && config.cache.max_mb == 0 {
+        return Err(ConfigError::Invalid {
+            field: "cache.max_mb".to_string(),
+            message: "must be at least one megabyte when the cache is enabled".to_string(),
+        });
+    }
     if config.block_on.severities.is_empty() {
         return Err(ConfigError::Invalid {
             field: "block_on.severities".to_string(),
@@ -901,6 +967,35 @@ severity = "blocker"
         );
         let text = err_text(&text);
         assert!(text.contains("review.title.pattern"), "{text}");
+    }
+
+    #[test]
+    fn an_untrusted_head_turns_the_cache_off() {
+        let mut cache = Cache {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(cache.disable_for_untrusted_head());
+        assert!(!cache.enabled);
+        // Idempotent, and it reports that nothing was turned off.
+        assert!(!cache.disable_for_untrusted_head());
+    }
+
+    #[test]
+    fn the_cache_is_off_unless_asked_for() {
+        let config = Config::from_toml(&minimal()).expect("minimal config parses");
+        assert!(!config.cache.enabled);
+        assert!(config.cache.dir.is_none());
+    }
+
+    #[test]
+    fn an_enabled_cache_needs_a_usable_size_bound() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[cache]\nenabled = true\nmax_mb = 0\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("cache.max_mb"), "{text}");
     }
 
     #[test]

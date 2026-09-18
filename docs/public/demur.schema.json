@@ -37,6 +37,40 @@
       },
       "type": "object"
     },
+    "Cache": {
+      "additionalProperties": false,
+      "description": "The resume cache: completed pass outputs kept so a retried run does not\npay twice. It can only change what a run costs, never what it concludes.",
+      "properties": {
+        "dir": {
+          "default": null,
+          "description": "Directory holding entries. The Action supplies one; a local run\ncaches only when this names a directory.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "enabled": {
+          "default": false,
+          "description": "Off by default. A cache that appears without being asked for is a\nsurprise in a tool whose point is that nothing is hidden.",
+          "type": "boolean"
+        },
+        "max_age_hours": {
+          "default": 24,
+          "description": "Entries older than this are dropped.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_mb": {
+          "default": 256,
+          "description": "Total size the cache may occupy, in megabytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "DescriptionRules": {
       "additionalProperties": false,
       "description": "Rules for the pull request description.",
@@ -475,6 +509,16 @@
         "unlimited": false
       },
       "description": "Per-pull-request spending cap."
+    },
+    "cache": {
+      "$ref": "#/$defs/Cache",
+      "default": {
+        "dir": null,
+        "enabled": false,
+        "max_age_hours": 24,
+        "max_mb": 256
+      },
+      "description": "The resume cache. Off unless asked for."
     },
     "ignore": {
       "$ref": "#/$defs/Ignore",
