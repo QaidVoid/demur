@@ -1,0 +1,62 @@
+/**
+ * demur brand tokens. Ink and oxblood: the palette of a written objection.
+ * Headings take a serif to separate the argument from the code around it.
+ */
+
+:root {
+  --vp-c-brand-1: #b4232b;
+  --vp-c-brand-2: #9a1d24;
+  --vp-c-brand-3: #c9313a;
+  --vp-c-brand-soft: rgba(180, 35, 43, 0.14);
+
+  --vp-c-tip-1: var(--vp-c-brand-1);
+  --vp-c-tip-soft: var(--vp-c-brand-soft);
+
+  --demur-serif: ui-serif, Georgia, "Iowan Old Style", "Times New Roman", serif;
+
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(120deg, #b4232b, #1b1b1f);
+  --vp-home-hero-image-filter: blur(48px);
+}
+
+.dark {
+  --vp-c-brand-1: #ff7b7b;
+  --vp-c-brand-2: #ff9a9a;
+  --vp-c-brand-3: #c4343c;
+  --vp-c-brand-soft: rgba(255, 123, 123, 0.16);
+
+  --vp-home-hero-name-background: linear-gradient(120deg, #ff7b7b, #e8e8ea);
+}
+
+.VPHero .name,
+.vp-doc h1,
+.vp-doc h2 {
+  font-family: var(--demur-serif);
+  letter-spacing: -0.015em;
+}
+
+.VPHero .tagline {
+  font-family: var(--demur-serif);
+  font-style: italic;
+  max-width: 44rem;
+}
+
+.vp-doc h2 {
+  border-top: 1px solid var(--vp-c-divider);
+  padding-top: 1.5rem;
+}
+
+/* A verdict line: the one sentence a page argues for. */
+.vp-doc .verdict {
+  font-family: var(--demur-serif);
+  font-size: 1.08rem;
+  line-height: 1.6;
+  border-left: 3px solid var(--vp-c-brand-1);
+  padding: 0.1rem 0 0.1rem 1rem;
+  margin: 1.5rem 0;
+  color: var(--vp-c-text-1);
+}
+
+.VPFeature .title {
+  font-family: var(--demur-serif);
+}
