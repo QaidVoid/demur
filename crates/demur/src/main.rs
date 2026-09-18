@@ -53,6 +53,7 @@ enum Command {
     },
     /// Review a GitHub pull request by number or URL. Read-only unless
     /// --publish is passed.
+    #[command(visible_alias = "pr")]
     ReviewPr {
         /// Pull request number or full URL.
         target: String,
