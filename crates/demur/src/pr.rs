@@ -155,6 +155,7 @@ pub async fn review_pr(
         prior_spend: 0.0,
         carried_findings: Vec::new(),
         suppress_fingerprints: std::collections::HashSet::new(),
+        repo_root: Some(repo.clone()),
     };
 
     match demur_core::pipeline::run(&registry, &config, &pipeline_input).await {

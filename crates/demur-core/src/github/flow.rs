@@ -136,6 +136,9 @@ pub async fn review_pull_request(
             .unwrap_or(0.0),
         carried_findings,
         suppress_fingerprints: suppress,
+        // The Action checks the repository out before running, so the
+        // working directory is the checkout retrieval may read.
+        repo_root: std::env::current_dir().ok(),
     };
 
     // Run the pipeline.

@@ -199,6 +199,9 @@ pub struct PipelineInput {
     /// Fingerprints a human dismissed. Fresh findings matching them stay
     /// silent.
     pub suppress_fingerprints: HashSet<String>,
+    /// The checkout retrieval may read from. None means there is no
+    /// repository on disk for this run, so nothing can be retrieved.
+    pub repo_root: Option<std::path::PathBuf>,
 }
 
 /// Spend for one pass.
@@ -480,6 +483,17 @@ you can already anchor to an exact file and line range with its concrete harm.";
         ));
         let stop = std::sync::atomic::AtomicBool::new(false);
         let failures = std::sync::atomic::AtomicU32::new(0);
+        // Retrieval is off unless asked for, and a repository root is only
+        // available where the run has a checkout to read.
+        let retriever = if config.retrieval.enabled {
+            input
+                .repo_root
+                .as_deref()
+                .and_then(|root| crate::retrieval::Retriever::new(root, config))
+        } else {
+            None
+        };
+        let retrieval_budget = std::sync::Mutex::new(config.retrieval.max_bytes());
 
         let dives = planned.iter().map(|dive| {
             run_deep_dive(
@@ -495,6 +509,8 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 deep_cache,
                 &stop,
                 &failures,
+                retriever.as_ref(),
+                &retrieval_budget,
             )
         });
         let mut outcomes: Vec<Option<DiveOutcome>> = (0..planned.len()).map(|_| None).collect();
@@ -518,9 +534,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
             if outcome.stood_down {
                 stood_down = true;
             }
-            if let Some(pass_spend) = outcome.spend {
-                spend.push(pass_spend);
-            }
+            spend.extend(outcome.spend);
             all_findings.extend(outcome.findings);
         }
         if stood_down {
@@ -1101,7 +1115,7 @@ struct PlannedDive<'a> {
 struct DiveOutcome {
     index: usize,
     findings: Vec<findings::Finding>,
-    spend: Option<PassSpend>,
+    spend: Vec<PassSpend>,
     degradations: Vec<Degradation>,
     /// The budget stood down on this dive, so no further dive should run.
     stood_down: bool,
@@ -1125,13 +1139,15 @@ async fn run_deep_dive(
     deep_cache: PassCache<'_>,
     stop: &std::sync::atomic::AtomicBool,
     failures: &std::sync::atomic::AtomicU32,
+    retriever: Option<&crate::retrieval::Retriever>,
+    retrieval_budget: &std::sync::Mutex<usize>,
 ) -> DiveOutcome {
     use std::sync::atomic::Ordering;
 
     let empty = |stood_down: bool| DiveOutcome {
         index: dive.index,
         findings: Vec::new(),
-        spend: None,
+        spend: Vec::new(),
         degradations: Vec::new(),
         stood_down,
         fatal: None,
@@ -1251,6 +1267,12 @@ async fn run_deep_dive(
         let mut gate = gate.lock().expect("budget gate lock");
         settle_pass(&mut gate, hold, &result.usage, paid_price, result.resumed)
     };
+    let mut spend_lines = vec![PassSpend {
+        pass: format!("deep dive {lens}"),
+        usage: result.usage,
+        cost,
+        resumed: result.resumed,
+    }];
     log::info!(
         "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
         lens,
@@ -1258,6 +1280,95 @@ async fn run_deep_dive(
         started.elapsed(),
         cost
     );
+
+    // Retrieval rounds. The pass named what it wanted; the bot decides
+    // what each name means and whether it is willing to read it.
+    let mut result = result;
+    let base_prompt = if shrink {
+        prompt::assemble(&shrunk, &task, &prompt::findings_schema())
+    } else {
+        prompt::assemble(&context, &task, &prompt::findings_schema())
+    };
+    if let Some(retriever) = retriever {
+        let rounds = config.retrieval.max_rounds;
+        for round in 1..=rounds {
+            let requested = std::mem::take(&mut result.output.context_requests);
+            if requested.is_empty() {
+                break;
+            }
+            let resolved = resolve_requests(retriever, &requested, retrieval_budget);
+            let attached = resolved
+                .iter()
+                .filter(|r| matches!(r, crate::retrieval::Resolution::Found { .. }))
+                .count();
+            log::info!(
+                "deep dive [{}]: round {round} asked for {} item(s), {attached} attached",
+                lens,
+                requested.len()
+            );
+            let round_prompt = prompt::with_retrieved(&base_prompt, &resolved);
+            let decision = {
+                let mut gate = gate.lock().expect("budget gate lock");
+                gate.authorize(PassEstimate {
+                    pass: "retrieval round",
+                    full_tokens: estimate_prompt(&round_prompt),
+                    shrunk_tokens: estimate_prompt(&round_prompt),
+                    max_output_tokens: config.limits.max_tokens,
+                    price: if downgraded { triage_price } else { deep_price },
+                    downgrade_price: None,
+                })
+            };
+            let LadderDecision::Run {
+                hold: round_hold, ..
+            } = decision
+            else {
+                // Retrieval must not be a way to spend outside the cap.
+                degradations.push(Degradation::PassFailed {
+                    pass: format!("retrieval round for deep dive ({lens}) on {}", cluster.path),
+                    reason: "the remaining budget could not fund it".to_string(),
+                });
+                break;
+            };
+            match call_pass::<findings::ModelFindings>(
+                provider,
+                round_prompt,
+                prompt::findings_schema(),
+                "deep dive",
+                config.limits.max_tokens,
+                pass_cache,
+            )
+            .await
+            {
+                Ok(next) => {
+                    let round_cost = {
+                        let mut gate = gate.lock().expect("budget gate lock");
+                        settle_pass(&mut gate, round_hold, &next.usage, paid_price, next.resumed)
+                    };
+                    spend_lines.push(PassSpend {
+                        pass: format!("deep dive {lens} retrieval round {round}"),
+                        usage: next.usage,
+                        cost: round_cost,
+                        resumed: next.resumed,
+                    });
+                    degradations.push(Degradation::ContextRetrieved {
+                        pass: format!("deep dive ({lens}) on {}", cluster.path),
+                        items: resolved.iter().map(|r| r.label().to_string()).collect(),
+                        attached,
+                    });
+                    result = next;
+                }
+                Err(err) => {
+                    gate.lock().expect("budget gate lock").release(round_hold);
+                    log::warn!("deep dive [{lens}] retrieval round failed: {err}");
+                    degradations.push(Degradation::PassFailed {
+                        pass: format!("retrieval round for deep dive ({lens}) on {}", cluster.path),
+                        reason: err.to_string(),
+                    });
+                    break;
+                }
+            }
+        }
+    }
     let mut found = Vec::new();
     for raw in &result.output.findings {
         if let Some(finding) = findings::validate(raw, diff_paths)
@@ -1271,16 +1382,40 @@ async fn run_deep_dive(
     DiveOutcome {
         index: dive.index,
         findings: found,
-        spend: Some(PassSpend {
-            pass: format!("deep dive {lens}"),
-            usage: result.usage,
-            cost,
-            resumed: result.resumed,
-        }),
+        spend: spend_lines,
         degradations,
         stood_down: false,
         fatal: None,
     }
+}
+
+/// Resolve what a pass asked for, stopping at the run's size bound. A
+/// refusal or a miss is answered rather than dropped.
+fn resolve_requests(
+    retriever: &crate::retrieval::Retriever,
+    requested: &[String],
+    budget: &std::sync::Mutex<usize>,
+) -> Vec<crate::retrieval::Resolution> {
+    use crate::retrieval::{Request, Resolution};
+    let mut out = Vec::new();
+    for raw in requested {
+        let request = Request::parse(raw);
+        let resolution = retriever.resolve(&request);
+        if let Resolution::Found { content, .. } = &resolution {
+            let mut remaining = budget.lock().expect("retrieval budget lock");
+            if content.len() > *remaining {
+                // Past the bound the request is answered as unavailable
+                // rather than silently truncated into nonsense.
+                out.push(Resolution::Refused {
+                    label: request.label(),
+                });
+                continue;
+            }
+            *remaining -= content.len();
+        }
+        out.push(resolution);
+    }
+    out
 }
 
 /// Settle a completed pass against its hold. A pass served from cache made

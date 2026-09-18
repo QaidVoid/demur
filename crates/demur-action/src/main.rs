@@ -140,6 +140,11 @@ async fn run() -> Result<(), String> {
     if is_fork && config.cache.disable_for_untrusted_head() {
         eprintln!("fork pull request: the resume cache is not read");
     }
+    // What a pass asks to retrieve is shaped by the diff it read, and on a
+    // fork that diff was written by someone outside the repository.
+    if is_fork && config.retrieval.disable_for_untrusted_head() {
+        eprintln!("fork pull request: context retrieval is not performed");
+    }
     let registry = match ProviderRegistry::from_config(&config) {
         Ok(registry) => registry,
         Err(key_error) => {
