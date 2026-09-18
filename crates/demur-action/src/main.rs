@@ -68,6 +68,9 @@ pub fn should_review(action: Option<&str>, draft: bool, has_pull_request: bool) 
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
     match run().await {
         Ok(()) => ExitCode::from(EXIT_OK),
         Err(err) => {

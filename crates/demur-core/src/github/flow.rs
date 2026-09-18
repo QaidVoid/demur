@@ -47,6 +47,10 @@ pub async fn review_pull_request(
 ) -> Result<FlowOutcome, FlowError> {
     let pr = client.pull_request(number).await?;
     let head_sha = pr.head_sha().to_string();
+    log::info!(
+        "pull request #{number}: head {head_sha}, draft={}",
+        pr.draft
+    );
 
     // Prior state.
     let prior_marker = client.prior_marker(number).await?;
@@ -55,13 +59,28 @@ pub async fn review_pull_request(
         None => false,
     };
     let scope = delta::derive_scope(prior_marker.as_ref(), prior_is_ancestor);
+    match &scope {
+        ReviewScope::Full => log::info!("scope: full review"),
+        ReviewScope::Delta { since_sha } => {
+            log::info!("scope: delta since {since_sha}")
+        }
+    }
+    let diff_started = std::time::Instant::now();
     let diff_text = match &scope {
         ReviewScope::Full => client.pull_request_diff(number).await?,
         ReviewScope::Delta { since_sha } => {
             client.compare_diff(number, since_sha, &head_sha).await?
         }
     };
+    log::info!(
+        "diff: {} lines fetched in {:.1?}",
+        diff_text.lines().count(),
+        diff_started.elapsed()
+    );
     let dismissed = client.dismissed_fingerprints(number).await;
+    if !dismissed.is_empty() {
+        log::info!("dismissed fingerprints: {}", dismissed.len());
+    }
 
     // Ingest and prepare the pipeline input.
     let files = parse_unified_diff(&diff_text);
@@ -192,6 +211,11 @@ review ran against {head_sha}. The newer commit was not reviewed.\n"
         &fingerprints,
     );
 
+    log::info!(
+        "publishing: {} inline comment(s), {} finding(s) in body",
+        comments.len(),
+        fingerprints.len()
+    );
     super::publish::publish_review(
         client,
         number,
@@ -202,6 +226,7 @@ review ran against {head_sha}. The newer commit was not reviewed.\n"
         &comments,
     )
     .await?;
+    log::info!("published: check run {}", review.verdict.check_conclusion());
 
     Ok(FlowOutcome {
         published: true,

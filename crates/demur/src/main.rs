@@ -79,6 +79,9 @@ pub(crate) enum Format {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_secs()
+        .init();
     let cli = Cli::parse();
     match cli.command {
         Command::Review {

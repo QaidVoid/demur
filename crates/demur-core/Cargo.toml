@@ -8,6 +8,7 @@ description = "Review pipeline core for demur, a BYOK code review bot"
 
 [dependencies]
 globset = "0.4.20"
+log = "0.4.34"
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

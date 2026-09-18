@@ -178,6 +178,9 @@ pub async fn run(
         .collect();
 
     if input.ingestion.clusters.is_empty() {
+        for degradation in &degradations {
+            log::warn!("degradation: {}", degradation.describe());
+        }
         let review = synthesize_review(
             config,
             input,
@@ -198,6 +201,12 @@ pub async fn run(
     let triage_task = "Triage the changed hunks. For each file cluster, suggest review \
 lenses from: correctness, security, performance, style. Also report any finding \
 you can already anchor to an exact file and line range with its concrete harm.";
+    log::info!(
+        "triage: ~{} input tokens estimated on {}",
+        estimate_prompt_tokens(&context),
+        config.models.triage.name
+    );
+    let triage_started = std::time::Instant::now();
     let estimate = budget::PassEstimate {
         kind: PassKind::Triage,
         pass: "triage",
@@ -227,6 +236,15 @@ you can already anchor to an exact file and line range with its concrete harm.";
         usage,
         cost: gate.record(&usage, &triage_price),
     });
+    log::info!(
+        "triage: {} finding(s) in {:.1?}, ${:.4}",
+        triage_output.findings.len(),
+        triage_started.elapsed(),
+        spend
+            .last()
+            .map(|pass_spend| pass_spend.cost)
+            .unwrap_or(0.0)
+    );
     for raw in &triage_output.findings {
         if let Some(finding) = findings::validate(raw, &diff_paths) {
             let hunks = input
@@ -257,6 +275,11 @@ you can already anchor to an exact file and line range with its concrete harm.";
     if profile != Profile::Quick {
         let ceiling = config.limits.deep_calls;
         let mut calls: u32 = 0;
+        log::info!(
+            "deep dives: {} cluster(s) to consider, ceiling {} call(s)",
+            input.ingestion.clusters.len(),
+            ceiling
+        );
         'clusters: for cluster in &input.ingestion.clusters {
             if calls >= ceiling {
                 unreviewed.push(cluster.path.clone());
@@ -271,6 +294,8 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     unreviewed.push(cluster.path.clone());
                     break;
                 }
+                log::info!("deep dive [{}]: {}", lens, cluster.path);
+                let dive_started = std::time::Instant::now();
                 let context = prompt::cluster_context(&input.meta, &cluster.path, &cluster.hunks);
                 let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
                 let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
@@ -338,11 +363,19 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 } else {
                     &deep_price
                 };
+                let dive_cost = gate.record(&usage, paid_price);
                 spend.push(PassSpend {
                     pass: format!("deep dive {lens}"),
                     usage,
-                    cost: gate.record(&usage, paid_price),
+                    cost: dive_cost,
                 });
+                log::info!(
+                    "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
+                    lens,
+                    dive_output.findings.len(),
+                    dive_started.elapsed(),
+                    dive_cost
+                );
                 for raw in &dive_output.findings {
                     if let Some(finding) = findings::validate(raw, &diff_paths) {
                         if input
@@ -389,6 +422,8 @@ with their concrete harm.";
             }
         }
         if !gate_is_stood_down(&degradations) {
+            log::info!("cross-examination: running on {}", config.models.deep.name);
+            let cross_started = std::time::Instant::now();
             let (cross_output, usage) = call_pass::<findings::ModelFindings>(
                 &registry.deep,
                 prompt::assemble(&context, task, &prompt::cross_examination_schema()),
@@ -402,6 +437,11 @@ with their concrete harm.";
                 usage,
                 cost: gate.record(&usage, &deep_price),
             });
+            log::info!(
+                "cross-examination: {} finding(s) in {:.1?}",
+                cross_output.findings.len(),
+                cross_started.elapsed()
+            );
             for raw in &cross_output.findings {
                 if let Some(finding) = findings::validate(raw, &diff_paths) {
                     let hunks = input
@@ -424,6 +464,9 @@ with their concrete harm.";
         }
     }
 
+    for degradation in &degradations {
+        log::warn!("degradation: {}", degradation.describe());
+    }
     let review = synthesize_review(
         config,
         input,

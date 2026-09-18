@@ -33,6 +33,14 @@ finally from the GitHub CLI when it is authenticated (`gh auth login`). The
 pull request diff is fetched and reviewed in full: the CLI keeps no state,
 so it never reads or writes the bot's review markers.
 
+## Progress logs
+
+Progress goes to stderr while a review runs: which pass is executing, how
+long it took, what it cost, and any degradation that applied. The default
+verbosity is `info`; set `RUST_LOG=debug` for more detail or
+`RUST_LOG=error` for near silence. Stdout stays clean, so piping the
+markdown output works unchanged.
+
 ## Output formats and exit status
 
 `--format markdown` (the default) prints the review ranked exactly as the
