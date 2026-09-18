@@ -40,6 +40,33 @@ raises the ceiling and retries, up to twice and never past a limit any current
 model will grant. If it persists, raise `limits.max_tokens` toward a value your
 model actually supports, or reduce `limits.comments` so less output is needed.
 
+## The review arrived as a comment instead of requesting changes
+
+GitHub refuses some review events depending on who is submitting them. It will
+not let you request changes on your own pull request, and the job identity in a
+workflow may not be permitted to approve.
+
+When that happens the review is still published, as a comment carrying every
+finding, and the body says which event was refused and repeats GitHub's reason.
+**The check run still carries the verdict**, so a blocking finding still turns
+the check red and still blocks a merge gated on it. What you lose is the formal
+review state, not the review.
+
+If your branch protection requires a formal CHANGES_REQUESTED state rather than
+a failing check, that configuration cannot be satisfied by a bot reviewing a
+pull request its own identity authored. Gate on the check run instead.
+
+## `missing permission` when the permission is present
+
+Before, any refusal was reported as a missing `pull-requests: write`. That was
+wrong: a refusal and an authorization failure are different problems.
+
+- **`missing permission`** now means exactly that. Check the workflow's
+  `permissions` block.
+- **`github refused the request`** means the request was understood and refused
+  on its merits. The message quotes GitHub's own reason, which is the thing
+  worth reading. Reviewing your own pull request is the common case.
+
 ## The review says coverage was reduced
 
 That is the budget working. The review names the rung that fired:
@@ -47,7 +74,10 @@ That is the budget working. The review names the rung that fired:
 - *context was shrunk* means the pass ran on the highest-risk hunks only.
 - *ran on the triage model* means the pass was downgraded to the cheaper model.
 - *deep call ceiling left N clusters* means `limits.deep_calls` bound before the
-  budget did.
+  budget did. The line names the highest-risk unreviewed clusters and counts
+  the rest, so a very wide pull request still produces a readable review. Raise
+  `limits.deep_calls`, narrow `ignore.paths`, or accept that a change touching
+  hundreds of files is not deeply reviewable at any setting.
 - *failed and was skipped* means that one pass failed against the provider and
   the rest of the run continued without it.
 
