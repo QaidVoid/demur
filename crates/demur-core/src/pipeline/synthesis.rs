@@ -49,6 +49,9 @@ pub struct SynthesisInput {
     pub prior_spend: f64,
     /// Summary paragraph drafted by the verdict model, if available.
     pub summary: Option<String>,
+    /// True when rules were configured but the run had no pull request to
+    /// apply them to. Stated once, and never a finding.
+    pub rules_skipped: bool,
 }
 
 /// The synthesized review.
@@ -75,6 +78,7 @@ pub fn synthesize(input: SynthesisInput) -> Synthesis {
         spend_lines,
         prior_spend,
         summary,
+        rules_skipped,
     } = input;
     let mut findings = dedupe(findings);
     rank(&mut findings);
@@ -113,6 +117,7 @@ pub fn synthesize(input: SynthesisInput) -> Synthesis {
         &spend_lines,
         prior_spend,
         &summary,
+        rules_skipped,
     );
     Synthesis {
         verdict,
@@ -138,6 +143,7 @@ fn render_body(
     spend_lines: &[(String, f64, bool)],
     prior_spend: f64,
     summary: &Option<String>,
+    rules_skipped: bool,
 ) -> String {
     let mut body = String::new();
     match verdict {
@@ -229,6 +235,12 @@ fn render_body(
         money(run_total + prior_spend),
         money(prior_spend)
     ));
+    if rules_skipped {
+        body.push_str(
+            "- Metadata rules were not evaluated: this run reviews a local range and \
+has no pull request title or description to judge.\n",
+        );
+    }
     body
 }
 
@@ -286,6 +298,7 @@ mod tests {
             spend_lines: vec![("triage".to_string(), 0.0021, false)],
             prior_spend: 0.01,
             summary: None,
+            rules_skipped: false,
         }
     }
 
@@ -403,6 +416,7 @@ mod tests {
             ],
             prior_spend: 0.25,
             summary: None,
+            rules_skipped: false,
         });
         assert!(result.body.contains("deep call ceiling left 1 cluster(s)"));
         assert!(result.body.contains("triage spend: $0.0021"));

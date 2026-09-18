@@ -3,6 +3,7 @@
 //! ladder.
 
 use super::RunOutcome;
+use super::prompt::MetaOrigin;
 use crate::config::{Config, Severity};
 use crate::diff::parse_unified_diff;
 use crate::ingest::ingest;
@@ -76,6 +77,7 @@ fn input() -> PipelineInput {
             title: "Add token".to_string(),
             description: "describe".to_string(),
             head_sha: "abc123".to_string(),
+            origin: MetaOrigin::PullRequest,
         },
         ingestion: ingest(&files, &config_with("standard", "")),
         diff_text: DIFF.to_string(),
@@ -870,4 +872,173 @@ async fn an_unusable_cache_location_runs_cold_without_failing() {
     crate::pipeline::run(&registry(steps()), &config, &input())
         .await
         .expect("an unusable cache location must not fail the run");
+}
+
+fn local_input() -> PipelineInput {
+    let mut input = input();
+    // What the local CLI supplies: a label demur wrote, and the range's
+    // commit messages.
+    input.meta.title = "local review: HEAD~1..HEAD".to_string();
+    input.meta.description = "feat: add b".to_string();
+    input.meta.origin = super::prompt::MetaOrigin::Composed;
+    input
+}
+
+const STRICT_RULES: &str = "[review.title]\npattern = '^(feat|fix): .+'\nseverity = \"blocker\"\n\n[review.description]\nrequired = true\nmin_length = 40\nseverity = \"blocker\"";
+
+#[tokio::test]
+async fn a_local_range_review_raises_no_metadata_violation() {
+    // Both the composed title and the short description would violate
+    // these rules. Neither is a claim the author made.
+    let config = config_with("standard", STRICT_RULES);
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &local_input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    // Assert on violations, not on the words: the line explaining that
+    // rules did not run mentions the title too.
+    assert!(
+        review
+            .published
+            .iter()
+            .all(|finding| !finding.file.starts_with("pull request")),
+        "no metadata violation may be published: {:?}",
+        review.published
+    );
+    assert!(
+        !review.body.contains("does not match the required format"),
+        "{}",
+        review.body
+    );
+    assert!(!review.body.contains("is empty"), "{}", review.body);
+    // The verdict comes from the code findings alone, exactly as it would
+    // with no rules configured.
+    let without_rules = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(bare) =
+        crate::pipeline::run(&without_rules, &config_with("standard", ""), &local_input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert_eq!(review.verdict, bare.verdict);
+    assert_eq!(review.published.len(), bare.published.len());
+}
+
+#[tokio::test]
+async fn the_same_rules_still_bite_on_a_pull_request() {
+    let config = config_with("standard", STRICT_RULES);
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let mut input = input();
+    input.meta.title = "added a token".to_string();
+    input.meta.description = String::new();
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &input)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert_eq!(
+        review.verdict,
+        crate::pipeline::synthesis::Verdict::RequestChanges
+    );
+    assert!(
+        review.body.contains("pull request title"),
+        "{}",
+        review.body
+    );
+    assert!(
+        review.body.contains("pull request description"),
+        "{}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn a_local_run_says_rules_were_not_evaluated() {
+    let config = config_with("standard", STRICT_RULES);
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &local_input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(
+        review.body.contains("Metadata rules were not evaluated"),
+        "a configured rule that did not run must say so: {}",
+        review.body
+    );
+    // Stated once, and it is not a finding.
+    assert_eq!(
+        review
+            .body
+            .matches("Metadata rules were not evaluated")
+            .count(),
+        1
+    );
+    assert!(
+        review
+            .published
+            .iter()
+            .all(|f| f.file != "pull request title")
+    );
+}
+
+#[tokio::test]
+async fn a_local_run_without_rules_says_nothing_about_them() {
+    let config = config_with("standard", "");
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![dive_response("a"), dive_response("b")],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &local_input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(!review.body.contains("Metadata rules"), "{}", review.body);
+}
+
+#[tokio::test]
+async fn a_skipped_local_run_reports_no_violation_but_explains_itself() {
+    let config = config_with(
+        "standard",
+        "[budget]\nper_pr_usd = 0.000001\n\n[review.description]\nrequired = true\nseverity = \"blocker\"",
+    );
+    let providers = registry(vec![vec![], vec![], vec![]]);
+    let RunOutcome::Skipped { notice, violations } =
+        crate::pipeline::run(&providers, &config, &local_input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a skipped run");
+    };
+    assert!(violations.is_empty(), "no rule applied to a local range");
+    assert!(!notice.contains("Rule violations found"), "{notice}");
+    assert!(
+        notice.contains("Metadata rules were not evaluated"),
+        "{notice}"
+    );
 }

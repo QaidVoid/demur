@@ -204,7 +204,15 @@ pub async fn run(
     // whether the pull request itself breaks a rule.
     let rules = crate::rules::Rules::compile(&config.review)
         .map_err(|err| PipelineError::Rules(err.to_string()))?;
-    let violations = if rules.is_empty() {
+    // Rules judge what the author claimed. A run with no pull request has
+    // only the label demur wrote for its own output, which is not a claim
+    // and must never be measured against a rule.
+    let rules_apply = input.meta.origin.carries_an_authored_claim();
+    let rules_skipped = !rules.is_empty() && !rules_apply;
+    let violations = if rules.is_empty() || !rules_apply {
+        if rules_skipped {
+            log::info!("metadata rules: not evaluated, this run has no pull request");
+        }
         Vec::new()
     } else {
         let found = rules.evaluate(&input.meta.title, &input.meta.description);
@@ -253,6 +261,7 @@ pub async fn run(
             &mut degradations,
             &mut spend,
             std::mem::take(&mut all_findings),
+            rules_skipped,
         )
         .await?;
         return Ok(RunOutcome::Review(Box::new(review)));
@@ -291,7 +300,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
         }
         LadderDecision::StandDown => {
             return Ok(RunOutcome::Skipped {
-                notice: skip_notice(input, &gate, &violations),
+                notice: skip_notice(input, &gate, &violations, rules_skipped),
                 violations,
             });
         }
@@ -632,6 +641,7 @@ with their concrete harm.";
         &mut degradations,
         &mut spend,
         all_findings,
+        rules_skipped,
     )
     .await?;
     Ok(RunOutcome::Review(Box::new(review)))
@@ -647,6 +657,7 @@ async fn synthesize_review(
     degradations: &mut Vec<Degradation>,
     spend: &mut Vec<PassSpend>,
     findings: Vec<findings::Finding>,
+    rules_skipped: bool,
 ) -> Result<Review, PipelineError> {
     let mut all = findings;
     all.extend(input.carried_findings.iter().cloned());
@@ -774,6 +785,7 @@ coverage was complete and no defect was established.";
             .collect(),
         prior_spend: input.prior_spend,
         summary,
+        rules_skipped,
     });
     Ok(Review {
         verdict: synthesis.verdict,
@@ -1069,6 +1081,7 @@ fn skip_notice(
     input: &PipelineInput,
     gate: &BudgetGate,
     violations: &[findings::Finding],
+    rules_skipped: bool,
 ) -> String {
     let carried: Vec<String> = input
         .carried_findings
@@ -1092,7 +1105,18 @@ Cumulative spend for this pull request: {:.4} USD (earlier runs: {:.4}).\n\
             )
         }
     ) + &render_violations(violations)
+        + if rules_skipped {
+            RULES_NOT_APPLICABLE
+        } else {
+            ""
+        }
 }
+
+/// Said once when rules are configured and the run has no pull request to
+/// apply them to. A user who configured a rule and saw nothing could not
+/// otherwise tell a satisfied rule from one that never ran.
+pub(crate) const RULES_NOT_APPLICABLE: &str = "\n\nMetadata rules were not evaluated: \
+this run reviews a local range and has no pull request title or description to judge.";
 
 /// Rule violations rendered for a notice. They cost nothing to find, so a
 /// skipped run still reports them rather than staying silent about the one
