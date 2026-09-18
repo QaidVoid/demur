@@ -8,7 +8,7 @@ and flag a typo while you type rather than on your next run.
 Most TOML editor tooling reads a `#:schema` directive on the first line:
 
 ```toml
-#:schema https://demur.dev/demur.schema.json
+#:schema https://demur.qaidvoid.dev/demur.schema.json
 
 profile = "standard"
 
@@ -25,7 +25,7 @@ If you pin a release, pin the schema with it. Every release publishes an
 immutable copy at its own version:
 
 ```toml
-#:schema https://demur.dev/schema/v0.1.0/demur.schema.json
+#:schema https://demur.qaidvoid.dev/schema/v0.1.0/demur.schema.json
 ```
 
 A versioned copy is never rewritten, so a pinned binary and a pinned schema
