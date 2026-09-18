@@ -43,8 +43,8 @@ pub struct SynthesisInput {
     pub comment_budget: u32,
     /// Degradations applied during the run, always disclosed.
     pub degradations: Vec<Degradation>,
-    /// Spend per pass for this run, as (pass, cost) pairs.
-    pub spend_lines: Vec<(String, f64)>,
+    /// Spend per pass for this run, as (pass, cost, resumed) triples.
+    pub spend_lines: Vec<(String, f64, bool)>,
     /// Spend recorded by earlier runs on this pull request.
     pub prior_spend: f64,
     /// Summary paragraph drafted by the verdict model, if available.
@@ -135,7 +135,7 @@ fn render_body(
     beyond_budget: &[Finding],
     comment_budget: &u32,
     degradations: &[Degradation],
-    spend_lines: &[(String, f64)],
+    spend_lines: &[(String, f64, bool)],
     prior_spend: f64,
     summary: &Option<String>,
 ) -> String {
@@ -189,9 +189,39 @@ fn render_body(
             body.push_str(&format!("- {}\n", degradation.describe()));
         }
     }
-    let run_total: f64 = spend_lines.iter().map(|(_, cost)| cost).sum();
-    for (pass, cost) in spend_lines {
-        body.push_str(&format!("- {pass} spend: {}\n", money(*cost)));
+    let paid: f64 = spend_lines
+        .iter()
+        .filter(|(_, _, resumed)| !resumed)
+        .map(|(_, cost, _)| cost)
+        .sum();
+    let inherited: f64 = spend_lines
+        .iter()
+        .filter(|(_, _, resumed)| *resumed)
+        .map(|(_, cost, _)| cost)
+        .sum();
+    let run_total = paid + inherited;
+    for (pass, cost, resumed) in spend_lines {
+        let note = if *resumed {
+            " (resumed from cache)"
+        } else {
+            ""
+        };
+        body.push_str(&format!("- {pass} spend: {}{note}\n", money(*cost)));
+    }
+    if inherited > 0.0 {
+        // A resumed run is not a cheap review. It is a review that had to
+        // be paid for across more than one attempt.
+        let resumed: Vec<&str> = spend_lines
+            .iter()
+            .filter(|(_, _, resumed)| *resumed)
+            .map(|(pass, _, _)| pass.as_str())
+            .collect();
+        body.push_str(&format!(
+            "- Paid by this run: {}\n- Inherited from an earlier attempt: {} ({})\n",
+            money(paid),
+            money(inherited),
+            resumed.join(", ")
+        ));
     }
     body.push_str(&format!("- Total spend this run: {}\n", money(run_total)));
     body.push_str(&format!(
@@ -253,7 +283,7 @@ mod tests {
             block_on,
             comment_budget: budget,
             degradations: Vec::new(),
-            spend_lines: vec![("triage".to_string(), 0.0021)],
+            spend_lines: vec![("triage".to_string(), 0.0021, false)],
             prior_spend: 0.01,
             summary: None,
         }
@@ -367,7 +397,10 @@ mod tests {
             degradations: vec![Degradation::DeepCallsCapped {
                 unreviewed: vec!["big.rs".to_string()],
             }],
-            spend_lines: vec![("triage".to_string(), 0.0021), ("deep".to_string(), 0.1130)],
+            spend_lines: vec![
+                ("triage".to_string(), 0.0021, false),
+                ("deep".to_string(), 0.1130, false),
+            ],
             prior_spend: 0.25,
             summary: None,
         });

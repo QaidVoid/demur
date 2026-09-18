@@ -699,3 +699,175 @@ async fn an_unapplicable_rule_never_reaches_a_run() {
         "expected a rules failure, got {error}"
     );
 }
+
+fn cached_config(dir: &std::path::Path) -> Config {
+    let mut config = config_with("standard", "");
+    config.cache.enabled = true;
+    config.cache.dir = Some(dir.to_path_buf());
+    config
+}
+
+fn steps() -> Vec<Vec<serde_json::Value>> {
+    vec![
+        vec![triage_response()],
+        vec![
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![summary_response()],
+    ]
+}
+
+#[tokio::test]
+async fn a_fully_cached_run_and_a_cold_run_agree_exactly() {
+    // This is the guarantee the whole capability rests on: a cache may
+    // change what a run costs and nothing else.
+    let dir = tempfile::tempdir().unwrap();
+    let config = cached_config(dir.path());
+
+    let cold = crate::pipeline::run(&registry(steps()), &config, &input())
+        .await
+        .unwrap();
+    let RunOutcome::Review(cold) = cold else {
+        panic!("expected a review");
+    };
+
+    // Every pass is now cached. A provider with no steps left proves no
+    // call is made: any miss would fail with "no more recorded steps".
+    let empty = registry(vec![vec![], vec![], vec![]]);
+    let warm = crate::pipeline::run(&empty, &config, &input())
+        .await
+        .expect("a fully cached run makes no provider call");
+    let RunOutcome::Review(warm) = warm else {
+        panic!("expected a review");
+    };
+
+    assert_eq!(cold.verdict, warm.verdict);
+    assert_eq!(cold.published.len(), warm.published.len());
+    for (a, b) in cold.published.iter().zip(warm.published.iter()) {
+        assert_eq!(a.message, b.message);
+        assert_eq!(a.severity, b.severity);
+        assert_eq!(a.file, b.file);
+        assert_eq!(a.start_line, b.start_line);
+    }
+    assert_eq!(cold.omitted, warm.omitted);
+    assert_eq!(cold.degradations, warm.degradations);
+}
+
+#[tokio::test]
+async fn a_resumed_run_pays_nothing_and_says_what_it_inherited() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cached_config(dir.path());
+    crate::pipeline::run(&registry(steps()), &config, &input())
+        .await
+        .unwrap();
+
+    let empty = registry(vec![vec![], vec![], vec![]]);
+    let RunOutcome::Review(warm) = crate::pipeline::run(&empty, &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert_eq!(warm.spend.paid, 0.0, "a fully resumed run pays nothing");
+    assert!(
+        warm.spend.inherited > 0.0,
+        "the earlier attempt's cost still counts"
+    );
+    assert_eq!(warm.spend.total, warm.spend.inherited);
+    assert!(
+        warm.body.contains("Inherited from an earlier attempt"),
+        "{}",
+        warm.body
+    );
+    assert!(warm.body.contains("resumed from cache"), "{}", warm.body);
+    assert!(
+        warm.spend.passes.iter().all(|pass| pass.resumed),
+        "every pass was resumed"
+    );
+}
+
+#[tokio::test]
+async fn nothing_is_cached_unless_it_is_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = config_with("standard", "");
+    config.cache.dir = Some(dir.path().join("unused"));
+    // enabled stays false.
+    crate::pipeline::run(&registry(steps()), &config, &input())
+        .await
+        .unwrap();
+    assert!(
+        !dir.path().join("unused").exists(),
+        "a disabled cache creates no location"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_pass_leaves_nothing_to_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cached_config(dir.path());
+    let providers = registry_results(
+        vec![Ok(triage_response())],
+        vec![
+            Ok(dive_response("hardcoded credential")),
+            Err(ProviderError::Rejected {
+                message: "no".to_string(),
+            }),
+        ],
+        vec![Ok(summary_response())],
+    );
+    crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+
+    // The second dive failed, so a retry must call the provider for it
+    // again. Only the successful passes are served from cache.
+    let retry = registry_results(vec![], vec![Ok(dive_response("second"))], vec![]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&retry, &config, &input())
+        .await
+        .expect("the retry resumes what completed and re-runs what failed")
+    else {
+        panic!("expected a review");
+    };
+    assert!(review.body.contains("second"), "{}", review.body);
+    assert!(
+        review.spend.paid > 0.0,
+        "the failed pass had to be paid for on the retry"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_model_is_not_served_from_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = cached_config(dir.path());
+    crate::pipeline::run(&registry(steps()), &config, &input())
+        .await
+        .unwrap();
+
+    let mut changed = cached_config(dir.path());
+    changed.models.deep.name = "a-different-deep-model".to_string();
+    // The deep provider must be called again; entries from the old model
+    // answer a question this run is not asking.
+    let providers = registry(vec![
+        vec![],
+        vec![
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![],
+    ]);
+    crate::pipeline::run(&providers, &changed, &input())
+        .await
+        .expect("a changed model re-runs the deep dives");
+}
+
+#[tokio::test]
+async fn an_unusable_cache_location_runs_cold_without_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, "not a directory").unwrap();
+    let config = cached_config(&file.join("under"));
+    crate::pipeline::run(&registry(steps()), &config, &input())
+        .await
+        .expect("an unusable cache location must not fail the run");
+}

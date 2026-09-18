@@ -137,6 +137,9 @@ pub struct PassSpend {
     pub usage: TokenUsage,
     /// Cost in USD at the role model's prices.
     pub cost: f64,
+    /// True when this pass was served from the resume cache, so its cost
+    /// was paid by an earlier attempt rather than by this run.
+    pub resumed: bool,
 }
 
 /// Spend for one run.
@@ -146,7 +149,12 @@ pub struct RunSpend {
     pub passes: Vec<PassSpend>,
     /// Spend recorded by earlier runs on this pull request.
     pub prior_spend: f64,
-    /// This run's total.
+    /// What this run paid to providers.
+    pub paid: f64,
+    /// What an earlier attempt paid for passes this run resumed. Those
+    /// dollars were spent, so they keep counting.
+    pub inherited: f64,
+    /// Paid plus inherited.
     pub total: f64,
 }
 
@@ -202,6 +210,19 @@ pub async fn run(
         let found = rules.evaluate(&input.meta.title, &input.meta.description);
         log::info!("metadata rules: {} violation(s)", found.len());
         found
+    };
+
+    let store = open_cache(config);
+    let store_ref: Option<&dyn crate::cache::Store> = store
+        .as_ref()
+        .map(|store| store as &dyn crate::cache::Store);
+    let triage_cache = PassCache {
+        store: store_ref,
+        model: &config.models.triage,
+    };
+    let deep_cache = PassCache {
+        store: store_ref,
+        model: &config.models.deep,
     };
 
     let profile = config.profile.unwrap_or(Profile::Standard);
@@ -275,18 +296,25 @@ you can already anchor to an exact file and line range with its concrete harm.";
             });
         }
     };
-    let (triage_output, usage) = call_pass::<findings::TriageOutput>(
+    let triage_result = call_pass::<findings::TriageOutput>(
         &registry.triage,
         triage_prompt,
         prompt::findings_schema(),
         "triage",
         config.limits.max_tokens,
+        triage_cache,
     )
     .await?;
+    let (triage_output, usage, resumed) = (
+        triage_result.output,
+        triage_result.usage,
+        triage_result.resumed,
+    );
     spend.push(PassSpend {
         pass: "triage".to_string(),
         usage,
-        cost: gate.record(&usage, &triage_price),
+        cost: record_pass(&mut gate, &usage, &triage_price, resumed),
+        resumed,
     });
     log::info!(
         "triage: {} finding(s) in {:.1?}, ${:.4}",
@@ -389,12 +417,14 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 } else {
                     full_prompt
                 };
+                let pass_cache = if downgraded { triage_cache } else { deep_cache };
                 let dived = call_pass::<findings::ModelFindings>(
                     provider,
                     chosen,
                     prompt::findings_schema(),
                     "deep dive",
                     config.limits.max_tokens,
+                    pass_cache,
                 )
                 .await;
                 let dived = match dived {
@@ -406,6 +436,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                             prompt::findings_schema(),
                             "deep dive",
                             config.limits.max_tokens,
+                            pass_cache,
                         )
                         .await
                         .inspect(|_| {
@@ -416,8 +447,8 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     }
                     other => other,
                 };
-                let (dive_output, usage) = match dived {
-                    Ok(output) => output,
+                let (dive_output, usage, resumed) = match dived {
+                    Ok(result) => (result.output, result.usage, result.resumed),
                     // A key problem repeats on every remaining cluster, so
                     // failing fast beats burning the ceiling to learn it.
                     Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
@@ -440,11 +471,12 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 } else {
                     &deep_price
                 };
-                let dive_cost = gate.record(&usage, paid_price);
+                let dive_cost = record_pass(&mut gate, &usage, paid_price, resumed);
                 spend.push(PassSpend {
                     pass: format!("deep dive {lens}"),
                     usage,
                     cost: dive_cost,
+                    resumed,
                 });
                 log::info!(
                     "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
@@ -536,10 +568,11 @@ with their concrete harm.";
                 prompt::cross_examination_schema(),
                 "cross-examination",
                 config.limits.max_tokens,
+                if downgrade { triage_cache } else { deep_cache },
             )
             .await;
-            let (cross_output, usage) = match cross {
-                Ok(output) => output,
+            let (cross_output, usage, resumed) = match cross {
+                Ok(result) => (result.output, result.usage, result.resumed),
                 Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
                 Err(err) => {
                     log::warn!("cross-examination failed: {err}");
@@ -547,13 +580,18 @@ with their concrete harm.";
                         pass: "cross-examination".to_string(),
                         reason: err.to_string(),
                     });
-                    (findings::ModelFindings::default(), TokenUsage::default())
+                    (
+                        findings::ModelFindings::default(),
+                        TokenUsage::default(),
+                        false,
+                    )
                 }
             };
             spend.push(PassSpend {
                 pass: "cross-examination".to_string(),
                 usage,
-                cost: gate.record(&usage, paid_price),
+                cost: record_pass(&mut gate, &usage, paid_price, resumed),
+                resumed,
             });
             log::info!(
                 "cross-examination: {} finding(s) in {:.1?}",
@@ -664,22 +702,40 @@ coverage was complete and no defect was established.";
                 // This pass drafts prose only. The verdict and every
                 // finding are already settled, so a failure here costs a
                 // paragraph, never the run that paid for the deep dives.
+                let store = open_cache(config);
+                let summary_cache = PassCache {
+                    store: store
+                        .as_ref()
+                        .map(|store| store as &dyn crate::cache::Store),
+                    model: if downgrade {
+                        &config.models.triage
+                    } else {
+                        &config.models.verdict
+                    },
+                };
                 match call_pass::<SummaryOutput>(
                     provider,
                     summary_prompt,
                     summary_schema(),
                     "verdict summary",
                     config.limits.max_tokens,
+                    summary_cache,
                 )
                 .await
                 {
-                    Ok((summary_output, usage)) => {
+                    Ok(result) => {
                         spend.push(PassSpend {
                             pass: "verdict summary".to_string(),
-                            usage,
-                            cost: gate.record(&usage, paid_price),
+                            usage: result.usage,
+                            cost: record_pass(
+                                &mut *gate,
+                                &result.usage,
+                                paid_price,
+                                result.resumed,
+                            ),
+                            resumed: result.resumed,
                         });
-                        Some(summary_output.summary)
+                        Some(result.output.summary)
                     }
                     Err(err) => {
                         log::warn!("verdict summary failed, publishing without it: {err}");
@@ -688,6 +744,7 @@ coverage was complete and no defect was established.";
                                 pass: "verdict summary (failed)".to_string(),
                                 usage: *usage,
                                 cost: gate.record(usage, paid_price),
+                                resumed: false,
                             });
                         }
                         degradations.push(Degradation::SummaryUnavailable {
@@ -713,7 +770,7 @@ coverage was complete and no defect was established.";
         degradations: degradations.clone(),
         spend_lines: spend
             .iter()
-            .map(|pass_spend| (pass_spend.pass.clone(), pass_spend.cost))
+            .map(|pass_spend| (pass_spend.pass.clone(), pass_spend.cost, pass_spend.resumed))
             .collect(),
         prior_spend: input.prior_spend,
         summary,
@@ -726,6 +783,16 @@ coverage was complete and no defect was established.";
         body: synthesis.body,
         degradations: degradations.clone(),
         spend: RunSpend {
+            paid: spend
+                .iter()
+                .filter(|pass| !pass.resumed)
+                .map(|pass| pass.cost)
+                .sum(),
+            inherited: spend
+                .iter()
+                .filter(|pass| pass.resumed)
+                .map(|pass| pass.cost)
+                .sum(),
             total: spend.iter().map(|pass_spend| pass_spend.cost).sum(),
             passes: spend.clone(),
             prior_spend: input.prior_spend,
@@ -749,6 +816,25 @@ struct SummaryOutput {
     summary: String,
 }
 
+/// What a pass needs to consult the resume cache: somewhere to look, and
+/// the model identity that, with the request, decides whether an entry
+/// answers this pass's question.
+#[derive(Clone, Copy)]
+pub struct PassCache<'a> {
+    /// Where entries live. None disables the cache for this pass.
+    pub store: Option<&'a dyn crate::cache::Store>,
+    /// The model this pass will actually call.
+    pub model: &'a crate::config::ModelDef,
+}
+
+/// Outcome of one pass: its output, its usage, and whether the cache
+/// supplied it rather than the provider.
+struct PassResult<T> {
+    output: T,
+    usage: TokenUsage,
+    resumed: bool,
+}
+
 /// One provider call with schema-validated output and bounded retries.
 /// Returns the parsed output and the usage the call reported.
 async fn call_pass<T: DeserializeOwned>(
@@ -757,7 +843,8 @@ async fn call_pass<T: DeserializeOwned>(
     schema: Value,
     schema_name: &str,
     max_output: u32,
-) -> Result<(T, TokenUsage), ProviderError> {
+    cache: PassCache<'_>,
+) -> Result<PassResult<T>, ProviderError> {
     let make_request = {
         let system = prompt.system.clone();
         let user = prompt.user.clone();
@@ -777,6 +864,36 @@ Respond again with only a JSON object that matches it exactly."
             max_output_tokens: ceiling,
         }
     };
+    // The key is the request this pass starts from. Ceiling escalation is
+    // an internal retry, so a run that escalated still stores its result
+    // under the question it originally asked.
+    let initial = make_request(max_output, None);
+    let key = cache
+        .store
+        .map(|_| crate::cache::CacheKey::new(&initial, cache.model));
+    if let (Some(store), Some(key)) = (cache.store, key.as_ref())
+        && let Some(entry) = store.get(key)
+    {
+        // A retrieved entry is validated exactly as a live response is, so
+        // the strongest thing a bad entry can do is what a bad model
+        // response can already do.
+        match serde_json::from_value::<T>(entry.content.clone()) {
+            Ok(parsed) => {
+                log::info!("{schema_name}: resumed from cache");
+                return Ok(PassResult {
+                    output: parsed,
+                    usage: entry.usage(),
+                    resumed: true,
+                });
+            }
+            Err(err) => {
+                log::warn!(
+                    "{schema_name}: cached entry failed validation, running the pass: {err}"
+                );
+            }
+        }
+    }
+
     let mut ceiling = max_output;
     let mut escalations: u32 = 0;
     let mut attempts: u32 = 0;
@@ -828,7 +945,16 @@ retrying with {raised} output tokens"
                 usage.output_tokens = usage
                     .output_tokens
                     .saturating_add(carried_usage.output_tokens);
-                return Ok((parsed, usage));
+                // Only a completed, schema-valid pass is stored. A failure
+                // anywhere above leaves nothing behind to resume from.
+                if let (Some(store), Some(key)) = (cache.store, key.as_ref()) {
+                    store.put(key, &crate::cache::Entry::new(response.content, &usage));
+                }
+                return Ok(PassResult {
+                    output: parsed,
+                    usage,
+                    resumed: false,
+                });
             }
             Err(err) => {
                 last_error = Some(err);
@@ -888,6 +1014,40 @@ fn shrunk_diff_text(input: &PipelineInput) -> String {
         }
     }
     text
+}
+
+/// Open the resume cache when configuration asks for one. A location that
+/// cannot be opened yields no cache rather than an error, because a cache
+/// is never worth failing a run over.
+fn open_cache(config: &Config) -> Option<crate::cache::FsStore> {
+    if !config.cache.enabled {
+        return None;
+    }
+    let dir = config.cache.dir.as_ref()?;
+    let store = crate::cache::FsStore::open(dir, config.cache.max_age(), config.cache.max_bytes());
+    if store.is_none() {
+        log::warn!(
+            "cache directory {} is unusable; running cold",
+            dir.display()
+        );
+    }
+    store
+}
+
+/// Price a completed pass. A pass served from cache made no provider call
+/// this run, so it consumes no budget, but its original cost is still
+/// reported because those dollars were spent.
+fn record_pass(
+    gate: &mut BudgetGate,
+    usage: &TokenUsage,
+    price: &ModelPrice,
+    resumed: bool,
+) -> f64 {
+    if resumed {
+        price.cost_of_usage(usage)
+    } else {
+        gate.record(usage, price)
+    }
 }
 
 /// Estimate the input tokens a pass will actually send. The system rules
