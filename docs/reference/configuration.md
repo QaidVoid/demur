@@ -175,6 +175,35 @@ no diff line to anchor to.
 A `pattern` that is not a valid regular expression fails the run at validation
 with the field named, rather than being ignored.
 
+## `[cache]`
+
+The resume cache keeps completed passes so a retried run does not pay twice
+for work an earlier attempt finished. It is off unless you turn it on.
+
+```toml
+[cache]
+enabled = true
+dir = "/tmp/demur-cache"   # where entries live
+max_age_hours = 24         # entries older than this are dropped
+max_mb = 256               # total size before oldest-first eviction
+```
+
+A cache can only change what a run costs. An absent, disabled, unreadable,
+corrupt, or evicted cache produces exactly the review a cold run produces, so
+nothing about your findings, verdict, or check run depends on it existing.
+
+An entry is reusable only by a run that would have asked the same question of
+the same model: the key covers the head commit, the pass and its lens, the
+rendered prompt, the model and its parameters, and the output ceiling. A
+changed model or lens is a miss, not a reuse.
+
+A resumed run reports what it paid and what it inherited separately, and the
+pull request's cumulative spend keeps counting what the earlier attempt
+actually paid.
+
+The cache is never read on a pull request from a fork. In the Action, set the
+`cache` input rather than this section; the workflow supplies the directory.
+
 ## `[models.<role>]`
 
 Roles are `triage`, `deep`, and `verdict`; every role is required.

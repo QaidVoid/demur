@@ -43,7 +43,9 @@ export default defineConfig({
         text: 'How it works',
         items: [
           { text: 'The review pipeline', link: '/guide/pipeline' },
+          { text: 'Review rules', link: '/guide/rules' },
           { text: 'Cost and budgets', link: '/guide/cost' },
+          { text: 'The resume cache', link: '/guide/cache' },
           { text: 'Delta reviews', link: '/guide/delta-reviews' },
           { text: 'Providers', link: '/guide/providers' },
           { text: 'Security model', link: '/guide/security' }
@@ -53,6 +55,7 @@ export default defineConfig({
         text: 'Reference',
         items: [
           { text: 'Configuration', link: '/reference/configuration' },
+          { text: 'Editor schema', link: '/reference/schema' },
           { text: 'CLI', link: '/reference/cli' },
           { text: 'GitHub Action', link: '/reference/action' },
           { text: 'Troubleshooting', link: '/reference/troubleshooting' }

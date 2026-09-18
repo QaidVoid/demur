@@ -83,3 +83,30 @@ you control, or review the pull request locally with the CLI.
 | Merge the pull request | No, no merge path exists |
 | Reach the network beyond configured endpoints | No |
 | Read or exfiltrate the provider key | No |
+
+## The resume cache
+
+The [resume cache](/guide/cache) stores the output of completed review passes.
+That output is derived from pull request content, which is untrusted, so the
+entries are untrusted too and are treated that way.
+
+**Entries are revalidated on the way in.** A retrieved entry is checked against
+the pass schema exactly as a live provider response is, and its findings go
+through the same finding contract. The strongest thing a tampered entry can do
+is what a hostile model response can already do: produce a wrong finding that a
+human reviewer sees and dismisses. It cannot introduce a finding a live pass
+could not, and it cannot change the verdict rule, the budget, or any
+configuration, because none of those are stored in an entry.
+
+**Fork pull requests never read the cache.** A workflow cache can be written by
+a job running for a fork's pull request, and an entry written there carries
+model output derived from that fork's own content. Reading one in a trusted run
+would let a fork place a finding under this repository's reviewer. Rather than
+depend on the cache scoping rules of the execution environment, a fork run is
+always cold. It costs the contributor nothing, since a fork run has no provider
+key and publishes a notice anyway.
+
+**Nothing secret is stored.** An entry holds pass output and token counts. The
+provider key, the GitHub token, the configuration, and the rendered prompt are
+never written to it. The key is a digest, so the cache holds answers rather than
+questions.
