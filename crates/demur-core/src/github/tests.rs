@@ -480,3 +480,114 @@ async fn force_push_falls_back_to_a_full_review() {
     // The carried blocker still stands even after history was rewritten.
     assert_eq!(outcome.check_conclusion, "failure");
 }
+
+fn too_large_body() -> String {
+    r#"{"message":"Sorry, the diff exceeded the maximum number of lines (20000)","errors":[{"resource":"PullRequest","field":"diff","code":"too_large"}],"documentation_url":"https://docs.github.com/rest/pulls/pulls#get-a-pull-request","status":"406"}"#
+    .to_string()
+}
+
+#[test]
+fn synthesized_diff_covers_adds_removes_and_renames() {
+    let files = vec![
+        PrFile {
+            path: "new.rs".to_string(),
+            previous_path: None,
+            status: "added".to_string(),
+            patch: Some("@@ -0,0 +1,1 @@\n+fn fresh() {}".to_string()),
+        },
+        PrFile {
+            path: "gone.rs".to_string(),
+            previous_path: None,
+            status: "removed".to_string(),
+            patch: Some("@@ -1,1 +0,0 @@\n-fn stale() {}".to_string()),
+        },
+        PrFile {
+            path: "moved.rs".to_string(),
+            previous_path: Some("old.rs".to_string()),
+            status: "renamed".to_string(),
+            patch: Some("@@ -1,1 +1,1 @@\n fn a() {}".to_string()),
+        },
+        PrFile {
+            path: "huge.bin".to_string(),
+            previous_path: None,
+            status: "modified".to_string(),
+            patch: None,
+        },
+    ];
+    let diff = synthesize_diff(&files);
+    let parsed = crate::diff::parse_unified_diff(&diff);
+    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed[0].path, "new.rs");
+    assert!(parsed[0].is_new);
+    assert_eq!(parsed[1].path, "gone.rs");
+    assert!(parsed[1].is_deleted);
+    assert_eq!(parsed[2].path, "moved.rs");
+    assert_eq!(parsed[2].old_path.as_deref(), Some("old.rs"));
+}
+
+#[tokio::test]
+async fn oversized_pull_request_diff_falls_back_to_the_files_api() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(406).set_body_string(too_large_body()))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let page_one = json!([
+        {"filename": "src/big.rs", "status": "modified",
+         "patch": "@@ -1,2 +1,3 @@\n context\n+added line"},
+        {"filename": "media/logo.png", "status": "modified", "patch": null}
+    ]);
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/files"))
+        .and(wiremock::matchers::query_param("page", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page_one))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/files"))
+        .and(wiremock::matchers::query_param("page", "2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let diff = client.pull_request_diff(7).await.unwrap();
+    let parsed = crate::diff::parse_unified_diff(&diff);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].path, "src/big.rs");
+    assert_eq!(parsed[0].hunks[0].added(), 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn oversized_delta_diff_falls_back_to_compare_files() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/old...new"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(406).set_body_string(too_large_body()))
+        .mount(&server)
+        .await;
+    let compare_files = json!({
+        "files": [
+            {"filename": "src/delta.rs", "status": "modified",
+             "patch": "@@ -1,1 +1,2 @@\n fn a() {}\n+let b = 1;"}
+        ]
+    });
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/old...new"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(compare_files))
+        .mount(&server)
+        .await;
+
+    let client = client(&server);
+    let diff = client.compare_diff(7, "old", "new").await.unwrap();
+    let parsed = crate::diff::parse_unified_diff(&diff);
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].path, "src/delta.rs");
+    assert_eq!(parsed[0].hunks[0].added(), 1);
+}

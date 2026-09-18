@@ -252,6 +252,9 @@ impl GitHubClient {
     }
 
     /// Fetch the pull request's full unified diff.
+    /// Fetch the unified diff of the pull request. When the diff exceeds
+    /// GitHub's line limit (406 too large), it is assembled from the
+    /// paginated per-file patches of the files API instead.
     pub async fn pull_request_diff(&self, number: u64) -> Result<String, GitHubError> {
         let response = self
             .get(
@@ -260,8 +263,14 @@ impl GitHubClient {
             )
             .await?;
         if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let text = response.text().await.unwrap_or_default();
+            if status == 406 && is_diff_too_large(&text) {
+                let files = self.pull_request_files(number).await?;
+                return Ok(synthesize_diff(&files));
+            }
             return Err(GitHubError::Request {
-                message: self.error_body(response).await,
+                message: self.redacted(&crate::provider::excerpt(&text)),
             });
         }
         response.text().await.map_err(|err| GitHubError::Request {
@@ -269,9 +278,50 @@ impl GitHubClient {
         })
     }
 
+    /// The pull request's changed files with their per-file patches,
+    /// paginated up to the API's 3000 file ceiling.
+    pub async fn pull_request_files(&self, number: u64) -> Result<Vec<PrFile>, GitHubError> {
+        let mut all = Vec::new();
+        for page in 1..=30 {
+            let response = self
+                .get(
+                    &format!(
+                        "/repos/{}/{}/pulls/{number}/files?per_page=100&page={page}",
+                        self.owner, self.repo
+                    ),
+                    "application/vnd.github+json",
+                )
+                .await?;
+            if !response.status().is_success() {
+                return Err(GitHubError::Request {
+                    message: self.error_body(response).await,
+                });
+            }
+            let mut page_files: Vec<PrFile> =
+                response.json().await.map_err(|err| GitHubError::Request {
+                    message: self.redacted(&err.to_string()),
+                })?;
+            let done = page_files.len() < 100;
+            all.append(&mut page_files);
+            if done {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
     /// Fetch the unified diff of the commits between two heads, used for
-    /// delta reviews.
-    pub async fn compare_diff(&self, from_sha: &str, to_sha: &str) -> Result<String, GitHubError> {
+    /// delta reviews. When that diff exceeds GitHub's line limit, it is
+    /// assembled from the compare files list; when the compare files list
+    /// itself is truncated at its 300 file ceiling, the full pull request
+    /// file list widens the scope instead, because a wider review is the
+    /// fail-safe direction for a delta.
+    pub async fn compare_diff(
+        &self,
+        number: u64,
+        from_sha: &str,
+        to_sha: &str,
+    ) -> Result<String, GitHubError> {
         let response = self
             .get(
                 &format!(
@@ -281,14 +331,44 @@ impl GitHubClient {
                 "application/vnd.github.v3.diff",
             )
             .await?;
+        if response.status().is_success() {
+            return response.text().await.map_err(|err| GitHubError::Request {
+                message: self.redacted(&err.to_string()),
+            });
+        }
+        let status = response.status().as_u16();
+        let text = response.text().await.unwrap_or_default();
+        if status != 406 || !is_diff_too_large(&text) {
+            return Err(GitHubError::Request {
+                message: self.redacted(&crate::provider::excerpt(&text)),
+            });
+        }
+        let response = self
+            .get(
+                &format!(
+                    "/repos/{}/{}/compare/{from_sha}...{to_sha}",
+                    self.owner, self.repo
+                ),
+                "application/vnd.github+json",
+            )
+            .await?;
         if !response.status().is_success() {
             return Err(GitHubError::Request {
                 message: self.error_body(response).await,
             });
         }
-        response.text().await.map_err(|err| GitHubError::Request {
+        #[derive(Deserialize)]
+        struct CompareFiles {
+            files: Vec<PrFile>,
+        }
+        let compare: CompareFiles = response.json().await.map_err(|err| GitHubError::Request {
             message: self.redacted(&err.to_string()),
-        })
+        })?;
+        if compare.files.len() >= 300 {
+            let files = self.pull_request_files(number).await?;
+            return Ok(synthesize_diff(&files));
+        }
+        Ok(synthesize_diff(&compare.files))
     }
 
     /// True when `prior` is an ancestor of `current` (or identical).
@@ -545,6 +625,65 @@ impl GitHubClient {
         }
         Ok(())
     }
+}
+
+/// One changed file from the files API, with its per-file patch when
+/// GitHub could produce one. Binary and oversized files have no patch and
+/// are skipped when a diff is assembled from this list.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PrFile {
+    /// Path after the change.
+    #[serde(rename = "filename")]
+    pub path: String,
+    /// Path before the change, for renames.
+    #[serde(rename = "previous_filename")]
+    pub previous_path: Option<String>,
+    /// added, removed, modified, renamed, or changed.
+    pub status: String,
+    /// The unified diff hunks for this file, when available.
+    #[serde(default)]
+    pub patch: Option<String>,
+}
+
+/// True when the API rejected the diff for exceeding its line limit.
+fn is_diff_too_large(body: &str) -> bool {
+    body.contains("too_large") || body.contains("exceeded the maximum number of lines")
+}
+
+/// Assemble a unified diff from per-file patches. Files without a patch
+/// (binary or oversized) are skipped.
+pub fn synthesize_diff(files: &[PrFile]) -> String {
+    let mut out = String::new();
+    for file in files {
+        let Some(patch) = &file.patch else {
+            continue;
+        };
+        let old = file.previous_path.as_ref().unwrap_or(&file.path);
+        out.push_str(&format!("diff --git a/{old} b/{}\n", file.path));
+        match file.status.as_str() {
+            "added" => out.push_str("new file mode 100644\n"),
+            "removed" => out.push_str("deleted file mode 100644\n"),
+            "renamed" => {
+                out.push_str(&format!("rename from {old}\n"));
+                out.push_str(&format!("rename to {}\n", file.path));
+            }
+            _ => {}
+        }
+        let old_side = if file.status == "added" {
+            "/dev/null".to_string()
+        } else {
+            format!("a/{old}")
+        };
+        let new_side = if file.status == "removed" {
+            "/dev/null".to_string()
+        } else {
+            format!("b/{}", file.path)
+        };
+        out.push_str(&format!("--- {old_side}\n+++ {new_side}\n"));
+        out.push_str(patch.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 /// Extract a fingerprint from an inline comment's hidden marker.

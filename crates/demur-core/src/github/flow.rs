@@ -57,7 +57,9 @@ pub async fn review_pull_request(
     let scope = delta::derive_scope(prior_marker.as_ref(), prior_is_ancestor);
     let diff_text = match &scope {
         ReviewScope::Full => client.pull_request_diff(number).await?,
-        ReviewScope::Delta { since_sha } => client.compare_diff(since_sha, &head_sha).await?,
+        ReviewScope::Delta { since_sha } => {
+            client.compare_diff(number, since_sha, &head_sha).await?
+        }
     };
     let dismissed = client.dismissed_fingerprints(number).await;
 
