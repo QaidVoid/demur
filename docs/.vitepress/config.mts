@@ -6,7 +6,6 @@ export default defineConfig({
   description:
     'BYOK adversarial AI code review: even granting every fact in the pull request, there is still no case for merging it.',
   base: '/',
-  outDir: 'dist',
   cleanUrls: true,
   head: [
     ['link', { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' }],
