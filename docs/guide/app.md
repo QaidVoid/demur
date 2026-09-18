@@ -68,7 +68,7 @@ is what the trust above is about.
 ```toml
 [app]
 client_id = "Iv1.abc123def456"
-token_file = "~/.config/demur/authorization.json"
+token_file = "/home/you/.config/demur/authorization.json"
 ```
 
 **4. Authorize once.** The first publish prints a code:

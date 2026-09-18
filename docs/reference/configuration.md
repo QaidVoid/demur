@@ -245,8 +245,12 @@ is attributed to you and carries demur's mark beside your name.
 ```toml
 [app]
 client_id = "Iv1.abc123def456"
-token_file = "~/.config/demur/authorization.json"
+token_file = "/home/you/.config/demur/authorization.json"
 ```
+
+Paths are used literally: `~` is not expanded, so write them out in full or a
+directory named `~` appears where you ran demur. The same is true of `key_file`
+and `cache.dir`.
 
 `client_id` names which application you are authorizing. It is not a secret.
 `token_file` is where to keep the authorization so later publications do not

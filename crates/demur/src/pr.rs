@@ -178,6 +178,22 @@ async fn resolve_identity(
     }
 }
 
+/// Explain a failed publication. An authorization carries the permissions
+/// its application was granted, so a refusal under one is far more often
+/// the application not being installed on this repository than a
+/// permission missing from it. Saying "missing permission" alone sends
+/// someone to audit a setting that is already correct.
+fn publication_failure(error: demur_core::github::GitHubError, badged: bool) -> String {
+    let text = error.to_string();
+    if badged && matches!(error, demur_core::github::GitHubError::Permission { .. }) {
+        return format!(
+            "{text}\nif the application's permissions are already set, it is most likely not \
+installed on this repository: install it from the application's settings and try again"
+        );
+    }
+    text
+}
+
 async fn authorize(
     authorizer: &demur_core::app::Authorizer,
 ) -> Result<demur_core::app::Authorization, demur_core::app::AppError> {
@@ -296,7 +312,7 @@ your name, not under a bot identity, and without demur's mark."
                     &[],
                 )
                 .await
-                .map_err(|err| err.to_string())?;
+                .map_err(|err| publication_failure(err, identity.badged))?;
             }
             Ok(match review.verdict {
                 Verdict::Approve => crate::EXIT_APPROVE,
