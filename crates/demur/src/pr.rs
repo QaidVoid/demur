@@ -254,6 +254,7 @@ pub async fn review_pr(
         .await
         .map_err(|e| e.to_string())?;
     let files = parse_unified_diff(&diff);
+    let ingestion = ingest(&files, &config);
     let pipeline_input = PipelineInput {
         meta: PullRequestMeta {
             title: if pr.title.is_empty() {
@@ -265,7 +266,7 @@ pub async fn review_pr(
             head_sha: pr.head_sha().to_string(),
             origin: MetaOrigin::PullRequest,
         },
-        ingestion: ingest(&files, &config),
+        ingestion: ingestion.clone(),
         diff_text: diff,
         prior_spend: 0.0,
         carried_findings: Vec::new(),
@@ -302,14 +303,42 @@ and carries demur's mark beside your name."
 your name, not under a bot identity, and without demur's mark."
                     );
                 }
+                // The same anchoring the Action uses, so a review
+                // published from here has resolvable threads and a marker
+                // a later run can read. A body-only review silently costs
+                // delta scope, carry-forward, and dismissal.
+                let cluster_hunks: std::collections::HashMap<String, Vec<_>> = ingestion
+                    .clusters
+                    .iter()
+                    .map(|cluster| (cluster.path.clone(), cluster.hunks.clone()))
+                    .collect();
+                let (fingerprints, comments) = demur_core::github::anchor_findings(
+                    &review.published,
+                    &ingestion,
+                    &cluster_hunks,
+                    &std::collections::HashSet::new(),
+                );
+                let spend: std::collections::BTreeMap<String, f64> = review
+                    .spend
+                    .passes
+                    .iter()
+                    .map(|pass| (pass.pass.clone(), pass.cost))
+                    .collect();
+                let marker = demur_core::delta::build_marker(
+                    pr.head_sha(),
+                    None,
+                    &spend,
+                    &[],
+                    &fingerprints,
+                );
                 publish_review(
                     &client,
                     parsed.number,
                     pr.head_sha(),
                     review.verdict,
                     &review.body,
-                    None,
-                    &[],
+                    Some(&marker),
+                    &comments,
                 )
                 .await
                 .map_err(|err| publication_failure(err, identity.badged))?;

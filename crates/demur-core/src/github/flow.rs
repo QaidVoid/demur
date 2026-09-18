@@ -180,33 +180,12 @@ pub async fn review_pull_request(
         }
     };
 
-    // Fingerprints for the surviving findings, for suppression of fresh
-    // duplicates of dismissed findings, inline markers, and the next
-    // marker.
-    let mut fingerprints: Vec<(Finding, String)> = Vec::new();
-    for finding in &review.published {
-        if let Some(hunks) = cluster_hunks.get(&finding.file) {
-            let fp = delta::fingerprint(finding, hunks);
-            if suppress_for_fingerprints.contains(&fp) {
-                continue;
-            }
-            fingerprints.push((finding.clone(), fp));
-        }
-    }
-
-    // Inline comments only for findings anchored in the current diff.
-    let mut comments = Vec::new();
-    for (finding, fingerprint) in &fingerprints {
-        if let Some(lines) = anchored_lines(&input.ingestion, &finding.file)
-            && lines.contains(&finding.start_line)
-        {
-            comments.push(InlineComment {
-                path: finding.file.clone(),
-                line: finding.start_line,
-                body: render_comment(finding, fingerprint),
-            });
-        }
-    }
+    let (fingerprints, comments) = anchor_findings(
+        &review.published,
+        &input.ingestion,
+        &cluster_hunks,
+        &suppress_for_fingerprints,
+    );
 
     // Did the head move while we worked?
     let current_head = client.pull_request(number).await?.head_sha().to_string();
@@ -256,6 +235,42 @@ review ran against {head_sha}. The newer commit was not reviewed.\n"
         summary: body,
         head_moved,
     })
+}
+
+/// Fingerprint the surviving findings and build the inline comments for
+/// those anchored in the current diff. Shared so every path that publishes
+/// a review publishes the same one: a body-only review is a review with no
+/// resolvable threads, and a review with no fingerprints is a review no
+/// later run can carry forward or silence.
+pub fn anchor_findings(
+    published: &[Finding],
+    ingestion: &crate::ingest::Ingestion,
+    cluster_hunks: &HashMap<String, Vec<crate::diff::Hunk>>,
+    suppress: &HashSet<String>,
+) -> (Vec<(Finding, String)>, Vec<InlineComment>) {
+    let mut fingerprints: Vec<(Finding, String)> = Vec::new();
+    for finding in published {
+        if let Some(hunks) = cluster_hunks.get(&finding.file) {
+            let fingerprint = delta::fingerprint(finding, hunks);
+            if suppress.contains(&fingerprint) {
+                continue;
+            }
+            fingerprints.push((finding.clone(), fingerprint));
+        }
+    }
+    let mut comments = Vec::new();
+    for (finding, fingerprint) in &fingerprints {
+        if let Some(lines) = anchored_lines(ingestion, &finding.file)
+            && lines.contains(&finding.start_line)
+        {
+            comments.push(InlineComment {
+                path: finding.file.clone(),
+                line: finding.start_line,
+                body: render_comment(finding, fingerprint),
+            });
+        }
+    }
+    (fingerprints, comments)
 }
 
 fn carried_states(

@@ -44,6 +44,7 @@ export default defineConfig({
         items: [
           { text: 'The review pipeline', link: '/guide/pipeline' },
           { text: 'Review rules', link: '/guide/rules' },
+          { text: 'Shaping the review', link: '/guide/template' },
           { text: 'Context retrieval', link: '/guide/retrieval' },
           { text: 'Cost and budgets', link: '/guide/cost' },
           { text: 'The resume cache', link: '/guide/cache' },
