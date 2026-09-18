@@ -59,6 +59,25 @@ pub enum Degradation {
     },
 }
 
+/// How many items a disclosure may name before it starts counting them
+/// instead. A disclosure shares the review body with the delta markers,
+/// which prune to stay under the forge's size limit, so an unbounded
+/// enumeration competes with state the next run depends on.
+const DISCLOSURE_SAMPLE: usize = 8;
+
+/// Name up to the bound and count the rest. The fact and the total are
+/// never bounded; only the enumeration is.
+fn sample(items: &[String]) -> String {
+    if items.len() <= DISCLOSURE_SAMPLE {
+        return items.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        items[..DISCLOSURE_SAMPLE].join(", "),
+        items.len() - DISCLOSURE_SAMPLE
+    )
+}
+
 impl Degradation {
     /// The line rendered into the review body.
     pub fn describe(&self) -> String {
@@ -70,16 +89,18 @@ impl Degradation {
                 format!("{pass}: ran on the triage model instead of the deep model")
             }
             Degradation::DeepCallsCapped { unreviewed } => {
-                let names = unreviewed.join(", ");
+                // Clusters arrive in risk order, so the named ones are the
+                // ones most worth naming.
                 format!(
-                    "deep call ceiling left {} cluster(s) without a deep dive: {names}",
-                    unreviewed.len()
+                    "deep call ceiling left {} cluster(s) without a deep dive: {}",
+                    unreviewed.len(),
+                    sample(unreviewed)
                 )
             }
             Degradation::SummaryOnly { skipped } => {
-                let names = skipped.join(", ");
                 format!(
-                    "budget exhausted before completion; the review summarizes only what ran. Passes skipped: {names}"
+                    "budget exhausted before completion; the review summarizes only what ran. Passes skipped: {}",
+                    sample(skipped)
                 )
             }
             Degradation::PassFailed { pass, reason } => {
@@ -93,7 +114,7 @@ impl Degradation {
                 format!(
                     "{pass}: asked for {} item(s) of repository context, {attached} attached ({})",
                     items.len(),
-                    items.join(", ")
+                    sample(items)
                 )
             }
             Degradation::SummaryUnavailable { reason } => {
@@ -352,6 +373,64 @@ mod tests {
             input,
             cached_input: input / 2.0,
             output,
+        }
+    }
+
+    #[test]
+    fn a_disclosure_within_the_bound_is_unchanged() {
+        let unreviewed: Vec<String> = (0..3).map(|i| format!("src/f{i}.rs")).collect();
+        let text = Degradation::DeepCallsCapped { unreviewed }.describe();
+        assert!(text.contains("3 cluster(s)"), "{text}");
+        assert!(text.contains("src/f0.rs, src/f1.rs, src/f2.rs"), "{text}");
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    #[test]
+    fn a_large_disclosure_counts_instead_of_listing() {
+        // The case that produced an eight kilobyte bullet: hundreds of
+        // clusters left unreviewed on a very wide pull request.
+        let unreviewed: Vec<String> = (0..282).map(|i| format!("src/session/f{i}.ts")).collect();
+        let text = Degradation::DeepCallsCapped { unreviewed }.describe();
+        assert!(
+            text.contains("282 cluster(s)"),
+            "the total is never hidden: {text}"
+        );
+        assert!(text.contains("and 274 more"), "{text}");
+        assert!(
+            text.contains("src/session/f0.ts"),
+            "the highest-risk entries are the ones named: {text}"
+        );
+        assert!(!text.contains("src/session/f100.ts"), "{text}");
+        assert!(
+            text.len() < 400,
+            "a disclosure must stay readable, got {} characters",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn every_enumerating_disclosure_is_bounded() {
+        let many: Vec<String> = (0..100).map(|i| format!("item-{i}")).collect();
+        for degradation in [
+            Degradation::DeepCallsCapped {
+                unreviewed: many.clone(),
+            },
+            Degradation::SummaryOnly {
+                skipped: many.clone(),
+            },
+            Degradation::ContextRetrieved {
+                pass: "deep dive".to_string(),
+                items: many.clone(),
+                attached: 1,
+            },
+        ] {
+            let text = degradation.describe();
+            assert!(
+                text.len() < 400,
+                "unbounded disclosure: {} characters",
+                text.len()
+            );
+            assert!(text.contains("more"), "the rest must be counted: {text}");
         }
     }
 
