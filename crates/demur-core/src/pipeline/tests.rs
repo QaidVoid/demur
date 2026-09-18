@@ -458,3 +458,137 @@ async fn carried_blocker_sets_the_verdict_on_a_clean_delta() {
             .any(|finding| finding.message == "unfixed sql injection")
     );
 }
+
+fn registry_results(
+    triage: Vec<Result<serde_json::Value, ProviderError>>,
+    deep: Vec<Result<serde_json::Value, ProviderError>>,
+    verdict: Vec<Result<serde_json::Value, ProviderError>>,
+) -> ProviderRegistry {
+    ProviderRegistry::recorded(
+        RecordedProvider::new(triage),
+        RecordedProvider::new(deep),
+        RecordedProvider::new(verdict),
+    )
+}
+
+fn recorded(provider: &crate::provider::AnyProvider) -> &RecordedProvider {
+    match provider {
+        crate::provider::AnyProvider::Recorded(inner) => inner,
+        _ => panic!("expected a recorded provider"),
+    }
+}
+
+#[tokio::test]
+async fn verdict_summary_failure_still_publishes_the_completed_review() {
+    // The summary is prose. Losing it must not discard the deep dives that
+    // were already paid for, which is what a rejected request used to do.
+    let config = config_with("standard", "");
+    let providers = registry_results(
+        vec![Ok(triage_response())],
+        vec![
+            Ok(dive_response("hardcoded credential")),
+            Ok(dive_response("second")),
+        ],
+        vec![Err(ProviderError::Rejected {
+            message: "failed to download media at input[0].content[0]".to_string(),
+        })],
+    );
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .expect("a rejected summary must not fail the run");
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert_eq!(
+        review.verdict,
+        crate::pipeline::synthesis::Verdict::RequestChanges
+    );
+    assert!(review.body.contains("hardcoded credential"));
+    assert!(
+        review.body.contains("verdict summary could not be drafted"),
+        "the failure must be disclosed: {}",
+        review.body
+    );
+    // The deep dive spend survives so the review can still report it.
+    assert!(review.spend.total > 0.0);
+}
+
+#[tokio::test]
+async fn deep_dive_failure_degrades_and_keeps_the_other_dives() {
+    let config = config_with("standard", "");
+    let providers = registry_results(
+        vec![Ok(triage_response())],
+        vec![
+            Ok(dive_response("hardcoded credential")),
+            Err(ProviderError::Rejected {
+                message: "provider said no".to_string(),
+            }),
+        ],
+        vec![Ok(summary_response())],
+    );
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .expect("one failed dive must not fail the run");
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert!(review.body.contains("hardcoded credential"));
+    assert!(
+        review.body.contains("failed and was skipped"),
+        "the skipped dive must be disclosed: {}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn auth_failure_on_a_deep_dive_fails_the_run_immediately() {
+    // A bad key repeats on every cluster, so degrading would burn the
+    // whole ceiling to learn what the first call already proved.
+    let config = config_with("standard", "");
+    let providers = registry_results(
+        vec![Ok(triage_response())],
+        vec![Err(ProviderError::Auth {
+            message: "invalid key".to_string(),
+        })],
+        vec![Ok(summary_response())],
+    );
+    let error = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .expect_err("an auth failure must stop the run");
+    let PipelineError::Provider(ProviderError::Auth { .. }) = error else {
+        panic!("expected an auth failure, got {error}");
+    };
+}
+
+#[tokio::test]
+async fn budget_downgrade_sends_the_pass_to_the_triage_model() {
+    // The deep provider is given no steps at all: if the downgrade rung is
+    // disclosed but the call still goes to the deep model, the run fails.
+    let config = config_with("standard", "[budget]\nper_pr_usd = 0.01");
+    let providers = registry(vec![
+        vec![
+            triage_response(),
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![],
+        vec![summary_response()],
+    ]);
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .expect("the downgraded dives run on the triage model");
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    assert!(
+        review
+            .body
+            .contains("ran on the triage model instead of the deep model"),
+        "{}",
+        review.body
+    );
+    assert!(
+        recorded(&providers.deep).requests().is_empty(),
+        "a downgraded pass must not reach the deep model"
+    );
+}

@@ -20,7 +20,7 @@ use crate::provider::{
     CompletionRequest, CompletionResponse, ProviderError, ProviderRegistry, RetryPolicy,
     TokenUsage, complete_with_retries,
 };
-use budget::{BudgetGate, Degradation, LadderDecision, PassKind};
+use budget::{BudgetGate, Degradation, LadderDecision, PassEstimate};
 use prompt::PullRequestMeta;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -34,10 +34,20 @@ const SCHEMA_ATTEMPTS: u32 = 3;
 /// grows 4x per escalation.
 const MAX_CEILING_ESCALATIONS: u32 = 2;
 
+/// Absolute output ceiling. Escalation never asks for more than any
+/// current model will grant, because a ceiling past the model's own limit
+/// turns a truncation into a rejection.
+const MAX_OUTPUT_CEILING: u32 = 64_000;
+
+/// How many deep dives may fail against the provider before the run is
+/// treated as broken rather than degraded.
+const MAX_FAILED_DIVES: u32 = 2;
+
 /// A provider replaying recorded responses. Used by the fixture harness for
 /// end-to-end pipeline tests and for offline replay runs.
 pub struct RecordedProvider {
     steps: std::sync::Mutex<std::collections::VecDeque<Result<Value, ProviderError>>>,
+    seen: std::sync::Mutex<Vec<CompletionRequest>>,
     usage: TokenUsage,
 }
 
@@ -47,6 +57,7 @@ impl RecordedProvider {
     pub fn new(steps: Vec<Result<Value, ProviderError>>) -> RecordedProvider {
         RecordedProvider {
             steps: std::sync::Mutex::new(steps.into()),
+            seen: std::sync::Mutex::new(Vec::new()),
             usage: TokenUsage {
                 input_tokens: 100,
                 cached_input_tokens: 0,
@@ -54,13 +65,22 @@ impl RecordedProvider {
             },
         }
     }
+
+    /// Requests this provider was asked to complete, in order.
+    pub fn requests(&self) -> Vec<CompletionRequest> {
+        self.seen.lock().expect("recorded requests lock").clone()
+    }
 }
 
 impl crate::provider::Provider for RecordedProvider {
     async fn complete(
         &self,
-        _request: &CompletionRequest,
+        request: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
+        self.seen
+            .lock()
+            .expect("recorded requests lock")
+            .push(request.clone());
         let step = self
             .steps
             .lock()
@@ -200,31 +220,38 @@ pub async fn run(
     let triage_task = "Triage the changed hunks. For each file cluster, suggest review \
 lenses from: correctness, security, performance, style. Also report any finding \
 you can already anchor to an exact file and line range with its concrete harm.";
+    let triage_full = prompt::assemble(&context, triage_task, &prompt::findings_schema());
+    let triage_shrunk = prompt::assemble(&shrunk_context, triage_task, &prompt::findings_schema());
     log::info!(
         "triage: ~{} input tokens estimated on {}",
-        estimate_prompt_tokens(&context),
+        estimate_prompt(&triage_full),
         config.models.triage.name
     );
     let triage_started = std::time::Instant::now();
-    let estimate = budget::PassEstimate {
-        kind: PassKind::Triage,
+    let estimate = PassEstimate {
         pass: "triage",
-        full_tokens: estimate_prompt_tokens(&context),
-        shrunk_tokens: estimate_prompt_tokens(&shrunk_context),
+        full_tokens: estimate_prompt(&triage_full),
+        shrunk_tokens: estimate_prompt(&triage_shrunk),
         max_output_tokens: config.limits.max_tokens,
         price: &triage_price,
         downgrade_price: None,
     };
-    match gate.authorize(estimate) {
-        LadderDecision::Run => {}
-        LadderDecision::RunDegraded(degradation) => degradations.push(degradation),
+    let triage_prompt = match gate.authorize(estimate) {
+        LadderDecision::Run {
+            shrink,
+            degradations: disclosed,
+            ..
+        } => {
+            degradations.extend(disclosed);
+            if shrink { triage_shrunk } else { triage_full }
+        }
         LadderDecision::StandDown => {
             return Ok(RunOutcome::Skipped(skip_notice(input, &gate)));
         }
-    }
+    };
     let (triage_output, usage) = call_pass::<findings::TriageOutput>(
         &registry.triage,
-        prompt::assemble(&context, triage_task, &prompt::findings_schema()),
+        triage_prompt,
         prompt::findings_schema(),
         "triage",
         config.limits.max_tokens,
@@ -274,6 +301,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
     if profile != Profile::Quick {
         let ceiling = config.limits.deep_calls;
         let mut calls: u32 = 0;
+        let mut failed_dives: u32 = 0;
         log::info!(
             "deep dives: {} cluster(s) to consider, ceiling {} call(s)",
             input.ingestion.clusters.len(),
@@ -298,64 +326,88 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 let context = prompt::cluster_context(&input.meta, &cluster.path, &cluster.hunks);
                 let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
                 let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
-                let decision = gate.authorize(budget::PassEstimate {
-                    kind: PassKind::Deep,
+                let task = deep_dive_task(&lens);
+                let full_prompt = prompt::assemble(&context, &task, &prompt::findings_schema());
+                let shrunk_prompt = prompt::assemble(&shrunk, &task, &prompt::findings_schema());
+                let decision = gate.authorize(PassEstimate {
                     pass: "deep dive",
-                    full_tokens: estimate_prompt_tokens(&context),
-                    shrunk_tokens: estimate_prompt_tokens(&shrunk),
+                    full_tokens: estimate_prompt(&full_prompt),
+                    shrunk_tokens: estimate_prompt(&shrunk_prompt),
                     max_output_tokens: config.limits.max_tokens,
                     price: &deep_price,
                     downgrade_price: Some(&triage_price),
                 });
-                let mut downgraded = false;
-                if let LadderDecision::RunDegraded(Degradation::ModelDowngraded { .. }) = &decision
-                {
-                    downgraded = true;
-                }
-                if let LadderDecision::RunDegraded(degradation) = &decision {
-                    degradations.push(degradation.clone());
-                }
-                match decision {
-                    LadderDecision::Run | LadderDecision::RunDegraded(_) => {}
+                let (shrink, downgraded) = match decision {
+                    LadderDecision::Run {
+                        shrink,
+                        downgrade,
+                        degradations: disclosed,
+                    } => {
+                        degradations.extend(disclosed);
+                        (shrink, downgrade)
+                    }
                     LadderDecision::StandDown => {
                         degradations.push(Degradation::SummaryOnly {
                             skipped: vec!["remaining deep dives".to_string()],
                         });
                         break 'clusters;
                     }
-                }
-                let task = deep_dive_task(&lens);
+                };
+                let provider = if downgraded {
+                    &registry.triage
+                } else {
+                    &registry.deep
+                };
+                let chosen = if shrink {
+                    shrunk_prompt.clone()
+                } else {
+                    full_prompt
+                };
                 let dived = call_pass::<findings::ModelFindings>(
-                    &registry.deep,
-                    prompt::assemble(&context, &task, &prompt::findings_schema()),
+                    provider,
+                    chosen,
                     prompt::findings_schema(),
                     "deep dive",
                     config.limits.max_tokens,
                 )
                 .await;
-                let (dive_output, usage) = match dived {
-                    Ok(output) => output,
-                    Err(ProviderError::ContextOverflow { .. }) => {
+                let dived = match dived {
+                    Err(ProviderError::ContextOverflow { .. }) if !shrink => {
                         // Shrink to the first hunk and retry once.
-                        match call_pass::<findings::ModelFindings>(
-                            &registry.deep,
-                            prompt::assemble(&shrunk, &task, &prompt::findings_schema()),
+                        call_pass::<findings::ModelFindings>(
+                            provider,
+                            shrunk_prompt,
                             prompt::findings_schema(),
                             "deep dive",
                             config.limits.max_tokens,
                         )
                         .await
-                        {
-                            Ok(output) => {
-                                degradations.push(Degradation::ContextShrunk {
-                                    pass: format!("deep dive ({lens})"),
-                                });
-                                output
-                            }
-                            Err(err) => return Err(err.into()),
-                        }
+                        .inspect(|_| {
+                            degradations.push(Degradation::ContextShrunk {
+                                pass: format!("deep dive ({lens})"),
+                            });
+                        })
                     }
-                    Err(err) => return Err(err.into()),
+                    other => other,
+                };
+                let (dive_output, usage) = match dived {
+                    Ok(output) => output,
+                    // A key problem repeats on every remaining cluster, so
+                    // failing fast beats burning the ceiling to learn it.
+                    Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
+                    Err(err) => {
+                        log::warn!("deep dive [{lens}] on {} failed: {err}", cluster.path);
+                        degradations.push(Degradation::PassFailed {
+                            pass: format!("deep dive ({lens}) on {}", cluster.path),
+                            reason: err.to_string(),
+                        });
+                        failed_dives += 1;
+                        if failed_dives > MAX_FAILED_DIVES {
+                            return Err(err.into());
+                        }
+                        calls += 1;
+                        continue;
+                    }
                 };
                 let paid_price = if downgraded {
                     &triage_price
@@ -402,39 +454,80 @@ you can already anchor to an exact file and line range with its concrete harm.";
 rollback safety, concurrency hazards, migration safety, and breaking interface \
 changes. Report only findings you can anchor to an exact file and line range \
 with their concrete harm.";
-        let estimate = budget::PassEstimate {
-            kind: PassKind::Deep,
+        let full_prompt = prompt::assemble(&context, task, &prompt::cross_examination_schema());
+        let shrunk_prompt =
+            prompt::assemble(&shrunk_context, task, &prompt::cross_examination_schema());
+        let estimate = PassEstimate {
             pass: "cross-examination",
-            full_tokens: estimate_prompt_tokens(&context),
-            shrunk_tokens: estimate_prompt_tokens(&shrunk_context),
+            full_tokens: estimate_prompt(&full_prompt),
+            shrunk_tokens: estimate_prompt(&shrunk_prompt),
             max_output_tokens: config.limits.max_tokens,
             price: &deep_price,
             downgrade_price: Some(&triage_price),
         };
-        match gate.authorize(estimate) {
-            LadderDecision::Run => {}
-            LadderDecision::RunDegraded(degradation) => degradations.push(degradation),
+        // The decision for this pass, not the accumulated degradation list,
+        // decides whether it runs. An earlier stand-down among the deep
+        // dives must not be reported as if cross-examination had been
+        // priced and refused on its own.
+        let plan = match gate.authorize(estimate) {
+            LadderDecision::Run {
+                shrink,
+                downgrade,
+                degradations: disclosed,
+            } => {
+                degradations.extend(disclosed);
+                Some((shrink, downgrade))
+            }
             LadderDecision::StandDown => {
                 degradations.push(Degradation::SummaryOnly {
                     skipped: vec!["cross-examination".to_string()],
                 });
+                None
             }
-        }
-        if !gate_is_stood_down(&degradations) {
-            log::info!("cross-examination: running on {}", config.models.deep.name);
+        };
+        if let Some((shrink, downgrade)) = plan {
+            let provider = if downgrade {
+                &registry.triage
+            } else {
+                &registry.deep
+            };
+            let paid_price = if downgrade {
+                &triage_price
+            } else {
+                &deep_price
+            };
+            let model = if downgrade {
+                &config.models.triage.name
+            } else {
+                &config.models.deep.name
+            };
+            log::info!("cross-examination: running on {model}");
             let cross_started = std::time::Instant::now();
-            let (cross_output, usage) = call_pass::<findings::ModelFindings>(
-                &registry.deep,
-                prompt::assemble(&context, task, &prompt::cross_examination_schema()),
+            let chosen = if shrink { shrunk_prompt } else { full_prompt };
+            let cross = call_pass::<findings::ModelFindings>(
+                provider,
+                chosen,
                 prompt::cross_examination_schema(),
                 "cross-examination",
                 config.limits.max_tokens,
             )
-            .await?;
+            .await;
+            let (cross_output, usage) = match cross {
+                Ok(output) => output,
+                Err(err @ ProviderError::Auth { .. }) => return Err(err.into()),
+                Err(err) => {
+                    log::warn!("cross-examination failed: {err}");
+                    degradations.push(Degradation::PassFailed {
+                        pass: "cross-examination".to_string(),
+                        reason: err.to_string(),
+                    });
+                    (findings::ModelFindings::default(), TokenUsage::default())
+                }
+            };
             spend.push(PassSpend {
                 pass: "cross-examination".to_string(),
                 usage,
-                cost: gate.record(&usage, &deep_price),
+                cost: gate.record(&usage, paid_price),
             });
             log::info!(
                 "cross-examination: {} finding(s) in {:.1?}",
@@ -516,34 +609,67 @@ async fn synthesize_review(
 based only on the findings listed above. If no findings are listed, state that \
 coverage was complete and no defect was established.";
         let cheap_verdict_price = ModelPrice::from_model(&config.models.triage);
-        let decision = gate.authorize(budget::PassEstimate {
-            kind: PassKind::Verdict,
+        let summary_prompt = prompt::assemble(&context, task, &summary_schema());
+        let decision = gate.authorize(PassEstimate {
             pass: "verdict summary",
-            full_tokens: estimate_prompt_tokens(&context),
-            shrunk_tokens: estimate_prompt_tokens(&context),
+            full_tokens: estimate_prompt(&summary_prompt),
+            shrunk_tokens: estimate_prompt(&summary_prompt),
             max_output_tokens: config.limits.max_tokens,
             price: verdict_price,
             downgrade_price: Some(&cheap_verdict_price),
         });
-        if let LadderDecision::RunDegraded(degradation) = &decision {
-            degradations.push(degradation.clone());
-        }
         match decision {
-            LadderDecision::Run | LadderDecision::RunDegraded(_) => {
-                let (summary_output, usage) = call_pass::<SummaryOutput>(
-                    &registry.verdict,
-                    prompt::assemble(&context, task, &summary_schema()),
+            LadderDecision::Run {
+                downgrade,
+                degradations: disclosed,
+                ..
+            } => {
+                degradations.extend(disclosed);
+                let provider = if downgrade {
+                    &registry.triage
+                } else {
+                    &registry.verdict
+                };
+                let paid_price = if downgrade {
+                    &cheap_verdict_price
+                } else {
+                    verdict_price
+                };
+                // This pass drafts prose only. The verdict and every
+                // finding are already settled, so a failure here costs a
+                // paragraph, never the run that paid for the deep dives.
+                match call_pass::<SummaryOutput>(
+                    provider,
+                    summary_prompt,
                     summary_schema(),
                     "verdict summary",
                     config.limits.max_tokens,
                 )
-                .await?;
-                spend.push(PassSpend {
-                    pass: "verdict summary".to_string(),
-                    usage,
-                    cost: gate.record(&usage, verdict_price),
-                });
-                Some(summary_output.summary)
+                .await
+                {
+                    Ok((summary_output, usage)) => {
+                        spend.push(PassSpend {
+                            pass: "verdict summary".to_string(),
+                            usage,
+                            cost: gate.record(&usage, paid_price),
+                        });
+                        Some(summary_output.summary)
+                    }
+                    Err(err) => {
+                        log::warn!("verdict summary failed, publishing without it: {err}");
+                        if let ProviderError::OutputTruncated { usage, .. } = &err {
+                            spend.push(PassSpend {
+                                pass: "verdict summary (failed)".to_string(),
+                                usage: *usage,
+                                cost: gate.record(usage, paid_price),
+                            });
+                        }
+                        degradations.push(Degradation::SummaryUnavailable {
+                            reason: err.to_string(),
+                        });
+                        None
+                    }
+                }
             }
             LadderDecision::StandDown => {
                 degradations.push(Degradation::SummaryOnly {
@@ -611,9 +737,15 @@ async fn call_pass<T: DeserializeOwned>(
         let user = prompt.user.clone();
         let schema = schema.clone();
         let schema_name = schema_name.to_string();
-        move |ceiling: u32| CompletionRequest {
+        move |ceiling: u32, correction: Option<&str>| CompletionRequest {
             system: system.clone(),
-            user: user.clone(),
+            user: match correction {
+                Some(problem) => format!(
+                    "{user}\n\nYour previous response did not match the schema: {problem}\n\
+Respond again with only a JSON object that matches it exactly."
+                ),
+                None => user.clone(),
+            },
             schema: schema.clone(),
             schema_name: schema_name.clone(),
             max_output_tokens: ceiling,
@@ -623,12 +755,12 @@ async fn call_pass<T: DeserializeOwned>(
     let mut escalations: u32 = 0;
     let mut attempts: u32 = 0;
     let mut carried_usage = TokenUsage::default();
-    let mut last_error;
+    let mut last_error: Option<serde_json::Error> = None;
     loop {
+        let correction = last_error.as_ref().map(|err| err.to_string());
+        let request = make_request(ceiling, correction.as_deref());
         let response =
-            match complete_with_retries(provider, &make_request(ceiling), &RetryPolicy::default())
-                .await
-            {
+            match complete_with_retries(provider, &request, &RetryPolicy::default()).await {
                 Ok(response) => response,
                 Err(ProviderError::OutputTruncated { message, usage }) => {
                     carried_usage.input_tokens = carried_usage
@@ -640,14 +772,14 @@ async fn call_pass<T: DeserializeOwned>(
                     carried_usage.output_tokens = carried_usage
                         .output_tokens
                         .saturating_add(usage.output_tokens);
-                    if escalations >= MAX_CEILING_ESCALATIONS {
+                    if escalations >= MAX_CEILING_ESCALATIONS || ceiling >= MAX_OUTPUT_CEILING {
                         return Err(ProviderError::OutputTruncated {
                             message,
                             usage: carried_usage,
                         });
                     }
                     escalations += 1;
-                    let raised = ceiling.saturating_mul(4);
+                    let raised = ceiling.saturating_mul(4).min(MAX_OUTPUT_CEILING);
                     log::warn!(
                         "{schema_name}: output ceiling {ceiling} truncated the response, \
 retrying with {raised} output tokens"
@@ -732,14 +864,11 @@ fn shrunk_diff_text(input: &PipelineInput) -> String {
     text
 }
 
-fn estimate_prompt_tokens(prompt: &str) -> u64 {
-    estimate_tokens(prompt)
-}
-
-fn gate_is_stood_down(degradations: &[Degradation]) -> bool {
-    degradations
-        .iter()
-        .any(|degradation| matches!(degradation, Degradation::SummaryOnly { .. }))
+/// Estimate the input tokens a pass will actually send. The system rules
+/// and the schema travel with every request, so an estimate over the
+/// context alone underprices every pass.
+fn estimate_prompt(prompt: &prompt::Prompt) -> u64 {
+    estimate_tokens(&prompt.system) + estimate_tokens(&prompt.user)
 }
 
 fn severity_word(severity: crate::config::Severity) -> &'static str {

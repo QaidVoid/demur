@@ -28,6 +28,19 @@ pub enum Degradation {
         /// Passes that did not run.
         skipped: Vec<String>,
     },
+    /// A pass failed against the provider and the run continued without it.
+    PassFailed {
+        /// Pass that failed.
+        pass: String,
+        /// Redacted reason the provider gave.
+        reason: String,
+    },
+    /// The verdict summary prose could not be drafted. Findings and the
+    /// verdict are unaffected because neither comes from that pass.
+    SummaryUnavailable {
+        /// Redacted reason the provider gave.
+        reason: String,
+    },
     /// No pass could run. Nothing is published.
     Skipped {
         /// Why the run was skipped.
@@ -58,6 +71,14 @@ impl Degradation {
                     "budget exhausted before completion; the review summarizes only what ran. Passes skipped: {names}"
                 )
             }
+            Degradation::PassFailed { pass, reason } => {
+                format!("{pass} failed and was skipped: {reason}")
+            }
+            Degradation::SummaryUnavailable { reason } => {
+                format!(
+                    "the verdict summary could not be drafted ({reason}); findings and the verdict are unaffected"
+                )
+            }
             Degradation::Skipped { reason } => {
                 format!("review skipped: {reason}")
             }
@@ -65,22 +86,9 @@ impl Degradation {
     }
 }
 
-/// Which kind of pass is asking to run. Controls which ladder rungs apply.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PassKind {
-    /// The triage pass. No deep model to downgrade to.
-    Triage,
-    /// A deep dive or the cross-examination pass.
-    Deep,
-    /// The verdict synthesis pass.
-    Verdict,
-}
-
 /// One authorization request: which pass, its full and shrunk context
 /// estimates, and the prices it would pay.
 pub struct PassEstimate<'a> {
-    /// Which kind of pass is asking.
-    pub kind: PassKind,
     /// Display name of the pass, used in degradation disclosures.
     pub pass: &'a str,
     /// Estimated input tokens for the full context.
@@ -95,15 +103,33 @@ pub struct PassEstimate<'a> {
     pub downgrade_price: Option<&'a ModelPrice>,
 }
 
-/// The ladder's answer to an authorization request.
+/// The ladder's answer to an authorization request. A caller that runs a
+/// pass must honor `shrink` and `downgrade`, because the gate priced the
+/// pass on the assumption that it would.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LadderDecision {
-    /// Run the pass with its full selected context and role model.
-    Run,
-    /// Run the pass with a degradation applied.
-    RunDegraded(Degradation),
+    /// Run the pass under the stated rungs.
+    Run {
+        /// Send the shrunk context instead of the full one.
+        shrink: bool,
+        /// Call the triage model instead of the role model.
+        downgrade: bool,
+        /// Disclosures for the rungs that applied.
+        degradations: Vec<Degradation>,
+    },
     /// Stop running passes and synthesize from what completed.
     StandDown,
+}
+
+impl LadderDecision {
+    /// Run with the full context on the role model.
+    fn full() -> LadderDecision {
+        LadderDecision::Run {
+            shrink: false,
+            downgrade: false,
+            degradations: Vec::new(),
+        }
+    }
 }
 
 /// Tracks spend for one run against the pull request's cumulative cap and
@@ -113,8 +139,6 @@ pub struct BudgetGate {
     cap: BudgetCap,
     prior_spend: f64,
     spent: f64,
-    context_shrunk: bool,
-    model_downgraded: bool,
     summary_only: bool,
 }
 
@@ -125,8 +149,6 @@ impl BudgetGate {
             cap,
             prior_spend,
             spent: 0.0,
-            context_shrunk: false,
-            model_downgraded: false,
             summary_only: false,
         }
     }
@@ -150,7 +172,6 @@ impl BudgetGate {
             return LadderDecision::StandDown;
         }
         let PassEstimate {
-            kind: _kind,
             pass,
             full_tokens,
             shrunk_tokens,
@@ -164,35 +185,49 @@ impl BudgetGate {
         let remaining = self.remaining();
 
         if remaining >= full_cost {
-            return LadderDecision::Run;
+            return LadderDecision::full();
         }
         // Rung 1: shrink the context to the highest-risk content. Every
         // pass that runs shrunk is disclosed, so repeats are recorded.
         if remaining >= shrunk_cost {
-            self.context_shrunk = true;
-            return LadderDecision::RunDegraded(Degradation::ContextShrunk {
-                pass: pass.to_string(),
-            });
+            return LadderDecision::Run {
+                shrink: true,
+                downgrade: false,
+                degradations: vec![Degradation::ContextShrunk {
+                    pass: pass.to_string(),
+                }],
+            };
         }
-        // Rung 2: deep passes drop to the triage model.
-        if let Some(cheap) = downgrade_price
-            && !self.model_downgraded
-        {
+        // Rung 2: deep passes drop to the triage model. The rung stays
+        // available to every later pass; collapsing straight to stand-down
+        // once one pass has downgraded would cut coverage the budget can
+        // still afford.
+        if let Some(cheap) = downgrade_price {
             let cheap_output = max_output_tokens as f64 / 1_000_000.0 * cheap.output;
             let cheap_full = cheap.cost_of_estimated_input(full_tokens) + cheap_output;
             let cheap_shrunk = cheap.cost_of_estimated_input(shrunk_tokens) + cheap_output;
             if remaining >= cheap_full {
-                self.model_downgraded = true;
-                return LadderDecision::RunDegraded(Degradation::ModelDowngraded {
-                    pass: pass.to_string(),
-                });
+                return LadderDecision::Run {
+                    shrink: false,
+                    downgrade: true,
+                    degradations: vec![Degradation::ModelDowngraded {
+                        pass: pass.to_string(),
+                    }],
+                };
             }
             if remaining >= cheap_shrunk {
-                self.model_downgraded = true;
-                self.context_shrunk = true;
-                return LadderDecision::RunDegraded(Degradation::ModelDowngraded {
-                    pass: pass.to_string(),
-                });
+                return LadderDecision::Run {
+                    shrink: true,
+                    downgrade: true,
+                    degradations: vec![
+                        Degradation::ContextShrunk {
+                            pass: pass.to_string(),
+                        },
+                        Degradation::ModelDowngraded {
+                            pass: pass.to_string(),
+                        },
+                    ],
+                };
             }
         }
         // Rung 3: stand down. Rung 4 (skip) is what StandDown means for
@@ -220,7 +255,6 @@ mod tests {
         downgrade: Option<&'a ModelPrice>,
     ) -> PassEstimate<'a> {
         PassEstimate {
-            kind: PassKind::Deep,
             pass: "deep dive",
             full_tokens: full,
             shrunk_tokens: shrunk,
@@ -247,7 +281,7 @@ mod tests {
             &price(1000.0, 1000.0),
             None,
         ));
-        assert_eq!(decision, LadderDecision::Run);
+        assert_eq!(decision, LadderDecision::full());
     }
 
     #[test]
@@ -258,17 +292,25 @@ mod tests {
         let decision = gate.authorize(test_estimate(1_000_000, 100_000, &deep, None));
         assert_eq!(
             decision,
-            LadderDecision::RunDegraded(Degradation::ContextShrunk {
-                pass: "deep dive".to_string()
-            })
+            LadderDecision::Run {
+                shrink: true,
+                downgrade: false,
+                degradations: vec![Degradation::ContextShrunk {
+                    pass: "deep dive".to_string()
+                }],
+            }
         );
         // Each subsequent pass that runs shrunk is disclosed as well.
         let decision = gate.authorize(test_estimate(1_000_000, 100_000, &deep, None));
         assert_eq!(
             decision,
-            LadderDecision::RunDegraded(Degradation::ContextShrunk {
-                pass: "deep dive".to_string()
-            })
+            LadderDecision::Run {
+                shrink: true,
+                downgrade: false,
+                degradations: vec![Degradation::ContextShrunk {
+                    pass: "deep dive".to_string()
+                }],
+            }
         );
         // When even the shrunk estimate no longer fits, the run stands down.
         gate.record(
@@ -290,14 +332,44 @@ mod tests {
         let mut gate = BudgetGate::new(BudgetCap::Limited(0.05), 0.0);
         let deep = price(30.0, 15.0);
         let cheap = price(0.15, 0.6);
-        gate.context_shrunk = true;
         let decision = gate.authorize(test_estimate(5_000_000, 100_000, &deep, Some(&cheap)));
         assert_eq!(
             decision,
-            LadderDecision::RunDegraded(Degradation::ModelDowngraded {
-                pass: "deep dive".to_string()
-            })
+            LadderDecision::Run {
+                shrink: true,
+                downgrade: true,
+                degradations: vec![
+                    Degradation::ContextShrunk {
+                        pass: "deep dive".to_string()
+                    },
+                    Degradation::ModelDowngraded {
+                        pass: "deep dive".to_string()
+                    },
+                ],
+            }
         );
+    }
+
+    #[test]
+    fn downgrade_rung_stays_available_to_later_passes() {
+        // One pass downgrading must not collapse every later pass straight
+        // to stand-down while the cheap model is still affordable.
+        let mut gate = BudgetGate::new(BudgetCap::Limited(1.0), 0.0);
+        let deep = price(300.0, 150.0);
+        let cheap = price(0.15, 0.6);
+        for _ in 0..3 {
+            let decision = gate.authorize(test_estimate(1_000_000, 100_000, &deep, Some(&cheap)));
+            assert!(
+                matches!(
+                    decision,
+                    LadderDecision::Run {
+                        downgrade: true,
+                        ..
+                    }
+                ),
+                "{decision:?}"
+            );
+        }
     }
 
     #[test]
@@ -313,7 +385,6 @@ mod tests {
         let mut gate = BudgetGate::new(BudgetCap::Limited(0.001), 0.0);
         let triage = price(0.15, 0.6);
         let mut estimate = test_estimate(4_000_000, 3_000_000, &triage, None);
-        estimate.kind = PassKind::Triage;
         estimate.pass = "triage";
         estimate.max_output_tokens = 100;
         let decision = gate.authorize(estimate);

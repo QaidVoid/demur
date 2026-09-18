@@ -24,7 +24,7 @@ pub struct ModelFinding {
 }
 
 /// The triage pass output: findings plus per-cluster lens suggestions.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct TriageOutput {
     /// Findings the triage model raised directly.
     pub findings: Vec<ModelFinding>,
@@ -33,7 +33,7 @@ pub struct TriageOutput {
 }
 
 /// Lens suggestions for one cluster path.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ClusterLens {
     /// Cluster path.
     pub path: String,
@@ -42,7 +42,7 @@ pub struct ClusterLens {
 }
 
 /// Findings-only output, used by deep dives and cross-examination.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct ModelFindings {
     /// Findings raised by the pass.
     pub findings: Vec<ModelFinding>,
