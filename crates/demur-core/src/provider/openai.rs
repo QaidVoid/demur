@@ -102,7 +102,10 @@ impl Provider for OpenAiClient {
                 message: redact(&err.to_string(), &self.key),
             })?;
         if !status.is_success() {
-            return Err(classify(status.as_u16(), &text, retry_after, &self.key));
+            return Err(super::with_request_excerpt(
+                classify(status.as_u16(), &text, retry_after, &self.key),
+                request,
+            ));
         }
         let parsed: WireResponse =
             serde_json::from_str(&text).map_err(|err| ProviderError::Malformed {

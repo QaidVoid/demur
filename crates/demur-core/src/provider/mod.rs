@@ -274,11 +274,19 @@ pub fn resolve_key(provider: &ProviderDef) -> Result<String, ProviderError> {
         }
     }
     if let Some(file) = &provider.key_file {
-        let value = std::fs::read_to_string(file).unwrap_or_default();
+        // A named file that cannot be read is a configuration mistake worth
+        // naming. Swallowing the error reports it as a missing key and
+        // sends the user hunting the wrong variable.
+        let value = std::fs::read_to_string(file).map_err(|err| ProviderError::Auth {
+            message: format!("key_file `{}` could not be read: {err}", file.display()),
+        })?;
         let trimmed = value.lines().next().unwrap_or_default().trim();
         if !trimmed.is_empty() {
             return Ok(trimmed.to_string());
         }
+        return Err(ProviderError::Auth {
+            message: format!("key_file `{}` is empty", file.display()),
+        });
     }
     Err(ProviderError::Auth {
         message: format!(
@@ -286,6 +294,32 @@ pub fn resolve_key(provider: &ProviderDef) -> Result<String, ProviderError> {
             provider.base_url, provider.key_env
         ),
     })
+}
+
+/// Attach the shape of what was sent to a permanent rejection. A provider
+/// or gateway that refuses a request refuses it because of the content,
+/// and without an excerpt the only way to learn which content is to pay
+/// for the whole run again.
+pub(crate) fn with_request_excerpt(
+    error: ProviderError,
+    request: &CompletionRequest,
+) -> ProviderError {
+    let ProviderError::Rejected { message } = error else {
+        return error;
+    };
+    let chars = request.user.chars().count();
+    let head: String = request.user.chars().take(200).collect();
+    let tail: String = request
+        .user
+        .chars()
+        .skip(chars.saturating_sub(200))
+        .collect();
+    ProviderError::Rejected {
+        message: format!(
+            "{message}; the rejected request carried {chars} characters of content, \
+starting `{head}` and ending `{tail}`"
+        ),
+    }
 }
 
 /// Replace any occurrence of the key in a message before it can reach logs

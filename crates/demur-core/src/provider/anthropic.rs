@@ -111,11 +111,9 @@ impl Provider for AnthropicClient {
                 message: redact(&err.to_string(), &self.key),
             })?;
         if !status.is_success() {
-            return Err(anthropic_error(
-                status.as_u16(),
-                &text,
-                retry_after,
-                &self.key,
+            return Err(super::with_request_excerpt(
+                anthropic_error(status.as_u16(), &text, retry_after, &self.key),
+                request,
             ));
         }
         let parsed: WireResponse =
