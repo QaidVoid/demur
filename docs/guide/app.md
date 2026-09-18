@@ -13,14 +13,53 @@ the honest picture: you published it, demur wrote it.
 Without this, a review you publish looks exactly like something you typed, and
 neither you nor a reader can tell the difference.
 
+## One application, and what it asks of you
+
+There is one demur application by default, because a mark is only recognizable
+if there is one of it. If every user registered their own, every badge would be
+whatever avatar that person uploaded, and the mark would mean nothing.
+
+Two things are worth separating here, because they are different in kind.
+
+**demur cannot act as the application.** It has no setting for an application
+key, no code that reads one, and nothing that authenticates as the application
+rather than as you. A test asserts this by absence, so it stays true.
+
+**Its owner could.** Installing a GitHub App requires the owner to generate a
+private key, and a key can mint credentials for every installation of that
+application. Nothing in this design prevents that, and saying otherwise would
+be an assurance that sounds like security without being it. Installing the
+shared application means trusting the person who owns it.
+
+**If you would rather not, register your own.** `client_id` is just
+configuration. Create an application under your own account, point demur at it,
+and everything works identically — you trade the shared mark for your own
+avatar. That is a real alternative, not a theoretical one, and it is why the
+shared application is a convenience rather than a requirement.
+
 ## Setting it up
 
-**1. Create the application.** Use the manifest in `app/manifest.json`, which
-asks for exactly the three permissions demur uses and subscribes to no events.
-Upload `app/avatar.png` as its logo. Creating it from the manifest means
-confirming a filled-in form rather than answering twenty questions, and a
-permission missed by hand does not surface until a review has already been
-paid for.
+**1. Create the application.** `app/manifest.json` records exactly what the
+settings must be: three repository permissions, no organization or account
+permissions, and no events. A test asserts it matches what the code uses, so
+the two cannot drift.
+
+Set it up by hand at **github.com/settings/apps/new**, matching that file.
+Two settings are easy to miss:
+
+- **Enable Device Flow** must be checked. Without it, authorizing fails.
+- **Webhook → Active** must be unchecked. demur is triggered by you running it,
+  never by GitHub pushing to it.
+
+Leave **Expire user authorization tokens** checked: it is what provides the
+refresh token demur uses to renew silently.
+
+Upload `app/avatar.png` as the logo. That is the badge.
+
+You will be asked to generate a private key before you can install the
+application. That is GitHub's requirement, not demur's: nothing here reads or
+accepts one. Generate it, keep it somewhere safe, and know that its existence
+is what the trust above is about.
 
 **2. Install it** on the repositories you want to review.
 
@@ -73,6 +112,15 @@ not under a bot identity, and without demur's mark.
 ```
 
 The mark is worth a one-time authorization. It is never worth a lost review.
+
+## GitHub Enterprise
+
+Authorization runs against whichever GitHub you are pointed at. On an
+enterprise instance demur derives the host from `GITHUB_SERVER_URL` when it is
+set and from `GITHUB_API_URL` otherwise, so the device flow goes to your own
+instance rather than to github.com.
+
+Create the application on that instance, not on github.com.
 
 ## Why workflows are left alone
 
