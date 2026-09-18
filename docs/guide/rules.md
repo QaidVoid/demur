@@ -31,7 +31,7 @@ three things a model-judged rule cannot give you:
 
 - **They are free.** Turning rules on does not change your bill.
 - **They are the same every run.** A title that passed yesterday cannot fail
-  today, and a contributor can reproduce the result locally with the CLI.
+  today, given the same title and the same configuration.
 - **They cannot be argued with.** No model output participates in deciding
   them, so a pull request body that says "ignore the title rules" is just text.
   That matters precisely because the body is the thing being judged, and on a
@@ -40,6 +40,40 @@ three things a model-judged rule cannot give you:
 The cost is real and worth stating plainly: a pattern can tell a compliant
 title from a non-compliant one, and nothing more. It cannot tell a useful title
 from a useless one that happens to start with `feat:`.
+
+## Where rules apply
+
+Rules judge what the author claimed, so they apply to a pull request's title
+and description and to nothing else.
+
+| Command | Rules |
+| --- | --- |
+| The GitHub Action | Evaluated |
+| `demur pr 128` | Evaluated |
+| `demur review main..HEAD` | Not evaluated |
+| `demur review` (working copy) | Not evaluated |
+
+A local review has no pull request. demur labels the run `local review: <range>`
+for its own output and uses the range's commit messages as a description, and
+neither is something you wrote as a claim about the change. Measuring them
+against a rule would report a finding about a title demur invented, which is
+why it does not.
+
+When you have rules configured and run locally, the review says so once:
+
+```
+- Metadata rules were not evaluated: this run reviews a local range and has no
+  pull request title or description to judge.
+```
+
+That line exists so a configured rule and a rule that never ran do not look
+alike. It is not a finding, carries no severity, and does not reach the verdict.
+
+Rules are not applied to commit subjects. A range holds many commits and none
+of them is the change's claim, a pull request title is usually written
+separately from every subject under it, and a finding citing `pull request
+title` in a repository with no pull request open would name a location that
+does not exist. Linting commit messages is a different job.
 
 ## Patterns
 
