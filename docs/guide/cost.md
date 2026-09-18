@@ -69,6 +69,37 @@ max_tokens = 2000 # output ceiling per call
 When the ceiling binds, the highest-risk clusters are reviewed first and the
 review names the clusters that received no deep dive.
 
+## Concurrency changes the clock, not the bill
+
+Deep dives are independent: each takes one file cluster under one lens and
+reads nothing another produced. They run several at a time.
+
+```toml
+[limits]
+concurrency = 4   # deep dives in flight at once; 1 runs them serially
+```
+
+A deep call costs roughly the same wall clock whatever the diff size, because
+the time goes on the model thinking rather than on reading the diff. Twelve
+calls at a minute each is a twelve minute review when run one at a time, and
+about three at a concurrency of four.
+
+What does not change is anything else. The same passes send the same requests
+to the same models, so the spend is identical, the findings are identical, and
+the order they are ranked and published in is identical. A run at
+`concurrency = 1` and the same run at `concurrency = 8` differ only in how long
+you waited.
+
+Raising it past a handful usually stops helping. The limit that binds is your
+provider's rate limiting, not your machine: past some point the extra calls
+come back as rate limit responses, the retry backoff waits them out, and the
+run gets slower without getting cheaper. On a shared endpoint the cost of being
+greedy also lands on whoever else is using it. Start at the default and raise
+it only if you measure an improvement.
+
+Setting it to `1` restores exactly the serial behavior, which is the right
+first move if you ever suspect concurrency of anything.
+
 ## Reading the spend report
 
 Every review ends with its own accounting:
