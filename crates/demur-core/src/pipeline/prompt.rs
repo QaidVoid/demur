@@ -15,8 +15,28 @@ pub struct Prompt {
     pub user: String,
 }
 
+/// Where a run's title and description came from. Deliberately has no
+/// default: metadata cannot be built without saying which kind it is, so a
+/// future entry point that composes its own cannot forget to declare it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaOrigin {
+    /// Fetched from a pull request. The author wrote it, so rules about
+    /// what a pull request must say apply to it.
+    PullRequest,
+    /// Composed by demur to describe what a local run covers. Nothing in
+    /// it is a claim the author made, so no rule judges it.
+    Composed,
+}
+
+impl MetaOrigin {
+    /// True when rules about pull request metadata have something to judge.
+    pub fn carries_an_authored_claim(self) -> bool {
+        matches!(self, MetaOrigin::PullRequest)
+    }
+}
+
 /// Metadata about the pull request under review.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PullRequestMeta {
     /// Pull request title.
     pub title: String,
@@ -24,6 +44,8 @@ pub struct PullRequestMeta {
     pub description: String,
     /// Head commit SHA under review.
     pub head_sha: String,
+    /// Whether the title and description are the author's or demur's own.
+    pub origin: MetaOrigin,
 }
 
 const SYSTEM_RULES: &str = "\
@@ -196,6 +218,7 @@ mod tests {
             title: "t".to_string(),
             description: "d".to_string(),
             head_sha: "abc".to_string(),
+            origin: MetaOrigin::PullRequest,
         };
         let context = repository_context(&meta, "<diff text>");
         assert!(context.contains("<pull_request_data>"));

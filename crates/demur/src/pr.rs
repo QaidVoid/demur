@@ -7,6 +7,7 @@ use demur_core::config::Config;
 use demur_core::diff::parse_unified_diff;
 use demur_core::github::{GitHubClient, publish_review};
 use demur_core::ingest::ingest;
+use demur_core::pipeline::prompt::MetaOrigin;
 use demur_core::pipeline::prompt::PullRequestMeta;
 use demur_core::pipeline::synthesis::Verdict;
 use demur_core::pipeline::{PipelineInput, RunOutcome};
@@ -147,6 +148,7 @@ pub async fn review_pr(
             },
             description: pr.body.clone().unwrap_or_default(),
             head_sha: pr.head_sha().to_string(),
+            origin: MetaOrigin::PullRequest,
         },
         ingestion: ingest(&files, &config),
         diff_text: diff,

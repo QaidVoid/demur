@@ -13,6 +13,7 @@ use demur_core::config::CONFIG_FILE_NAME;
 use demur_core::config::Config;
 use demur_core::diff::parse_unified_diff;
 use demur_core::ingest::ingest;
+use demur_core::pipeline::prompt::MetaOrigin;
 use demur_core::pipeline::prompt::PullRequestMeta;
 use demur_core::pipeline::synthesis::Verdict;
 use demur_core::pipeline::{PipelineInput, RunOutcome};
@@ -171,9 +172,12 @@ cache entries to, so caching it could reuse an answer about code you have since 
     };
     let pipeline_input = PipelineInput {
         meta: PullRequestMeta {
+            // demur wrote this label, so nothing in it is a claim the
+            // author made and no rule judges it.
             title: format!("local review: {range_label}"),
             description: input::description(&repo, &target),
             head_sha: "local".to_string(),
+            origin: MetaOrigin::Composed,
         },
         ingestion,
         diff_text: diff,

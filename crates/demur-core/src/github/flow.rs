@@ -1,6 +1,7 @@
 //! The end-to-end pull request review flow: delta scope from prior
 //! markers, the pipeline, carry-forward, publication, and the check run.
 
+use crate::pipeline::prompt::MetaOrigin;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use super::{GitHubClient, GitHubError, InlineComment};
@@ -125,6 +126,7 @@ pub async fn review_pull_request(
             },
             description: pr.body.clone().unwrap_or_default(),
             head_sha: head_sha.clone(),
+            origin: MetaOrigin::PullRequest,
         },
         ingestion,
         diff_text,
