@@ -216,6 +216,9 @@ pub struct PassSpend {
     /// True when this pass was served from the resume cache, so its cost
     /// was paid by an earlier attempt rather than by this run.
     pub resumed: bool,
+    /// The model this pass actually called. A pass the budget downgraded
+    /// names the cheaper model it used, not the role's configured one.
+    pub model: String,
 }
 
 /// Spend for one run.
@@ -408,6 +411,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
         usage,
         cost: settle_pass(&mut gate, triage_hold, &usage, &triage_price, resumed),
         resumed,
+        model: config.models.triage.name.clone(),
     });
     log::info!(
         "triage: {} finding(s) in {:.1?}, ${:.4}",
@@ -639,6 +643,7 @@ with their concrete harm.";
                             result.resumed,
                         ),
                         resumed: result.resumed,
+                        model: model.clone(),
                     });
                     result.output
                 }
@@ -801,6 +806,11 @@ coverage was complete and no defect was established.";
                                 result.resumed,
                             ),
                             resumed: result.resumed,
+                            model: if downgrade {
+                                config.models.triage.name.clone()
+                            } else {
+                                config.models.verdict.name.clone()
+                            },
                         });
                         Some(result.output.summary)
                     }
@@ -813,6 +823,7 @@ coverage was complete and no defect was established.";
                                 usage: *usage,
                                 cost: gate.record(usage, paid_price),
                                 resumed: false,
+                                model: config.models.verdict.name.clone(),
                             });
                         }
                         degradations.push(Degradation::SummaryUnavailable {
@@ -843,6 +854,11 @@ coverage was complete and no defect was established.";
         prior_spend: input.prior_spend,
         summary,
         rules_skipped,
+        template: config.review.template.clone(),
+        models: spend
+            .iter()
+            .map(|pass| (pass.pass.clone(), pass.model.clone()))
+            .collect(),
     });
     Ok(Review {
         verdict: synthesis.verdict,
@@ -1267,11 +1283,17 @@ async fn run_deep_dive(
         let mut gate = gate.lock().expect("budget gate lock");
         settle_pass(&mut gate, hold, &result.usage, paid_price, result.resumed)
     };
+    let model = if downgraded {
+        config.models.triage.name.clone()
+    } else {
+        config.models.deep.name.clone()
+    };
     let mut spend_lines = vec![PassSpend {
         pass: format!("deep dive {lens}"),
         usage: result.usage,
         cost,
         resumed: result.resumed,
+        model: model.clone(),
     }];
     log::info!(
         "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
@@ -1349,6 +1371,7 @@ async fn run_deep_dive(
                         usage: next.usage,
                         cost: round_cost,
                         resumed: next.resumed,
+                        model: model.clone(),
                     });
                     degradations.push(Degradation::ContextRetrieved {
                         pass: format!("deep dive ({lens}) on {}", cluster.path),

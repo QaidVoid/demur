@@ -320,7 +320,8 @@ async fn exhausted_budget_degrades_to_summary_only_with_disclosure() {
             .any(|text| text.contains("triage model instead of the deep model")),
         "degradations were: {described:?}"
     );
-    assert!(review.body.contains("Coverage and spend"));
+    assert!(review.body.contains("### Coverage"));
+    assert!(review.body.contains("### Spend"));
 }
 
 #[tokio::test]
@@ -1621,4 +1622,236 @@ async fn retrieval_needs_a_checkout_to_read() {
         .await
         .unwrap();
     assert_eq!(recorded(&providers.deep).requests().len(), 1);
+}
+
+fn templated(sections: &[&str], header: Option<&str>, footer: Option<&str>) -> Config {
+    let mut config = config_with("standard", "");
+    config.review.template = crate::config::Template {
+        header: header.map(str::to_string),
+        footer: footer.map(str::to_string),
+        sections: sections
+            .iter()
+            .map(|name| {
+                *crate::config::Section::ALL
+                    .iter()
+                    .find(|section| section.name() == *name)
+                    .expect("known section")
+            })
+            .collect(),
+    };
+    config.limits.concurrency = 1;
+    config
+}
+
+fn standard_steps() -> Vec<Vec<serde_json::Value>> {
+    vec![
+        vec![triage_response()],
+        vec![
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![summary_response()],
+    ]
+}
+
+#[tokio::test]
+async fn a_template_reorders_the_body_and_carries_its_prose() {
+    let config = templated(
+        &["findings", "spend", "coverage", "omitted", "beyond_budget"],
+        Some("### Automated review\nRun by the platform team."),
+        Some("Disagree? Resolve the thread."),
+    );
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&registry(standard_steps()), &config, &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(
+        review.body.starts_with("### Automated review"),
+        "{}",
+        review.body
+    );
+    assert!(
+        review.body.trim_end().ends_with("Resolve the thread."),
+        "{}",
+        review.body
+    );
+    let findings_at = review.body.find("### Findings").expect("findings");
+    let spend_at = review.body.find("### Spend").expect("spend");
+    let coverage_at = review.body.find("### Coverage").expect("coverage");
+    assert!(findings_at < spend_at, "findings before spend");
+    assert!(
+        spend_at < coverage_at,
+        "spend before coverage, as configured"
+    );
+    // The verdict header was not listed, so it is not rendered.
+    assert!(!review.body.contains("## demur:"), "{}", review.body);
+}
+
+#[tokio::test]
+async fn prose_is_rendered_literally() {
+    let config = templated(
+        &["findings", "omitted", "beyond_budget", "coverage", "spend"],
+        Some("head $HEAD {verdict} ${anything}"),
+        None,
+    );
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&registry(standard_steps()), &config, &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(
+        review.body.starts_with("head $HEAD {verdict} ${anything}"),
+        "nothing substitutes: {}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn the_models_section_names_what_actually_ran() {
+    let config = templated(
+        &[
+            "findings",
+            "omitted",
+            "beyond_budget",
+            "coverage",
+            "spend",
+            "models",
+        ],
+        None,
+        None,
+    );
+    let RunOutcome::Review(review) =
+        crate::pipeline::run(&registry(standard_steps()), &config, &input())
+            .await
+            .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(review.body.contains("### Models"), "{}", review.body);
+    assert!(
+        review.body.contains("triage-model: triage"),
+        "{}",
+        review.body
+    );
+    assert!(review.body.contains("deep-model"), "{}", review.body);
+    assert!(review.body.contains("verdict-model"), "{}", review.body);
+}
+
+#[tokio::test]
+async fn a_downgraded_pass_names_the_model_it_used() {
+    // Reporting the configured model would lie exactly where the truth
+    // matters: a run that dropped to a cheaper model.
+    let mut config = templated(
+        &[
+            "findings",
+            "omitted",
+            "beyond_budget",
+            "coverage",
+            "spend",
+            "models",
+        ],
+        None,
+        None,
+    );
+    config.budget.per_pr_usd = Some(0.01);
+    let providers = registry(vec![
+        vec![
+            triage_response(),
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    assert!(
+        review.body.contains("ran on the triage model"),
+        "the downgrade happened: {}",
+        review.body
+    );
+    let models = review.body.split("### Models").nth(1).unwrap_or_default();
+    assert!(
+        !models.contains("deep-model"),
+        "a downgraded dive must not claim the deep model: {models}"
+    );
+}
+
+#[tokio::test]
+async fn a_template_changes_arrangement_and_nothing_else() {
+    let default = crate::pipeline::run(
+        &registry(standard_steps()),
+        &config_with("standard", ""),
+        &input(),
+    )
+    .await
+    .unwrap();
+    let reordered = crate::pipeline::run(
+        &registry(standard_steps()),
+        &templated(
+            &["spend", "coverage", "beyond_budget", "omitted", "findings"],
+            None,
+            None,
+        ),
+        &input(),
+    )
+    .await
+    .unwrap();
+    let (RunOutcome::Review(default), RunOutcome::Review(reordered)) = (default, reordered) else {
+        panic!("expected reviews");
+    };
+    assert_eq!(default.verdict, reordered.verdict);
+    assert_eq!(default.omitted, reordered.omitted);
+    assert_eq!(default.published.len(), reordered.published.len());
+    for (a, b) in default.published.iter().zip(reordered.published.iter()) {
+        assert_eq!(a.file, b.file);
+        assert_eq!(a.message, b.message);
+        assert_eq!(a.severity, b.severity);
+    }
+    assert!((default.spend.total - reordered.spend.total).abs() < 1e-12);
+    assert_ne!(default.body, reordered.body, "only the body differs");
+}
+
+#[tokio::test]
+async fn a_degraded_run_still_discloses_under_a_reordering_template() {
+    let mut config = templated(
+        &["findings", "spend", "omitted", "beyond_budget", "coverage"],
+        None,
+        None,
+    );
+    config.budget.per_pr_usd = Some(0.01);
+    let providers = registry(vec![
+        vec![
+            triage_response(),
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![],
+        vec![summary_response()],
+    ]);
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    // Coverage is last, and the degradation is still there.
+    assert!(review.body.contains("### Coverage"), "{}", review.body);
+    assert!(!review.degradations.is_empty());
+    for degradation in &review.degradations {
+        assert!(
+            review.body.contains(&degradation.describe()),
+            "every degradation is disclosed wherever coverage was placed: {}",
+            degradation.describe()
+        );
+    }
 }
