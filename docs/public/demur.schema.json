@@ -393,6 +393,32 @@
       ],
       "type": "object"
     },
+    "Retrieval": {
+      "additionalProperties": false,
+      "description": "Context retrieval: a pass may name repository content it needs, which\nthe bot resolves itself. Off unless asked for, and never performed for\na pull request whose author is outside the repository.",
+      "properties": {
+        "enabled": {
+          "default": false,
+          "description": "Off by default. A pass can name nothing until this is set.",
+          "type": "boolean"
+        },
+        "max_kb": {
+          "default": 64,
+          "description": "Total retrieved content for a run, in kilobytes.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_rounds": {
+          "default": 1,
+          "description": "How many times one pass may ask for more context.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
     "Review": {
       "additionalProperties": false,
       "description": "Rules a repository declares about the pull request carrying a change.\nEvery rule is optional; a section left out declares nothing.",
@@ -575,6 +601,15 @@
       },
       "description": "Named provider endpoints.",
       "type": "object"
+    },
+    "retrieval": {
+      "$ref": "#/$defs/Retrieval",
+      "default": {
+        "enabled": false,
+        "max_kb": 64,
+        "max_rounds": 1
+      },
+      "description": "Context retrieval. Off unless asked for."
     },
     "review": {
       "$ref": "#/$defs/Review",

@@ -206,6 +206,9 @@ pub struct Config {
     /// The resume cache. Off unless asked for.
     #[serde(default)]
     pub cache: Cache,
+    /// Context retrieval. Off unless asked for.
+    #[serde(default)]
+    pub retrieval: Retrieval,
     /// Named provider endpoints.
     pub providers: BTreeMap<String, ProviderDef>,
     /// Model assigned to each pipeline role.
@@ -329,6 +332,53 @@ pub const DEFAULT_CACHE_MAX_AGE_HOURS: u64 = 24;
 
 /// Built-in size bound for the cache, in megabytes.
 pub const DEFAULT_CACHE_MAX_MB: u64 = 256;
+
+/// Built-in limit on retrieval rounds a pass may take.
+pub const DEFAULT_RETRIEVAL_ROUNDS: u32 = 1;
+
+/// Built-in ceiling on retrieved content per run, in kilobytes.
+pub const DEFAULT_RETRIEVAL_KB: u64 = 64;
+
+/// Context retrieval: a pass may name repository content it needs, which
+/// the bot resolves itself. Off unless asked for, and never performed for
+/// a pull request whose author is outside the repository.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct Retrieval {
+    /// Off by default. A pass can name nothing until this is set.
+    pub enabled: bool,
+    /// How many times one pass may ask for more context.
+    pub max_rounds: u32,
+    /// Total retrieved content for a run, in kilobytes.
+    pub max_kb: u64,
+}
+
+impl Default for Retrieval {
+    fn default() -> Self {
+        Retrieval {
+            enabled: false,
+            max_rounds: DEFAULT_RETRIEVAL_ROUNDS,
+            max_kb: DEFAULT_RETRIEVAL_KB,
+        }
+    }
+}
+
+impl Retrieval {
+    /// Size ceiling in bytes.
+    pub fn max_bytes(&self) -> usize {
+        (self.max_kb.saturating_mul(1024)) as usize
+    }
+
+    /// Turn retrieval off because the head is not trusted. What a pass
+    /// asks for is shaped by the diff it read, and on a fork that diff was
+    /// written by someone outside the repository. Returns true when
+    /// retrieval was actually turned off.
+    pub fn disable_for_untrusted_head(&mut self) -> bool {
+        let was_enabled = self.enabled;
+        self.enabled = false;
+        was_enabled
+    }
+}
 
 /// The resume cache: completed pass outputs kept so a retried run does not
 /// pay twice. It can only change what a run costs, never what it concludes.
@@ -595,6 +645,18 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
     // Compile declared patterns here so an unusable rule fails the run
     // before anything is spent, rather than at evaluation time.
     crate::rules::Rules::compile(&config.review)?;
+    if config.retrieval.enabled && config.retrieval.max_rounds == 0 {
+        return Err(ConfigError::Invalid {
+            field: "retrieval.max_rounds".to_string(),
+            message: "must be at least one when retrieval is enabled".to_string(),
+        });
+    }
+    if config.retrieval.enabled && config.retrieval.max_kb == 0 {
+        return Err(ConfigError::Invalid {
+            field: "retrieval.max_kb".to_string(),
+            message: "must be at least one kilobyte when retrieval is enabled".to_string(),
+        });
+    }
     if config.cache.enabled && config.cache.max_mb == 0 {
         return Err(ConfigError::Invalid {
             field: "cache.max_mb".to_string(),
@@ -982,6 +1044,38 @@ severity = "blocker"
         );
         let text = err_text(&text);
         assert!(text.contains("review.title.pattern"), "{text}");
+    }
+
+    #[test]
+    fn retrieval_is_off_unless_asked_for() {
+        let config = Config::from_toml(&minimal()).expect("minimal config parses");
+        assert!(!config.retrieval.enabled);
+    }
+
+    #[test]
+    fn an_untrusted_head_turns_retrieval_off() {
+        let mut retrieval = Retrieval {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(retrieval.disable_for_untrusted_head());
+        assert!(!retrieval.enabled);
+        assert!(!retrieval.disable_for_untrusted_head());
+    }
+
+    #[test]
+    fn enabled_retrieval_needs_usable_bounds() {
+        for (key, field) in [
+            ("max_rounds", "retrieval.max_rounds"),
+            ("max_kb", "retrieval.max_kb"),
+        ] {
+            let text = minimal().replace(
+                "[models.triage]",
+                &format!("[retrieval]\nenabled = true\n{key} = 0\n\n[models.triage]"),
+            );
+            let text = err_text(&text);
+            assert!(text.contains(field), "{text}");
+        }
     }
 
     #[test]

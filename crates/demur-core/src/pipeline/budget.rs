@@ -35,6 +35,17 @@ pub enum Degradation {
         /// Redacted reason the provider gave.
         reason: String,
     },
+    /// A pass asked for repository context and the bot fetched it, so a
+    /// reader can tell a finding argued from the diff alone from one
+    /// argued with material the diff did not carry.
+    ContextRetrieved {
+        /// Pass that asked.
+        pass: String,
+        /// What it asked for.
+        items: Vec<String>,
+        /// How many of those were attached.
+        attached: usize,
+    },
     /// The verdict summary prose could not be drafted. Findings and the
     /// verdict are unaffected because neither comes from that pass.
     SummaryUnavailable {
@@ -73,6 +84,17 @@ impl Degradation {
             }
             Degradation::PassFailed { pass, reason } => {
                 format!("{pass} failed and was skipped: {reason}")
+            }
+            Degradation::ContextRetrieved {
+                pass,
+                items,
+                attached,
+            } => {
+                format!(
+                    "{pass}: asked for {} item(s) of repository context, {attached} attached ({})",
+                    items.len(),
+                    items.join(", ")
+                )
             }
             Degradation::SummaryUnavailable { reason } => {
                 format!(

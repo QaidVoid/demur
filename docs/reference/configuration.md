@@ -205,6 +205,38 @@ actually paid.
 The cache is never read on a pull request from a fork. In the Action, set the
 `cache` input rather than this section; the workflow supplies the directory.
 
+## `[retrieval]`
+
+A review pass sees the diff and little else. With retrieval on, a pass may
+name repository content it needs before it can argue, and demur fetches it.
+
+```toml
+[retrieval]
+enabled = true
+max_rounds = 1    # times one pass may ask for more
+max_kb = 64       # total retrieved content per run
+```
+
+The model never reaches anything. It returns names, written `file:<path>` or
+`symbol:<name>`, and demur resolves each one itself against an allowlist. A
+request shaped like a command is a name that does not match a file, so it fails
+the way a typo fails.
+
+A request resolves only inside the checkout, minus the paths you ignore. demur
+refuses anything that escapes the checkout by traversal or through a symbolic
+link, the version control directory, this configuration file, and the file
+named by `key_file`, wherever it points.
+
+Symbol lookup is a textual search for a definition, not a semantic index. It is
+approximate on purpose, and a request it cannot answer is reported back to the
+pass rather than dropped.
+
+A retrieval round is a pass: estimated, authorized against the budget, and
+recorded. A round the budget cannot fund is skipped and disclosed.
+
+Retrieval is off unless you turn it on, and it is never performed for a pull
+request from a fork.
+
 ## `[models.<role>]`
 
 Roles are `triage`, `deep`, and `verdict`; every role is required.
