@@ -125,7 +125,7 @@ impl Provider for AnthropicClient {
                     &self.key,
                 ),
             })?;
-        let text = parsed
+        let joined = parsed
             .content
             .iter()
             .filter_map(|block| match block {
@@ -134,7 +134,10 @@ impl Provider for AnthropicClient {
             })
             .collect::<Vec<_>>()
             .join("");
-        let content = parse_json_content(&text)?;
+        if joined.trim().is_empty() {
+            return Err(empty_content_error(&text, &self.key));
+        }
+        let content = parse_json_content(&joined)?;
         let usage = parsed.usage.unwrap_or_default();
         let cache_reads = usage.cache_read_input_tokens.unwrap_or(0);
         Ok(CompletionResponse {
@@ -175,6 +178,40 @@ fn anthropic_error(
 struct WireResponse {
     content: Vec<Block>,
     usage: Option<WireUsage>,
+}
+
+/// Build a diagnostic Malformed error for a response that carried no text:
+/// it names the stop reason, the content block types seen, and a redacted
+/// excerpt of the raw body, which is what a gateway shape mismatch needs
+/// to be diagnosed.
+fn empty_content_error(raw_body: &str, key: &str) -> ProviderError {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw_body).unwrap_or(serde_json::Value::Null);
+    let stop_reason = parsed["stop_reason"].as_str().unwrap_or("unknown");
+    let block_types: Vec<String> = parsed["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(|block| block["type"].as_str().unwrap_or("?").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let hint = if stop_reason == "max_tokens" {
+        "the output hit the token ceiling before any text was produced"
+    } else {
+        "the endpoint returned no text content"
+    };
+    ProviderError::Malformed {
+        message: redact(
+            &format!(
+                "empty response content: stop_reason={stop_reason}, block_types={block_types:?}, \
+{hint}; raw response excerpt: {}",
+                body_excerpt(raw_body)
+            ),
+            key,
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -413,5 +450,47 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ProviderError::Request { .. }));
         server.verify().await;
+    }
+    use super::*;
+
+    #[tokio::test]
+    async fn empty_content_error_reports_stop_reason_and_block_types() {
+        let server = wiremock::MockServer::start().await;
+        let body = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "redacted_thinking", "data": "x"}
+            ],
+            "stop_reason": "max_tokens"
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = client(&server, None);
+        let err = client.complete(&request()).await.unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("stop_reason=max_tokens"), "{text}");
+        assert!(text.contains("thinking"), "{text}");
+        assert!(text.contains("token ceiling"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn thinking_only_text_still_parses_when_present() {
+        let server = wiremock::MockServer::start().await;
+        let body = serde_json::json!({
+            "content": [
+                {"type": "thinking", "thinking": "hmm"},
+                {"type": "text", "text": "{\"a\": 1}"}
+            ],
+            "stop_reason": "end_turn"
+        });
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        let client = client(&server, None);
+        let response = client.complete(&request()).await.unwrap();
+        assert_eq!(response.content, serde_json::json!({"a": 1}));
     }
 }

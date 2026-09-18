@@ -112,9 +112,10 @@ impl Provider for OpenAiClient {
             .choices
             .first()
             .and_then(|choice| choice.message.content.clone())
-            .ok_or_else(|| ProviderError::Malformed {
-                message: "response has no message content".to_string(),
-            })?;
+            .unwrap_or_default();
+        if content.trim().is_empty() {
+            return Err(empty_content_error(&text, &self.key));
+        }
         let content = parse_json_content(&content)?;
         let usage = parsed.usage.unwrap_or_default();
         let cached = usage.prompt_tokens_details.and_then(|d| d.cached_tokens);
@@ -209,6 +210,32 @@ struct WireResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: Message,
+    #[allow(dead_code)]
+    finish_reason: Option<String>,
+}
+
+/// Build a diagnostic Malformed error for a choice with no text: it names
+/// the finish reason and carries a redacted excerpt of the raw body.
+fn empty_content_error(raw_body: &str, key: &str) -> ProviderError {
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw_body).unwrap_or(serde_json::Value::Null);
+    let finish_reason = parsed["choices"][0]["finish_reason"]
+        .as_str()
+        .unwrap_or("unknown");
+    let hint = match finish_reason {
+        "length" => "the output hit the token ceiling before any text was produced",
+        _ => "the endpoint returned no message content",
+    };
+    ProviderError::Malformed {
+        message: redact(
+            &format!(
+                "empty response content: finish_reason={finish_reason}, {hint}; \
+raw response excerpt: {}",
+                body_excerpt(raw_body)
+            ),
+            key,
+        ),
+    }
 }
 
 #[derive(Debug, Deserialize)]
