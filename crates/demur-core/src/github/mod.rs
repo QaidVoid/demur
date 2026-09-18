@@ -201,6 +201,24 @@ impl GitHubClient {
         .await
     }
 
+    /// Post without interpreting a refusal, for a caller that has to
+    /// classify one itself. The shared path turns every 403 into a
+    /// permission failure, which is right for a call with one way to
+    /// succeed and wrong for a review event, where a refusal costs the
+    /// delivery mechanism rather than the review.
+    async fn post_unclassified(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        self.http
+            .post(format!("{}{path}", self.api_base))
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+    }
+
     async fn send(
         &self,
         builder: reqwest::RequestBuilder,
@@ -577,17 +595,24 @@ impl GitHubClient {
             })
             .collect();
         let response = self
-            .post(
+            .post_unclassified(
                 &format!("/repos/{}/{}/pulls/{number}/reviews", self.owner, self.repo),
                 json!({"event": event.as_str(), "body": body, "comments": comments}),
             )
-            .await;
+            .await
+            .map_err(|err| GitHubError::Request {
+                message: self.redacted(&err.to_string()),
+            });
         match response {
             Ok(response) if response.status().is_success() => Ok(()),
             Ok(response) => {
                 let status = response.status().as_u16();
                 let detail = self.error_body(response).await;
                 match status {
+                    // A rejected token is not a refused event.
+                    401 => Err(GitHubError::Auth {
+                        message: "token rejected".to_string(),
+                    }),
                     // A review event is a delivery mechanism, and the
                     // verdict is already carried by the check run, which
                     // cannot be refused. So any refusal costs the

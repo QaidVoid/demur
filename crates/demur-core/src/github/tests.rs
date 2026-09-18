@@ -936,3 +936,45 @@ async fn a_refused_fallback_fails_the_run() {
     .expect_err("nothing left to deliver the review with");
     assert!(!error.to_string().contains("missing permission"), "{error}");
 }
+
+#[tokio::test]
+async fn a_refused_event_falls_back_whether_it_is_403_or_422() {
+    // The shared request path turns every 403 into a permission failure,
+    // which is right for a call with one way to succeed and wrong for a
+    // review event. A 403 refusal must reach the same fallback a 422 does.
+    for status in [403u16, 422] {
+        let server = MockServer::start().await;
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/pulls/7/reviews"))
+            .respond_with(RefuseFirst {
+                calls: std::sync::Arc::clone(&calls),
+                status,
+                body: json!({"message": "Resource not accessible by integration"}),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/repos/owner/repo/check-runs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let publication = super::publish::publish_review(
+            &client(&server),
+            7,
+            "headsha",
+            crate::pipeline::synthesis::Verdict::RequestChanges,
+            "the finding",
+            Some(&Marker::new("headsha")),
+            &[],
+        )
+        .await
+        .unwrap_or_else(|err| panic!("a {status} refusal must fall back, got {err}"));
+        assert!(publication.fallback_used, "status {status}");
+        assert_eq!(publication.event_submitted, ReviewEvent::Comment);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[0], "REQUEST_CHANGES", "status {status}");
+        assert_eq!(calls[2], "COMMENT", "status {status}");
+        assert!(calls[3].contains("the finding"), "status {status}");
+    }
+}
