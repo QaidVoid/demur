@@ -118,8 +118,12 @@ pub async fn review_pull_request(
 
     let input = PipelineInput {
         meta: PullRequestMeta {
-            title: format!("pull request #{number}"),
-            description: String::new(),
+            title: if pr.title.is_empty() {
+                format!("pull request #{number}")
+            } else {
+                pr.title.clone()
+            },
+            description: pr.body.clone().unwrap_or_default(),
             head_sha: head_sha.clone(),
         },
         ingestion,

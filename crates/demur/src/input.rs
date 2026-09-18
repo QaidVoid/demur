@@ -33,6 +33,39 @@ pub fn detect_vcs(repo: &Path) -> Option<Vcs> {
     }
 }
 
+/// Fetch the commit messages covered by the target, which stand in for a
+/// pull request description on a local review. An empty result is not an
+/// error: a working copy under review has no commit message yet.
+pub fn description(repo: &Path, target: &Target) -> String {
+    let mut command = match detect_vcs(repo) {
+        Some(Vcs::Jj) => {
+            let mut command = Command::new("jj");
+            command
+                .current_dir(repo)
+                .arg("log")
+                .arg("--no-graph")
+                .arg("-T");
+            command.arg("description");
+            match target {
+                Target::WorkingCopy => command.arg("-r").arg("@"),
+                Target::Range(from, to) => command.arg("-r").arg(format!("{from}..{to}")),
+            };
+            command
+        }
+        Some(Vcs::Git) => {
+            let mut command = Command::new("git");
+            command.current_dir(repo).arg("log").arg("--format=%B");
+            match target {
+                Target::WorkingCopy => command.arg("-1").arg("HEAD"),
+                Target::Range(from, to) => command.arg(format!("{from}..{to}")),
+            };
+            command
+        }
+        None => return String::new(),
+    };
+    run(&mut command).unwrap_or_default()
+}
+
 /// Fetch the unified diff text for the target from the local repository.
 pub fn diff_text(repo: &Path, target: &Target) -> Result<String, String> {
     match detect_vcs(repo) {
@@ -51,7 +84,7 @@ fn jj_diff(repo: &Path, target: &Target) -> Result<String, String> {
             command.arg("--from").arg(from).arg("--to").arg(to);
         }
     }
-    run(command)
+    run(&mut command)
 }
 
 fn git_diff(repo: &Path, target: &Target) -> Result<String, String> {
@@ -61,10 +94,10 @@ fn git_diff(repo: &Path, target: &Target) -> Result<String, String> {
         Target::WorkingCopy => command.arg("HEAD"),
         Target::Range(from, to) => command.arg(format!("{from}..{to}")),
     };
-    run(command)
+    run(&mut command)
 }
 
-fn run(mut command: Command) -> Result<String, String> {
+fn run(command: &mut Command) -> Result<String, String> {
     let output = command
         .output()
         .map_err(|err| format!("cannot run {:?}: {err}", command.get_program()))?;

@@ -65,6 +65,13 @@ pub struct PullRequest {
     pub number: u64,
     /// True while the pull request is a draft.
     pub draft: bool,
+    /// Pull request title, which states what the change claims to do.
+    #[serde(default)]
+    pub title: String,
+    /// Pull request body. Untrusted data like the diff, and delimited as
+    /// such in prompts.
+    #[serde(default)]
+    pub body: Option<String>,
     /// Head commit SHA.
     #[serde(rename = "head")]
     head_refs: HeadRefs,

@@ -141,7 +141,7 @@ async fn review(
     let pipeline_input = PipelineInput {
         meta: PullRequestMeta {
             title: format!("local review: {range_label}"),
-            description: String::new(),
+            description: input::description(&repo, &target),
             head_sha: "local".to_string(),
         },
         ingestion,

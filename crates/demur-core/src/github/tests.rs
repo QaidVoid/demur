@@ -346,7 +346,11 @@ async fn end_to_end_delta_review_carries_blocker_and_stays_red() {
         .and(path("/repos/owner/repo/pulls/7"))
         .and(header("accept", "application/vnd.github+json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "number": 7, "draft": false, "head": {"sha": "newhead"}
+            "number": 7,
+            "draft": false,
+            "title": "Harden the token issuer",
+            "body": "Closes the credential leak reported last week.",
+            "head": {"sha": "newhead"}
         })))
         .mount(&server)
         .await;
@@ -412,6 +416,17 @@ async fn end_to_end_delta_review_carries_blocker_and_stays_red() {
     assert!(outcome.published);
     assert_eq!(outcome.check_conclusion, "failure");
     assert!(outcome.summary.contains("unfixed sql injection"));
+    // The reviewer argues against what the pull request claims, so the
+    // claim has to reach the prompt.
+    let crate::provider::AnyProvider::Recorded(triage) = &providers.triage else {
+        panic!("recorded provider");
+    };
+    let sent = &triage.requests()[0].user;
+    assert!(sent.contains("Harden the token issuer"), "{sent}");
+    assert!(
+        sent.contains("credential leak reported last week"),
+        "{sent}"
+    );
 }
 
 #[tokio::test]
