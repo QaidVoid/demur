@@ -116,18 +116,30 @@ pub enum LadderDecision {
         downgrade: bool,
         /// Disclosures for the rungs that applied.
         degradations: Vec<Degradation>,
+        /// The estimate held for this pass. Settle it with the reported
+        /// usage, or release it if the pass never reports.
+        hold: Hold,
     },
     /// Stop running passes and synthesize from what completed.
     StandDown,
 }
 
 impl LadderDecision {
-    /// Run with the full context on the role model.
-    fn full() -> LadderDecision {
+    /// Run with the full context on the role model, holding `estimate`.
+    fn full(estimate: f64) -> LadderDecision {
         LadderDecision::Run {
             shrink: false,
             downgrade: false,
             degradations: Vec::new(),
+            hold: Hold { estimate },
+        }
+    }
+
+    /// The hold this decision took, if it authorized a pass.
+    pub fn hold(&self) -> Option<Hold> {
+        match self {
+            LadderDecision::Run { hold, .. } => Some(*hold),
+            LadderDecision::StandDown => None,
         }
     }
 }
@@ -139,7 +151,20 @@ pub struct BudgetGate {
     cap: BudgetCap,
     prior_spend: f64,
     spent: f64,
+    /// Estimates authorized for passes that have not reported usage yet.
+    /// Without this the gate believes nothing is committed between
+    /// authorizing a pass and recording it, which is true with one pass in
+    /// flight and false with several: each would be told the whole
+    /// remaining budget is free.
+    held: f64,
     summary_only: bool,
+}
+
+/// An authorized estimate held against the budget until the pass it
+/// belongs to reports what it actually used.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Hold {
+    estimate: f64,
 }
 
 impl BudgetGate {
@@ -149,6 +174,7 @@ impl BudgetGate {
             cap,
             prior_spend,
             spent: 0.0,
+            held: 0.0,
             summary_only: false,
         }
     }
@@ -157,7 +183,7 @@ impl BudgetGate {
     pub fn remaining(&self) -> f64 {
         match self.cap {
             BudgetCap::Unlimited => f64::INFINITY,
-            BudgetCap::Limited(amount) => amount - self.prior_spend - self.spent,
+            BudgetCap::Limited(amount) => amount - self.prior_spend - self.spent - self.held,
         }
     }
 
@@ -166,7 +192,10 @@ impl BudgetGate {
         self.spent
     }
 
-    /// Ask permission to run a pass.
+    /// Ask permission to run a pass. A decision to run holds its estimate
+    /// against the remaining budget until the pass settles or releases, so
+    /// passes authorized while others are in flight cannot together exceed
+    /// the cap.
     pub fn authorize(&mut self, estimate: PassEstimate<'_>) -> LadderDecision {
         if self.summary_only {
             return LadderDecision::StandDown;
@@ -185,17 +214,22 @@ impl BudgetGate {
         let remaining = self.remaining();
 
         if remaining >= full_cost {
-            return LadderDecision::full();
+            self.held += full_cost;
+            return LadderDecision::full(full_cost);
         }
         // Rung 1: shrink the context to the highest-risk content. Every
         // pass that runs shrunk is disclosed, so repeats are recorded.
         if remaining >= shrunk_cost {
+            self.held += shrunk_cost;
             return LadderDecision::Run {
                 shrink: true,
                 downgrade: false,
                 degradations: vec![Degradation::ContextShrunk {
                     pass: pass.to_string(),
                 }],
+                hold: Hold {
+                    estimate: shrunk_cost,
+                },
             };
         }
         // Rung 2: deep passes drop to the triage model. The rung stays
@@ -207,15 +241,20 @@ impl BudgetGate {
             let cheap_full = cheap.cost_of_estimated_input(full_tokens) + cheap_output;
             let cheap_shrunk = cheap.cost_of_estimated_input(shrunk_tokens) + cheap_output;
             if remaining >= cheap_full {
+                self.held += cheap_full;
                 return LadderDecision::Run {
                     shrink: false,
                     downgrade: true,
                     degradations: vec![Degradation::ModelDowngraded {
                         pass: pass.to_string(),
                     }],
+                    hold: Hold {
+                        estimate: cheap_full,
+                    },
                 };
             }
             if remaining >= cheap_shrunk {
+                self.held += cheap_shrunk;
                 return LadderDecision::Run {
                     shrink: true,
                     downgrade: true,
@@ -227,6 +266,9 @@ impl BudgetGate {
                             pass: pass.to_string(),
                         },
                     ],
+                    hold: Hold {
+                        estimate: cheap_shrunk,
+                    },
                 };
             }
         }
@@ -241,6 +283,25 @@ impl BudgetGate {
         let cost = price.cost_of_usage(usage);
         self.spent += cost;
         cost
+    }
+
+    /// Release a hold and book what the provider actually reported. A hold
+    /// is never recorded as spend: it is released and replaced by the
+    /// measured cost, so the recorded figure stays exact.
+    pub fn settle(
+        &mut self,
+        hold: Hold,
+        usage: &crate::provider::TokenUsage,
+        price: &ModelPrice,
+    ) -> f64 {
+        self.release(hold);
+        self.record(usage, price)
+    }
+
+    /// Release a hold for a pass that never reported usage. A failure must
+    /// not permanently consume budget that was never spent.
+    pub fn release(&mut self, hold: Hold) {
+        self.held = (self.held - hold.estimate).max(0.0);
     }
 }
 
@@ -281,7 +342,17 @@ mod tests {
             &price(1000.0, 1000.0),
             None,
         ));
-        assert_eq!(decision, LadderDecision::full());
+        assert!(
+            matches!(
+                decision,
+                LadderDecision::Run {
+                    shrink: false,
+                    downgrade: false,
+                    ..
+                }
+            ),
+            "{decision:?}"
+        );
     }
 
     #[test]
@@ -290,28 +361,13 @@ mod tests {
         let mut gate = BudgetGate::new(BudgetCap::Limited(0.05), 0.0);
         let deep = price(0.2, 10.0);
         let decision = gate.authorize(test_estimate(1_000_000, 100_000, &deep, None));
-        assert_eq!(
-            decision,
-            LadderDecision::Run {
-                shrink: true,
-                downgrade: false,
-                degradations: vec![Degradation::ContextShrunk {
-                    pass: "deep dive".to_string()
-                }],
-            }
-        );
-        // Each subsequent pass that runs shrunk is disclosed as well.
+        assert_shrunk(&decision);
+        // The hold would keep a second pass from being authorized against
+        // the same budget, so release it to test the rung in isolation.
+        gate.release(decision.hold().unwrap());
         let decision = gate.authorize(test_estimate(1_000_000, 100_000, &deep, None));
-        assert_eq!(
-            decision,
-            LadderDecision::Run {
-                shrink: true,
-                downgrade: false,
-                degradations: vec![Degradation::ContextShrunk {
-                    pass: "deep dive".to_string()
-                }],
-            }
-        );
+        assert_shrunk(&decision);
+        gate.release(decision.hold().unwrap());
         // When even the shrunk estimate no longer fits, the run stands down.
         gate.record(
             &crate::provider::TokenUsage {
@@ -333,20 +389,35 @@ mod tests {
         let deep = price(30.0, 15.0);
         let cheap = price(0.15, 0.6);
         let decision = gate.authorize(test_estimate(5_000_000, 100_000, &deep, Some(&cheap)));
+        let LadderDecision::Run {
+            shrink,
+            downgrade,
+            degradations,
+            ..
+        } = &decision
+        else {
+            panic!("expected a run, got {decision:?}");
+        };
+        assert!(*shrink && *downgrade, "{decision:?}");
+        assert_eq!(degradations.len(), 2);
+    }
+
+    fn assert_shrunk(decision: &LadderDecision) {
+        let LadderDecision::Run {
+            shrink,
+            downgrade,
+            degradations,
+            ..
+        } = decision
+        else {
+            panic!("expected a run, got {decision:?}");
+        };
+        assert!(*shrink && !*downgrade, "{decision:?}");
         assert_eq!(
-            decision,
-            LadderDecision::Run {
-                shrink: true,
-                downgrade: true,
-                degradations: vec![
-                    Degradation::ContextShrunk {
-                        pass: "deep dive".to_string()
-                    },
-                    Degradation::ModelDowngraded {
-                        pass: "deep dive".to_string()
-                    },
-                ],
-            }
+            degradations,
+            &vec![Degradation::ContextShrunk {
+                pass: "deep dive".to_string()
+            }]
         );
     }
 
@@ -390,6 +461,75 @@ mod tests {
         let decision = gate.authorize(estimate);
         assert_eq!(decision, LadderDecision::StandDown);
         assert!(gate.summary_only);
+    }
+
+    #[test]
+    fn authorizations_in_flight_cannot_together_exceed_the_cap() {
+        // Without a hold, each pass would be told the whole remaining
+        // budget is free and they would together spend several times it.
+        let mut gate = BudgetGate::new(BudgetCap::Limited(0.10), 0.0);
+        let deep = price(1.0, 10.0);
+        let mut authorized = 0;
+        for _ in 0..10 {
+            match gate.authorize(test_estimate(10_000, 10_000, &deep, None)) {
+                LadderDecision::Run { .. } => authorized += 1,
+                LadderDecision::StandDown => break,
+            }
+        }
+        // Each pass holds 1000 output tokens at $10/M plus input, so the
+        // cap allows only a handful, not all ten.
+        assert!(authorized > 0, "at least one pass must be affordable");
+        assert!(
+            authorized < 10,
+            "the cap must stop authorizing, got {authorized}"
+        );
+        assert!(gate.remaining() >= 0.0, "never authorized past the cap");
+    }
+
+    #[test]
+    fn settling_books_actual_usage_not_the_estimate() {
+        let mut gate = BudgetGate::new(BudgetCap::Limited(1.0), 0.0);
+        let deep = price(2.0, 10.0);
+        let LadderDecision::Run { hold, .. } =
+            gate.authorize(test_estimate(10_000, 10_000, &deep, None))
+        else {
+            panic!("expected a run");
+        };
+        // The estimate assumed a full 1000 output tokens; the pass used 10.
+        let usage = crate::provider::TokenUsage {
+            input_tokens: 1_000,
+            cached_input_tokens: 0,
+            output_tokens: 10,
+        };
+        let cost = gate.settle(hold, &usage, &deep);
+        let expected = deep.cost_of_usage(&usage);
+        assert!((cost - expected).abs() < 1e-12, "{cost} != {expected}");
+        assert!(
+            (gate.remaining() - (1.0 - expected)).abs() < 1e-12,
+            "the hold must be released, leaving only actual spend: {}",
+            gate.remaining()
+        );
+    }
+
+    #[test]
+    fn a_released_hold_restores_the_budget() {
+        // A pass that fails without reporting must not permanently consume
+        // budget it never spent.
+        let mut gate = BudgetGate::new(BudgetCap::Limited(1.0), 0.0);
+        let deep = price(2.0, 10.0);
+        let before = gate.remaining();
+        let LadderDecision::Run { hold, .. } =
+            gate.authorize(test_estimate(10_000, 10_000, &deep, None))
+        else {
+            panic!("expected a run");
+        };
+        assert!(gate.remaining() < before, "authorizing holds the estimate");
+        gate.release(hold);
+        assert!(
+            (gate.remaining() - before).abs() < 1e-12,
+            "releasing restores it: {} != {before}",
+            gate.remaining()
+        );
     }
 
     #[test]
