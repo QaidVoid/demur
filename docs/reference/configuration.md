@@ -100,6 +100,7 @@ degradation is disclosed in the published review.
 deep_calls = 12   # maximum deep dive calls per run. Default: 12.
 comments = 10     # maximum published findings per review. Default: 10.
 max_tokens = 2000 # output token ceiling per pass. Default: 2000.
+concurrency = 4   # deep dives in flight at once. Default: 4. Use 1 for serial.
 ```
 
 When the deep call ceiling binds, the highest-risk clusters are reviewed

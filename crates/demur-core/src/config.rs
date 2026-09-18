@@ -25,6 +25,11 @@ pub const DEFAULT_COMMENTS: u32 = 10;
 /// Built-in per-pass output token ceiling.
 pub const DEFAULT_MAX_TOKENS: u32 = 2000;
 
+/// Built-in number of deep dives allowed in flight at once. Deliberately
+/// modest: the binding constraint is the provider's rate limiting, not the
+/// machine, and a greedy default is worst on a shared endpoint.
+pub const DEFAULT_CONCURRENCY: u32 = 4;
+
 /// A minimal working configuration, shown when required settings are absent.
 pub const MINIMAL_EXAMPLE: &str = r#"
 [providers.openai]
@@ -304,6 +309,8 @@ pub struct Limits {
     /// Output token ceiling for every pass. Raised 4x automatically when
     /// a response comes back truncated.
     pub max_tokens: u32,
+    /// Deep dives allowed in flight at once. One is the serial behavior.
+    pub concurrency: u32,
 }
 
 impl Default for Limits {
@@ -312,6 +319,7 @@ impl Default for Limits {
             deep_calls: DEFAULT_DEEP_CALLS,
             comments: DEFAULT_COMMENTS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            concurrency: DEFAULT_CONCURRENCY,
         }
     }
 }
@@ -650,6 +658,12 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 message: "must be zero or positive".to_string(),
             });
         }
+        if config.limits.concurrency == 0 {
+            return Err(ConfigError::Invalid {
+                field: "limits.concurrency".to_string(),
+                message: "must be at least one; use 1 to run passes serially".to_string(),
+            });
+        }
         if config.limits.max_tokens == 0 {
             return Err(ConfigError::Invalid {
                 field: "limits.max_tokens".to_string(),
@@ -716,6 +730,7 @@ mod tests {
         assert_eq!(config.limits.deep_calls, DEFAULT_DEEP_CALLS);
         assert_eq!(config.limits.comments, DEFAULT_COMMENTS);
         assert_eq!(config.limits.max_tokens, DEFAULT_MAX_TOKENS);
+        assert_eq!(config.limits.concurrency, DEFAULT_CONCURRENCY);
         assert!(config.lenses.correctness);
         assert!(config.lenses.security);
         assert!(config.lenses.performance);
@@ -996,6 +1011,16 @@ severity = "blocker"
         );
         let text = err_text(&text);
         assert!(text.contains("cache.max_mb"), "{text}");
+    }
+
+    #[test]
+    fn zero_concurrency_fails() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[limits]\nconcurrency = 0\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("limits.concurrency"), "{text}");
     }
 
     #[test]

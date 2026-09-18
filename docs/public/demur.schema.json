@@ -199,6 +199,13 @@
           "minimum": 0,
           "type": "integer"
         },
+        "concurrency": {
+          "default": 4,
+          "description": "Deep dives allowed in flight at once. One is the serial behavior.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
         "deep_calls": {
           "default": 12,
           "description": "Maximum deep dive calls per run.",
@@ -541,6 +548,7 @@
       "$ref": "#/$defs/Limits",
       "default": {
         "comments": 10,
+        "concurrency": 4,
         "deep_calls": 12,
         "max_tokens": 2000
       },
