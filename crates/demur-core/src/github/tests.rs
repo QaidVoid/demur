@@ -777,3 +777,162 @@ async fn diff_anchored_findings_post_as_threaded_inline_comments() {
         .unwrap();
     assert!(outcome.published);
 }
+
+/// Refuses the first review event with the status and body given, then
+/// accepts whatever comes next.
+struct RefuseFirst {
+    calls: std::sync::Arc<Mutex<Vec<String>>>,
+    status: u16,
+    body: serde_json::Value,
+}
+
+impl wiremock::Respond for RefuseFirst {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let parsed: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let mut calls = self.calls.lock().unwrap();
+        calls.push(parsed["event"].as_str().unwrap_or_default().to_string());
+        calls.push(parsed["body"].as_str().unwrap_or_default().to_string());
+        if calls.len() <= 2 {
+            ResponseTemplate::new(self.status).set_body_json(self.body.clone())
+        } else {
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        }
+    }
+}
+
+fn own_pull_request_refusal() -> serde_json::Value {
+    json!({
+        "message": "Unprocessable Entity",
+        "errors": ["Review Can not request changes on your own pull request"],
+        "status": "422"
+    })
+}
+
+#[tokio::test]
+async fn refused_request_changes_still_delivers_every_finding() {
+    // GitHub refuses REQUEST_CHANGES on a pull request you authored. The
+    // review is complete and paid for, so the refusal must cost the
+    // delivery mechanism and not the review.
+    let server = MockServer::start().await;
+    let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(RefuseFirst {
+            calls: std::sync::Arc::clone(&calls),
+            status: 422,
+            body: own_pull_request_refusal(),
+        })
+        .mount(&server)
+        .await;
+    let conclusion = std::sync::Arc::new(Mutex::new(String::new()));
+    let seen = std::sync::Arc::clone(&conclusion);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(move |request: &Request| {
+            let parsed: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            *seen.lock().unwrap() = parsed["conclusion"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        })
+        .mount(&server)
+        .await;
+
+    let publication = super::publish::publish_review(
+        &client(&server),
+        7,
+        "headsha",
+        crate::pipeline::synthesis::Verdict::RequestChanges,
+        "## demur: changes requested\n\n1. **[blocker]** `src/a.rs:2`: hardcoded credential",
+        Some(&Marker::new("headsha")),
+        &[],
+    )
+    .await
+    .expect("a refused event must not fail the run");
+
+    assert!(publication.fallback_used);
+    assert_eq!(publication.event_submitted, ReviewEvent::Comment);
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0], "REQUEST_CHANGES");
+    assert_eq!(calls[2], "COMMENT");
+    // Every finding survives, and the body explains itself.
+    assert!(calls[3].contains("hardcoded credential"), "{}", calls[3]);
+    assert!(calls[3].contains("REQUEST_CHANGES"), "{}", calls[3]);
+    assert!(
+        calls[3].contains("own pull request"),
+        "the forge's reason is repeated: {}",
+        calls[3]
+    );
+    // The check run still carries the verdict, so a gated merge stays gated.
+    assert_eq!(*conclusion.lock().unwrap(), "failure");
+}
+
+#[tokio::test]
+async fn a_refusal_is_not_reported_as_a_missing_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(own_pull_request_refusal()))
+        .mount(&server)
+        .await;
+    let error = client(&server)
+        .create_review(7, ReviewEvent::Comment, "body", &[])
+        .await
+        .expect_err("a refusal is an error for a comment review");
+    let text = error.to_string();
+    assert!(
+        !text.contains("missing permission"),
+        "a 422 is not an authorization problem: {text}"
+    );
+    assert!(text.contains("own pull request"), "{text}");
+}
+
+#[tokio::test]
+async fn a_genuine_permission_failure_still_names_the_permission() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .set_body_json(json!({"message": "Resource not accessible by integration"})),
+        )
+        .mount(&server)
+        .await;
+    let error = client(&server)
+        .create_review(7, ReviewEvent::Comment, "body", &[])
+        .await
+        .expect_err("a 403 on the fallback is a permission problem");
+    assert!(
+        error.to_string().contains("pull-requests: write"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_fallback_fails_the_run() {
+    // If the comment review is refused too, there is nothing left to try.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(422).set_body_json(own_pull_request_refusal()))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    let error = super::publish::publish_review(
+        &client(&server),
+        7,
+        "headsha",
+        crate::pipeline::synthesis::Verdict::RequestChanges,
+        "body",
+        Some(&Marker::new("headsha")),
+        &[],
+    )
+    .await
+    .expect_err("nothing left to deliver the review with");
+    assert!(!error.to_string().contains("missing permission"), "{error}");
+}

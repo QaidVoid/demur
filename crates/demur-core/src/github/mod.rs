@@ -38,6 +38,13 @@ pub enum GitHubError {
         /// Redacted detail.
         message: String,
     },
+    /// The request was understood and refused on its merits. Nothing about
+    /// the token is wrong, so the forge's own reason is what matters.
+    #[error("github refused the request: {message}")]
+    Refused {
+        /// What the forge said, verbatim.
+        message: String,
+    },
     /// Rate limited by GitHub. Retryable within bounds.
     #[error("github rate limited the request: {message}")]
     RateLimit {
@@ -557,7 +564,7 @@ impl GitHubClient {
         event: ReviewEvent,
         body: &str,
         comments: &[InlineComment],
-    ) -> Result<bool, GitHubError> {
+    ) -> Result<(), GitHubError> {
         let comments: Vec<serde_json::Value> = comments
             .iter()
             .map(|comment| {
@@ -576,22 +583,26 @@ impl GitHubClient {
             )
             .await;
         match response {
-            Ok(response) if response.status().is_success() => Ok(true),
+            Ok(response) if response.status().is_success() => Ok(()),
             Ok(response) => {
                 let status = response.status().as_u16();
                 let detail = self.error_body(response).await;
-                if (status == 403 || status == 422)
-                    && event == ReviewEvent::Approve
-                    && (detail.to_lowercase().contains("approv") || status == 403)
-                {
-                    Ok(false)
-                } else if status == 403 || status == 422 {
-                    Err(GitHubError::Permission {
+                match status {
+                    // A review event is a delivery mechanism, and the
+                    // verdict is already carried by the check run, which
+                    // cannot be refused. So any refusal costs the
+                    // mechanism, never the review.
+                    403 | 422 if event != ReviewEvent::Comment => {
+                        Err(GitHubError::Refused { message: detail })
+                    }
+                    // A comment review is the fallback. If that is refused
+                    // too there is nothing left to try.
+                    403 => Err(GitHubError::Permission {
                         permission: "pull-requests: write",
                         message: detail,
-                    })
-                } else {
-                    Err(GitHubError::Request { message: detail })
+                    }),
+                    422 => Err(GitHubError::Refused { message: detail }),
+                    _ => Err(GitHubError::Request { message: detail }),
                 }
             }
             Err(err) => Err(err),

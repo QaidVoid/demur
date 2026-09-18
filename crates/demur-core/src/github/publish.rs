@@ -37,21 +37,26 @@ pub async fn publish_review(
         Verdict::Approve => ReviewEvent::Approve,
         Verdict::RequestChanges => ReviewEvent::RequestChanges,
     };
-    let approved = client
+    // A review event is only how the verdict is delivered. The check run
+    // carries the verdict itself and cannot be refused, so a refusal costs
+    // the delivery mechanism and never the review.
+    let (event_submitted, fallback_used, body) = match client
         .create_review(number, event, &body_with_marker, comments)
-        .await?;
-    let (event_submitted, fallback_used, body) = if approved {
-        (event, false, body_with_marker)
-    } else {
-        let comment_body = format!(
-            "{body_with_marker}\n\nNote: the approval could not be submitted under the \
-current identity, so this review was posted as a comment. The check run carries \
-the verdict."
-        );
-        client
-            .create_review(number, ReviewEvent::Comment, &comment_body, comments)
-            .await?;
-        (ReviewEvent::Comment, true, comment_body)
+        .await
+    {
+        Ok(()) => (event, false, body_with_marker),
+        Err(GitHubError::Refused { message }) => {
+            let comment_body = format!(
+                "{body_with_marker}\n\nNote: a {} review could not be submitted, so this \
+review was posted as a comment. The check run carries the verdict.\nGitHub said: {message}",
+                event.as_str()
+            );
+            client
+                .create_review(number, ReviewEvent::Comment, &comment_body, comments)
+                .await?;
+            (ReviewEvent::Comment, true, comment_body)
+        }
+        Err(err) => return Err(err),
     };
 
     let (title, conclusion) = match verdict {
