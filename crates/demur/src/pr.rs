@@ -106,6 +106,103 @@ fn git_remote_url(repo: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Which credential a publication will use, and whether a review published
+/// with it carries demur's mark.
+struct Identity {
+    token: String,
+    badged: bool,
+}
+
+/// Resolve the identity a publication would use. An authorization demur
+/// holds is preferred; without one, whatever token the user already has is
+/// used, unbadged. Failing to obtain one costs the mark, never the review.
+async fn resolve_identity(
+    app: &demur_core::config::App,
+    publish: bool,
+) -> Result<Identity, String> {
+    use demur_core::app::{Authorization, Authorizer};
+
+    let Some(client_id) = app.client_id.as_deref().filter(|_| publish) else {
+        return Ok(Identity {
+            token: github_token()?,
+            badged: false,
+        });
+    };
+    let authorizer = Authorizer::new(client_id);
+    let kept = app.token_file.as_deref().and_then(Authorization::read);
+
+    // A kept authorization, renewed first if it is close to expiring.
+    if let Some(existing) = kept {
+        if !existing.needs_renewal() {
+            return Ok(Identity {
+                token: existing.token,
+                badged: true,
+            });
+        }
+        match authorizer.renew(&existing).await {
+            Ok(renewed) => {
+                keep(app, &renewed);
+                return Ok(Identity {
+                    token: renewed.token,
+                    badged: true,
+                });
+            }
+            Err(err) => {
+                // Revoked, or no longer renewable. Ask again rather than
+                // failing on a credential that simply aged out.
+                eprintln!("the kept authorization could not be renewed ({err}); authorizing again");
+            }
+        }
+    }
+
+    match authorize(&authorizer).await {
+        Ok(granted) => {
+            keep(app, &granted);
+            Ok(Identity {
+                token: granted.token,
+                badged: true,
+            })
+        }
+        Err(err) => match github_token() {
+            Ok(token) => {
+                eprintln!(
+                    "could not authorize demur ({err}); publishing unbadged under your own token"
+                );
+                Ok(Identity {
+                    token,
+                    badged: false,
+                })
+            }
+            Err(_) => Err(err.to_string()),
+        },
+    }
+}
+
+async fn authorize(
+    authorizer: &demur_core::app::Authorizer,
+) -> Result<demur_core::app::Authorization, demur_core::app::AppError> {
+    let (prompt, pending) = authorizer.begin().await?;
+    println!(
+        "To publish as yourself marked as demur's work, open {} and enter: {}",
+        prompt.verification_uri, prompt.user_code
+    );
+    authorizer.wait(&pending).await
+}
+
+/// Keep an authorization only where the user named a place for it. A
+/// failure to keep it is not a failure to publish.
+fn keep(app: &demur_core::config::App, authorization: &demur_core::app::Authorization) {
+    let Some(path) = app.token_file.as_deref() else {
+        return;
+    };
+    if let Err(err) = authorization.write(path) {
+        eprintln!(
+            "the authorization could not be kept at {}: {err}",
+            path.display()
+        );
+    }
+}
+
 /// Review a pull request. Read-only by default; publishing requires the
 /// explicit flag and posts under the token's human identity.
 pub async fn review_pr(
@@ -118,12 +215,14 @@ pub async fn review_pr(
     let repo =
         repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let parsed = parse_target(&target, &repo)?;
-    let token = github_token()?;
+    let mut config = Config::load(&repo.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
+    // The identity is resolved before anything is fetched, so the run knows
+    // how a review would be attributed before it spends anything on one.
+    let identity = resolve_identity(&config.app, publish).await?;
     let api =
         std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_string());
-    let client = GitHubClient::new(&api, token, &parsed.owner, &parsed.repo);
+    let client = GitHubClient::new(&api, identity.token.clone(), &parsed.owner, &parsed.repo);
 
-    let mut config = Config::load(&repo.join(CONFIG_FILE_NAME)).map_err(|err| err.to_string())?;
     if let Some(dir) = cache_dir {
         config.cache.enabled = true;
         config.cache.dir = Some(dir);
@@ -173,10 +272,17 @@ pub async fn review_pr(
                     .authenticated_login()
                     .await
                     .map_err(|err| err.to_string())?;
-                println!(
-                    "Publishing under your identity @{login}: findings will appear under \
-your name, not under a bot identity."
-                );
+                if identity.badged {
+                    println!(
+                        "Publishing as @{login}, marked as demur's work: the review is yours \
+and carries demur's mark beside your name."
+                    );
+                } else {
+                    println!(
+                        "Publishing under your identity @{login}: findings will appear under \
+your name, not under a bot identity, and without demur's mark."
+                    );
+                }
                 publish_review(
                     &client,
                     parsed.number,
