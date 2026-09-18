@@ -209,6 +209,9 @@ pub struct Config {
     /// Context retrieval. Off unless asked for.
     #[serde(default)]
     pub retrieval: Retrieval,
+    /// The application a user may authorize demur to act as.
+    #[serde(default)]
+    pub app: App,
     /// Named provider endpoints.
     pub providers: BTreeMap<String, ProviderDef>,
     /// Model assigned to each pipeline role.
@@ -338,6 +341,28 @@ pub const DEFAULT_RETRIEVAL_ROUNDS: u32 = 1;
 
 /// Built-in ceiling on retrieved content per run, in kilobytes.
 pub const DEFAULT_RETRIEVAL_KB: u64 = 64;
+
+/// demur as an application a user authorizes, so a review they publish is
+/// attributed to them and marked as demur's work. Absent means reviews
+/// publish unbadged with whatever token the user already has.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct App {
+    /// The application's client identifier. Not a secret: it names which
+    /// application the user is being asked to authorize.
+    pub client_id: Option<String>,
+    /// Where to keep an authorization so later publications do not ask
+    /// again. Absent means nothing is written and each publication
+    /// authorizes afresh.
+    pub token_file: Option<PathBuf>,
+}
+
+impl App {
+    /// True when an application is configured to authorize against.
+    pub fn is_configured(&self) -> bool {
+        self.client_id.is_some()
+    }
+}
 
 /// Context retrieval: a pass may name repository content it needs, which
 /// the bot resolves itself. Off unless asked for, and never performed for
@@ -645,6 +670,16 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
     // Compile declared patterns here so an unusable rule fails the run
     // before anything is spent, rather than at evaluation time.
     crate::rules::Rules::compile(&config.review)?;
+    // A place to keep an authorization is meaningless without an
+    // application to authorize, so a half-configuration fails closed rather
+    // than silently never badging anything.
+    if config.app.token_file.is_some() && config.app.client_id.is_none() {
+        return Err(ConfigError::Invalid {
+            field: "app.token_file".to_string(),
+            message: "names where to keep an authorization but no app.client_id says what to authorize; set both or neither"
+                .to_string(),
+        });
+    }
     if config.retrieval.enabled && config.retrieval.max_rounds == 0 {
         return Err(ConfigError::Invalid {
             field: "retrieval.max_rounds".to_string(),
@@ -1044,6 +1079,36 @@ severity = "blocker"
         );
         let text = err_text(&text);
         assert!(text.contains("review.title.pattern"), "{text}");
+    }
+
+    #[test]
+    fn no_application_is_configured_by_default() {
+        let config = Config::from_toml(&minimal()).expect("minimal config parses");
+        assert!(!config.app.is_configured());
+        assert!(config.app.token_file.is_none());
+    }
+
+    #[test]
+    fn a_half_configured_application_fails_closed() {
+        let text = minimal().replace(
+            "[models.triage]",
+            "[app]\ntoken_file = \"/tmp/demur-token\"\n\n[models.triage]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("app.token_file"), "{text}");
+        assert!(text.contains("app.client_id"), "{text}");
+    }
+
+    #[test]
+    fn an_application_without_a_token_file_is_valid() {
+        // Authorizing every time is a supported choice.
+        let text = minimal().replace(
+            "[models.triage]",
+            "[app]\nclient_id = \"Iv1.abc123\"\n\n[models.triage]",
+        );
+        let config = Config::from_toml(&text).expect("client_id alone is valid");
+        assert!(config.app.is_configured());
+        assert!(config.app.token_file.is_none());
     }
 
     #[test]

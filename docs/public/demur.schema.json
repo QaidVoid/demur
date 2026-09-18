@@ -1,5 +1,28 @@
 {
   "$defs": {
+    "App": {
+      "additionalProperties": false,
+      "description": "demur as an application a user authorizes, so a review they publish is\nattributed to them and marked as demur's work. Absent means reviews\npublish unbadged with whatever token the user already has.",
+      "properties": {
+        "client_id": {
+          "default": null,
+          "description": "The application's client identifier. Not a secret: it names which\napplication the user is being asked to authorize.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "token_file": {
+          "default": null,
+          "description": "Where to keep an authorization so later publications do not ask\nagain. Absent means nothing is written and each publication\nauthorizes afresh.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "BlockOn": {
       "additionalProperties": false,
       "description": "The severities whose findings force REQUEST_CHANGES.",
@@ -526,6 +549,14 @@
   "additionalProperties": false,
   "description": "Configuration for demur, a BYOK adversarial code review bot.",
   "properties": {
+    "app": {
+      "$ref": "#/$defs/App",
+      "default": {
+        "client_id": null,
+        "token_file": null
+      },
+      "description": "The application a user may authorize demur to act as."
+    },
     "block_on": {
       "$ref": "#/$defs/BlockOn",
       "default": {

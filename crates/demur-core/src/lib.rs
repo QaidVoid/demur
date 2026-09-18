@@ -5,6 +5,7 @@
 //! multi-pass review pipeline, and delta review state. The CLI and the
 //! GitHub Action binaries are thin wrappers over this library.
 
+pub mod app;
 pub mod cache;
 pub mod config;
 #[cfg(test)]
