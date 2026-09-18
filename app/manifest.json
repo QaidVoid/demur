@@ -1,0 +1,14 @@
+{
+  "name": "demur",
+  "url": "https://demur.qaidvoid.dev",
+  "description": "An adversarial code reviewer. It grants every fact in the pull request, then argues why the change still must not be merged. Reviews you publish through it are attributed to you and marked as demur's work.",
+  "public": false,
+  "request_oauth_on_install": false,
+  "setup_on_update": false,
+  "default_permissions": {
+    "pull_requests": "write",
+    "checks": "write",
+    "contents": "read"
+  },
+  "default_events": []
+}

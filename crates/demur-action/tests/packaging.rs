@@ -111,3 +111,67 @@ fn example_workflow_limits_permissions_and_sets_concurrency() {
         .expect("workflow `on` key missing");
     assert!(trigger.is_mapping(), "workflow `on` key missing");
 }
+
+fn load_json(path: &str) -> serde_json::Value {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let text = std::fs::read_to_string(format!("{manifest}/../../{path}"))
+        .unwrap_or_else(|err| panic!("read {path}: {err}"));
+    serde_json::from_str(&text).unwrap_or_else(|err| panic!("{path} is not valid JSON: {err}"))
+}
+
+#[test]
+fn the_app_manifest_asks_for_exactly_what_the_bot_uses() {
+    // Authorizing changes how a review is attributed, never what the bot
+    // may do. If these drift, the app can be granted more than the token
+    // path ever gets, which is the thing this check exists to prevent.
+    let manifest = load_json("app/manifest.json");
+    let permissions = manifest["default_permissions"]
+        .as_object()
+        .expect("default_permissions");
+    assert_eq!(permissions["pull_requests"], "write");
+    assert_eq!(permissions["checks"], "write");
+    assert_eq!(permissions["contents"], "read");
+    assert_eq!(
+        permissions.len(),
+        3,
+        "no permission beyond the three the bot uses: {permissions:?}"
+    );
+
+    // The action's permissions block is the same set, named the way a
+    // workflow names them.
+    let action = load("action.yml");
+    let workflow = load("docs/example-workflow.yml");
+    let declared = workflow["permissions"]
+        .as_mapping()
+        .expect("workflow permissions");
+    assert_eq!(declared.len(), 3);
+    assert_eq!(declared[&Value::from("pull-requests")], "write");
+    assert_eq!(declared[&Value::from("checks")], "write");
+    assert_eq!(declared[&Value::from("contents")], "read");
+    assert_eq!(action["runs"]["using"], "composite");
+}
+
+#[test]
+fn the_app_subscribes_to_no_events() {
+    // demur is triggered by a workflow, not by webhooks. Subscribing to
+    // events would ask a user to grant delivery the bot never reads.
+    let manifest = load_json("app/manifest.json");
+    assert_eq!(
+        manifest["default_events"].as_array().map(Vec::len),
+        Some(0),
+        "no events: {:?}",
+        manifest["default_events"]
+    );
+}
+
+#[test]
+fn the_avatar_exists_at_the_size_the_platform_wants() {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let bytes =
+        std::fs::read(format!("{manifest}/../../app/avatar.png")).expect("app/avatar.png exists");
+    assert_eq!(&bytes[1..4], b"PNG", "it is a PNG");
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    assert_eq!(width, height, "square");
+    assert!(width >= 200, "at least 200px, got {width}");
+}
