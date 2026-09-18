@@ -28,7 +28,8 @@ demur pr https://github.com/owner/repo/pull/42
 ```
 
 The target may be a pull request number inside a repository checkout or a
-full URL. A GitHub token is required in `GITHUB_TOKEN` or `GH_TOKEN`. The
+full URL. The GitHub token comes from `GITHUB_TOKEN`, then `GH_TOKEN`, and
+finally from the GitHub CLI when it is authenticated (`gh auth login`). The
 pull request diff is fetched and reviewed in full: the CLI keeps no state,
 so it never reads or writes the bot's review markers.
 

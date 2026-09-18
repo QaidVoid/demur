@@ -68,6 +68,31 @@ fn parse_target(target: &str, repo: &Path) -> Result<Target, String> {
     })
 }
 
+fn github_token() -> Result<String, String> {
+    const GUIDANCE: &str =
+        "no GitHub token: set GITHUB_TOKEN or GH_TOKEN, or authenticate with `gh auth login`";
+    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(token) = std::env::var(name) {
+            let trimmed = token.trim();
+            if !trimmed.is_empty() {
+                return Ok(trimmed.to_string());
+            }
+        }
+    }
+    let output = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .map_err(|_| GUIDANCE.to_string())?;
+    if !output.status.success() {
+        return Err(GUIDANCE.to_string());
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        return Err(GUIDANCE.to_string());
+    }
+    Ok(token)
+}
+
 fn git_remote_url(repo: &Path) -> Result<String, String> {
     let output = std::process::Command::new("git")
         .args(["config", "--get", "remote.origin.url"])
@@ -91,9 +116,7 @@ pub async fn review_pr(
     let repo =
         repo.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let parsed = parse_target(&target, &repo)?;
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .map_err(|_| "no GitHub token: set GITHUB_TOKEN or GH_TOKEN".to_string())?;
+    let token = github_token()?;
     let api =
         std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".to_string());
     let client = GitHubClient::new(&api, token, &parsed.owner, &parsed.repo);
@@ -189,5 +212,25 @@ mod tests {
     #[test]
     fn rejects_unparseable_targets_without_network() {
         assert!(parse_target("not-a-number", Path::new("/nonexistent")).is_err());
+    }
+
+    #[test]
+    fn environment_variables_win_over_the_gh_cli() {
+        unsafe {
+            std::env::set_var("GITHUB_TOKEN", "env-github-token");
+            std::env::remove_var("GH_TOKEN");
+        }
+        assert_eq!(github_token().unwrap(), "env-github-token");
+
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::set_var("GH_TOKEN", "env-gh-token");
+        }
+        assert_eq!(github_token().unwrap(), "env-gh-token");
+
+        unsafe {
+            std::env::remove_var("GITHUB_TOKEN");
+            std::env::remove_var("GH_TOKEN");
+        }
     }
 }
