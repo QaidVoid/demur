@@ -230,6 +230,36 @@ pub fn rank(findings: &mut [Finding]) {
     });
 }
 
+/// Reconcile findings that cite the same location into one finding
+/// carrying every concern raised about it. Merges and never discards: the
+/// leading concern is the first, which is the highest-ranked, and the
+/// severity is the most severe present. Deterministic.
+pub fn reconcile(findings: Vec<Finding>) -> Vec<Finding> {
+    let mut groups: Vec<Finding> = Vec::new();
+    let mut index: std::collections::HashMap<(String, u32), usize> =
+        std::collections::HashMap::new();
+    for finding in findings {
+        let key = (finding.file.clone(), finding.start_line);
+        match index.get(&key) {
+            Some(&position) => {
+                let lead = &mut groups[position];
+                if finding.severity.rank() > lead.severity.rank() {
+                    lead.severity = finding.severity;
+                }
+                lead.further_concerns.push(Concern {
+                    message: finding.message,
+                    harm: finding.harm,
+                });
+            }
+            None => {
+                index.insert(key, groups.len());
+                groups.push(finding);
+            }
+        }
+    }
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

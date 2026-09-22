@@ -3,7 +3,7 @@
 
 use crate::config::Severity;
 use crate::pipeline::budget::Degradation;
-use crate::pipeline::findings::{Finding, dedupe, rank};
+use crate::pipeline::findings::{Finding, dedupe, rank, reconcile};
 
 /// The review verdict. Publication reports it and never recomputes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +89,7 @@ pub fn synthesize(input: SynthesisInput) -> Synthesis {
     } = input;
     let mut findings = dedupe(findings);
     rank(&mut findings);
+    let findings = reconcile(findings);
 
     let blocking_rank = block_on
         .iter()
@@ -348,6 +349,9 @@ fn render_finding(index: usize, finding: &Finding) -> String {
         }
         out.push_str("   ```\n");
     }
+    for concern in &finding.further_concerns {
+        out.push_str(&format!("   - **{}**: {}\n", concern.message, concern.harm));
+    }
     out
 }
 
@@ -440,11 +444,15 @@ mod tests {
     fn forty_findings_publish_only_the_budget_with_omission_count() {
         let findings: Vec<Finding> = (0..40)
             .map(|i| {
-                finding(
+                let mut finding = finding(
                     Severity::Note,
                     "a.rs",
                     &format!("distinct finding number {i}"),
-                )
+                );
+                let line = i + 1;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
             })
             .collect();
         let result = synthesize(input(findings, vec![Severity::Blocker], 10));
@@ -457,18 +465,26 @@ mod tests {
     fn cut_blocking_finding_still_sets_verdict_and_is_named() {
         let findings: Vec<Finding> = (0..15)
             .map(|i| {
-                finding(
+                let mut finding = finding(
                     Severity::Blocker,
                     "z.rs",
                     &format!("blocking defect number {i} with a long harm story"),
-                )
+                );
+                let line = i + 1;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
             })
             .chain((0..30).map(|i| {
-                finding(
+                let mut finding = finding(
                     Severity::Note,
                     "a.rs",
                     &format!("distinct finding number {i}"),
-                )
+                );
+                let line = i + 1;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
             }))
             .collect();
         let result = synthesize(input(findings, vec![Severity::Blocker], 10));
@@ -488,6 +504,96 @@ mod tests {
         let same = finding(Severity::Blocker, "old.rs", "carried blocker");
         let result = synthesize(input(vec![same.clone(), same], vec![Severity::Blocker], 10));
         assert_eq!(result.published.len(), 1);
+    }
+
+    #[test]
+    fn concerns_on_one_line_reconcile_into_one_finding_carrying_all() {
+        let findings: Vec<Finding> = (0..6)
+            .map(|i| finding(Severity::Note, "a.rs", &format!("concern number {i}")))
+            .collect();
+        let result = synthesize(input(findings, vec![Severity::Blocker], 10));
+        assert_eq!(result.published.len(), 1);
+        assert_eq!(result.published[0].further_concerns.len(), 5);
+        for i in 0..6 {
+            assert!(result.body.contains(&format!("concern number {i}")));
+            assert!(
+                result
+                    .body
+                    .contains(&format!("Merging concern number {i} causes"))
+            );
+        }
+    }
+
+    #[test]
+    fn concerns_on_different_lines_do_not_merge() {
+        let mut second = finding(Severity::Note, "a.rs", "another line");
+        second.start_line = 8;
+        second.end_line = 8;
+        let result = synthesize(input(
+            vec![finding(Severity::Note, "a.rs", "one line"), second],
+            vec![Severity::Blocker],
+            10,
+        ));
+        assert_eq!(result.published.len(), 2);
+        assert!(result.published[0].further_concerns.is_empty());
+        assert!(result.published[1].further_concerns.is_empty());
+    }
+
+    #[test]
+    fn blocker_reconciled_with_notes_keeps_the_verdict() {
+        let findings = vec![
+            finding(Severity::Note, "a.rs", "a note"),
+            finding(Severity::Blocker, "a.rs", "a blocker"),
+            finding(Severity::Warning, "a.rs", "a warning"),
+        ];
+        let result = synthesize(input(findings, vec![Severity::Blocker], 10));
+        assert_eq!(result.verdict, Verdict::RequestChanges);
+        assert_eq!(result.published.len(), 1);
+        assert_eq!(result.published[0].severity, Severity::Blocker);
+    }
+
+    #[test]
+    fn verdict_is_the_same_with_and_without_reconciliation() {
+        let spread: Vec<Finding> = ["one", "two", "three"]
+            .iter()
+            .enumerate()
+            .map(|(i, message)| {
+                let mut finding = finding(Severity::Blocker, "a.rs", message);
+                let line = (i as u32) * 10 + 1;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
+            })
+            .collect();
+        let mut same_line = spread.clone();
+        for finding in &mut same_line {
+            finding.start_line = 3;
+            finding.end_line = 3;
+        }
+        assert_eq!(
+            synthesize(input(spread, vec![Severity::Blocker], 10)).verdict,
+            synthesize(input(same_line, vec![Severity::Blocker], 10)).verdict
+        );
+    }
+
+    #[test]
+    fn synthesis_is_deterministic() {
+        let make = || {
+            let mut findings = vec![
+                finding(Severity::Warning, "b.rs", "first warning"),
+                finding(Severity::Blocker, "a.rs", "the blocker"),
+            ];
+            let mut note = finding(Severity::Note, "a.rs", "the note");
+            note.start_line = 3;
+            note.end_line = 3;
+            findings.push(note);
+            findings
+        };
+        let one = synthesize(input(make(), vec![Severity::Blocker], 10));
+        let two = synthesize(input(make(), vec![Severity::Blocker], 10));
+        assert_eq!(one.body, two.body);
+        assert_eq!(one.published.len(), two.published.len());
+        assert_eq!(one.omitted, two.omitted);
     }
 
     #[test]
