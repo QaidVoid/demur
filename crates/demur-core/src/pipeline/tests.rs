@@ -298,6 +298,102 @@ async fn malformed_output_fails_the_run_without_a_review() {
     assert!(spend.iter().any(|pass| pass.pass == "triage (failed)"));
 }
 
+/// A diff with more hunks in one file than the shrink rung would keep.
+const WIDE_DIFF: &str = "\
+diff --git a/src/big.rs b/src/big.rs
+--- a/src/big.rs
++++ b/src/big.rs
+@@ -1,3 +1,4 @@
+ fn a() {
++    let one = 1;
+ }
+@@ -10,3 +11,4 @@
+ fn b() {
++    let two = 2;
+ }
+@@ -20,3 +21,4 @@
+ fn c() {
++    let three = 3;
+ }
+";
+
+fn wide_input() -> PipelineInput {
+    let mut input = input();
+    let files = parse_unified_diff(WIDE_DIFF);
+    input.ingestion = ingest(&files, &config_with("standard", ""));
+    input.diff_text = WIDE_DIFF.to_string();
+    input
+}
+
+fn overflow_then(response: serde_json::Value) -> ProviderRegistry {
+    ProviderRegistry::recorded(
+        RecordedProvider::new(vec![
+            Err(ProviderError::ContextOverflow {
+                message: "too many tokens".to_string(),
+            }),
+            Ok(response),
+        ]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    )
+}
+
+#[tokio::test]
+async fn triage_context_overflow_retries_shrunk_and_discloses_it() {
+    let config = config_with("quick", "");
+    let providers = overflow_then(json!({"findings": [], "cluster_lens": []}));
+
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &config, &wide_input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let requests = recorded(&providers.triage).requests();
+    assert_eq!(requests.len(), 2, "the shrunk retry is the second call");
+    assert!(requests[0].user.contains("let three"), "first call is full");
+    assert!(
+        !requests[1].user.contains("let three"),
+        "second call keeps only the shrink rung's hunks: {}",
+        requests[1].user
+    );
+    assert!(
+        review
+            .body
+            .contains("triage: context was shrunk to the highest-risk content"),
+        "{}",
+        review.body
+    );
+}
+
+#[tokio::test]
+async fn triage_double_overflow_fails_the_run() {
+    let config = config_with("quick", "");
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![
+            Err(ProviderError::ContextOverflow {
+                message: "too many tokens".to_string(),
+            }),
+            Err(ProviderError::ContextOverflow {
+                message: "still too many tokens".to_string(),
+            }),
+        ]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![]),
+    );
+
+    let RunOutcome::Failed { error, .. } = crate::pipeline::run(&providers, &config, &wide_input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a failed run");
+    };
+    assert!(matches!(
+        error,
+        PipelineError::Provider(ProviderError::ContextOverflow { .. })
+    ));
+}
+
 #[tokio::test]
 async fn exhausted_budget_degrades_to_summary_only_with_disclosure() {
     // A cap that funds triage and the summary but no deep dive at deep

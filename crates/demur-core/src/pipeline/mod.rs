@@ -380,7 +380,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
         price: &triage_price,
         downgrade_price: None,
     };
-    let (triage_prompt, triage_hold) = match gate.authorize(estimate) {
+    let (triage_prompt, ran_shrunk, triage_hold) = match gate.authorize(estimate) {
         LadderDecision::Run {
             shrink,
             degradations: disclosed,
@@ -388,7 +388,11 @@ you can already anchor to an exact file and line range with its concrete harm.";
             ..
         } => {
             degradations.extend(disclosed);
-            (if shrink { triage_shrunk } else { triage_full }, hold)
+            (
+                if shrink { triage_shrunk } else { triage_full },
+                shrink,
+                hold,
+            )
         }
         LadderDecision::StandDown => {
             return Ok(RunOutcome::Skipped {
@@ -400,13 +404,34 @@ you can already anchor to an exact file and line range with its concrete harm.";
     let triage_result = match call_pass::<findings::TriageOutput>(
         &registry.triage,
         triage_prompt,
-        triage_schema,
+        triage_schema.clone(),
         "triage",
         config.limits.max_tokens,
         triage_cache,
     )
     .await
     {
+        Err(ProviderError::ContextOverflow { .. }) if !ran_shrunk => {
+            // The full rendering cannot be reviewed, so retry once at the
+            // shrink rung's width before giving up on the run.
+            call_pass::<findings::TriageOutput>(
+                &registry.triage,
+                prompt::assemble(&shrunk_context, triage_task),
+                triage_schema,
+                "triage",
+                config.limits.max_tokens,
+                triage_cache,
+            )
+            .await
+            .inspect(|_| {
+                degradations.push(Degradation::ContextShrunk {
+                    pass: "triage".to_string(),
+                });
+            })
+        }
+        other => other,
+    };
+    let triage_result = match triage_result {
         Ok(result) => result,
         Err(err) => {
             gate.release(triage_hold);
