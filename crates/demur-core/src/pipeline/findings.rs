@@ -62,6 +62,9 @@ pub struct Concern {
     pub message: String,
     /// The concrete harm merging would cause.
     pub harm: String,
+    /// A concrete fix, when one can be expressed. Rendered as a plain code
+    /// fence, since a comment carries at most one suggestion block.
+    pub suggestion: Option<String>,
 }
 
 /// A validated finding anchored to the pull request diff.
@@ -166,6 +169,9 @@ pub fn validate(raw: &ModelFinding, diff_paths: &[String]) -> Option<Finding> {
     if harm.len() < 10 {
         return None;
     }
+    if raw.message.trim().is_empty() {
+        return None;
+    }
     let combined = format!("{} {}", raw.message.to_lowercase(), harm.to_lowercase());
     let praises = PRAISE_MARKERS
         .iter()
@@ -208,7 +214,8 @@ pub fn normalize_message(text: &str) -> String {
 }
 
 /// Dedupe findings by path and normalized message, keeping the first
-/// (highest-ranked) occurrence.
+/// occurrence. The caller ranks first, so the survivor is the
+/// highest-ranked of the duplicates.
 pub fn dedupe(findings: Vec<Finding>) -> Vec<Finding> {
     let mut seen = std::collections::HashSet::new();
     findings
@@ -249,6 +256,7 @@ pub fn reconcile(findings: Vec<Finding>) -> Vec<Finding> {
                 lead.further_concerns.push(Concern {
                     message: finding.message,
                     harm: finding.harm,
+                    suggestion: finding.suggestion,
                 });
             }
             None => {
@@ -345,6 +353,13 @@ mod tests {
         ];
         let deduped = dedupe(findings);
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn blank_statement_findings_are_dropped() {
+        let mut blank = raw();
+        blank.message = "   ".to_string();
+        assert!(validate(&blank, &paths()).is_none());
     }
 
     #[test]

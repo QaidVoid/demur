@@ -76,7 +76,7 @@ pub struct Synthesis {
 /// Compute the verdict, enforce the comment budget, and render the body.
 pub fn synthesize(input: SynthesisInput) -> Synthesis {
     let SynthesisInput {
-        findings,
+        mut findings,
         block_on,
         comment_budget,
         degradations,
@@ -87,8 +87,8 @@ pub fn synthesize(input: SynthesisInput) -> Synthesis {
         template,
         models,
     } = input;
-    let mut findings = dedupe(findings);
     rank(&mut findings);
+    let findings = dedupe(findings);
     let findings = reconcile(findings);
 
     let blocking_rank = block_on
@@ -223,11 +223,17 @@ impl Body<'_> {
                 if !self.beyond_budget.is_empty() {
                     body.push_str("### Blocking findings outside the comment budget\n\n");
                     for finding in self.beyond_budget {
+                        let further = if finding.further_concerns.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (+{} further concern(s))", finding.further_concerns.len())
+                        };
                         body.push_str(&format!(
-                            "- **[{}]** `{}`: {}\n",
+                            "- **[{}]** `{}`: {}{}\n",
                             severity_name(finding.severity),
                             finding.location(),
-                            finding.message
+                            finding.message,
+                            further
                         ));
                     }
                     body.push('\n');
@@ -351,6 +357,15 @@ fn render_finding(index: usize, finding: &Finding) -> String {
     }
     for concern in &finding.further_concerns {
         out.push_str(&format!("   - **{}**: {}\n", concern.message, concern.harm));
+        if let Some(suggestion) = &concern.suggestion {
+            out.push_str("   ```\n");
+            for line in suggestion.lines() {
+                out.push_str("   ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push_str("   ```\n");
+        }
     }
     out
 }
@@ -491,12 +506,48 @@ mod tests {
         assert_eq!(result.verdict, Verdict::RequestChanges);
         assert_eq!(result.published.len(), 10);
         assert_eq!(result.omitted, 35);
-        assert!(
-            result
-                .body
-                .contains("Blocking findings outside the comment budget")
-        );
-        assert!(result.body.contains("blocking defect number 14"));
+        let named = result
+            .body
+            .split("### Blocking findings outside the comment budget\n\n")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(named.contains("blocking defect number 6"));
+        assert!(!named.contains("blocking defect number 14"));
+    }
+
+    #[test]
+    fn blocking_finding_cut_by_the_budget_discloses_its_concerns() {
+        let mut findings: Vec<Finding> = (0..10)
+            .map(|i| {
+                let mut finding = finding(
+                    Severity::Blocker,
+                    "z.rs",
+                    &format!("b{i}{}", "x".repeat(30 - i)),
+                );
+                let line = (i + 1) as u32;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
+            })
+            .collect();
+        let mut lead = finding(Severity::Blocker, "z.rs", "lead concern");
+        lead.start_line = 40;
+        lead.end_line = 40;
+        findings.push(lead);
+        let mut second = finding(Severity::Blocker, "z.rs", "second concern");
+        second.start_line = 40;
+        second.end_line = 40;
+        findings.push(second);
+        let result = synthesize(input(findings, vec![Severity::Blocker], 10));
+        assert_eq!(result.published.len(), 10);
+        let named = result
+            .body
+            .split("### Blocking findings outside the comment budget\n\n")
+            .nth(1)
+            .unwrap_or_default();
+        assert!(named.contains("second concern"));
+        assert!(!named.contains("lead concern"));
+        assert!(named.contains("(+1 further concern(s))"));
     }
 
     #[test]
@@ -522,6 +573,37 @@ mod tests {
                     .contains(&format!("Merging concern number {i} causes"))
             );
         }
+    }
+
+    #[test]
+    fn dedupe_keeps_the_more_severe_of_two_duplicates() {
+        let mut note = finding(Severity::Note, "a.rs", "unhandled unwrap");
+        note.start_line = 30;
+        note.end_line = 30;
+        let mut blocker = finding(Severity::Blocker, "a.rs", "unhandled unwrap");
+        blocker.start_line = 40;
+        blocker.end_line = 40;
+        let result = synthesize(input(vec![note, blocker], vec![Severity::Blocker], 10));
+        assert_eq!(result.verdict, Verdict::RequestChanges);
+        assert_eq!(result.published.len(), 1);
+        assert_eq!(result.published[0].severity, Severity::Blocker);
+    }
+
+    #[test]
+    fn reconciled_concerns_keep_their_suggestions() {
+        let mut with_fix = finding(Severity::Note, "a.rs", "minor leak");
+        with_fix.suggestion = Some("let cached = compute();".to_string());
+        let blocker = finding(Severity::Blocker, "a.rs", "the blocker");
+        let result = synthesize(input(vec![with_fix, blocker], vec![Severity::Blocker], 10));
+        assert_eq!(result.published.len(), 1);
+        assert_eq!(result.published[0].severity, Severity::Blocker);
+        let concern = &result.published[0].further_concerns[0];
+        assert_eq!(concern.message, "minor leak");
+        assert_eq!(
+            concern.suggestion.as_deref(),
+            Some("let cached = compute();")
+        );
+        assert!(result.body.contains("let cached = compute();"));
     }
 
     #[test]

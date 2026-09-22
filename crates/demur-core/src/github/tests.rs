@@ -777,6 +777,49 @@ async fn diff_anchored_findings_post_as_threaded_inline_comments() {
     assert!(outcome.published);
 }
 
+#[test]
+fn a_dismissed_reconciled_thread_suppresses_every_concern() {
+    // Resolving the thread dismisses the finding as a whole: the next run
+    // republishes nothing for that line, whichever concern leads.
+    let files = crate::diff::parse_unified_diff(UNRELATED_DIFF);
+    let ingestion = crate::ingest::ingest(&files, &config());
+    let cluster_hunks: std::collections::HashMap<String, Vec<crate::diff::Hunk>> = ingestion
+        .clusters
+        .iter()
+        .map(|cluster| (cluster.path.clone(), cluster.hunks.clone()))
+        .collect();
+    let reconciled = crate::pipeline::findings::Finding {
+        file: "src/other.rs".to_string(),
+        start_line: 1,
+        end_line: 1,
+        severity: crate::config::Severity::Blocker,
+        message: "unchecked index".to_string(),
+        harm: "Merging panics the request handler on an empty slice.".to_string(),
+        suggestion: None,
+        further_concerns: vec![crate::pipeline::findings::Concern {
+            message: "redundant flag".to_string(),
+            harm: "Merging ships a dead store that misleads the next reader.".to_string(),
+            suggestion: None,
+        }],
+    };
+    let (fingerprints, comments) = super::flow::anchor_findings(
+        std::slice::from_ref(&reconciled),
+        &ingestion,
+        &cluster_hunks,
+        &Default::default(),
+    );
+    assert_eq!(fingerprints.len(), 1);
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].body.contains("redundant flag"));
+
+    let suppress: std::collections::HashSet<String> =
+        fingerprints.iter().map(|(_, fp)| fp.clone()).collect();
+    let (fingerprints, comments) =
+        super::flow::anchor_findings(&[reconciled], &ingestion, &cluster_hunks, &suppress);
+    assert!(fingerprints.is_empty());
+    assert!(comments.is_empty());
+}
+
 #[tokio::test]
 async fn several_concerns_on_one_line_post_as_one_inline_comment() {
     // Two findings about the same line are one thread: the reconciled
