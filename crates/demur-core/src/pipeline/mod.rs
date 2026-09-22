@@ -363,18 +363,19 @@ pub async fn run(
     let triage_task = "Triage the changed hunks. For each file cluster, suggest review \
 lenses from: correctness, security, performance, style. Also report any finding \
 you can already anchor to an exact file and line range with its concrete harm.";
-    let triage_full = prompt::assemble(&context, triage_task, &prompt::findings_schema());
-    let triage_shrunk = prompt::assemble(&shrunk_context, triage_task, &prompt::findings_schema());
+    let triage_schema = prompt::triage_schema();
+    let triage_full = prompt::assemble(&context, triage_task);
+    let triage_shrunk = prompt::assemble(&shrunk_context, triage_task);
     log::info!(
         "triage: ~{} input tokens estimated on {}",
-        estimate_prompt(&triage_full),
+        estimate_prompt(&triage_full, &triage_schema),
         config.models.triage.name
     );
     let triage_started = std::time::Instant::now();
     let estimate = PassEstimate {
         pass: "triage",
-        full_tokens: estimate_prompt(&triage_full),
-        shrunk_tokens: estimate_prompt(&triage_shrunk),
+        full_tokens: estimate_prompt(&triage_full, &triage_schema),
+        shrunk_tokens: estimate_prompt(&triage_shrunk, &triage_schema),
         max_output_tokens: config.limits.max_tokens,
         price: &triage_price,
         downgrade_price: None,
@@ -399,7 +400,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
     let triage_result = match call_pass::<findings::TriageOutput>(
         &registry.triage,
         triage_prompt,
-        prompt::findings_schema(),
+        triage_schema,
         "triage",
         config.limits.max_tokens,
         triage_cache,
@@ -598,13 +599,13 @@ publishing coverage it could not establish",
 rollback safety, concurrency hazards, migration safety, and breaking interface \
 changes. Report only findings you can anchor to an exact file and line range \
 with their concrete harm.";
-        let full_prompt = prompt::assemble(&context, task, &prompt::cross_examination_schema());
-        let shrunk_prompt =
-            prompt::assemble(&shrunk_context, task, &prompt::cross_examination_schema());
+        let cross_schema = prompt::cross_examination_schema();
+        let full_prompt = prompt::assemble(&context, task);
+        let shrunk_prompt = prompt::assemble(&shrunk_context, task);
         let estimate = PassEstimate {
             pass: "cross-examination",
-            full_tokens: estimate_prompt(&full_prompt),
-            shrunk_tokens: estimate_prompt(&shrunk_prompt),
+            full_tokens: estimate_prompt(&full_prompt, &cross_schema),
+            shrunk_tokens: estimate_prompt(&shrunk_prompt, &cross_schema),
             max_output_tokens: config.limits.max_tokens,
             price: &deep_price,
             downgrade_price: Some(&triage_price),
@@ -652,7 +653,7 @@ with their concrete harm.";
             let cross = call_pass::<findings::ModelFindings>(
                 provider,
                 chosen,
-                prompt::cross_examination_schema(),
+                cross_schema,
                 "cross-examination",
                 config.limits.max_tokens,
                 if downgrade { triage_cache } else { deep_cache },
@@ -785,11 +786,12 @@ async fn synthesize_review(
 based only on the findings listed above. If no findings are listed, state that \
 coverage was complete and no defect was established.";
         let cheap_verdict_price = ModelPrice::from_model(&config.models.triage);
-        let summary_prompt = prompt::assemble(&context, task, &summary_schema());
+        let summary_prompt = prompt::assemble(&context, task);
+        let summary_schema = summary_schema();
         let decision = gate.authorize(PassEstimate {
             pass: "verdict summary",
-            full_tokens: estimate_prompt(&summary_prompt),
-            shrunk_tokens: estimate_prompt(&summary_prompt),
+            full_tokens: estimate_prompt(&summary_prompt, &summary_schema),
+            shrunk_tokens: estimate_prompt(&summary_prompt, &summary_schema),
             max_output_tokens: config.limits.max_tokens,
             price: verdict_price,
             downgrade_price: Some(&cheap_verdict_price),
@@ -829,7 +831,7 @@ coverage was complete and no defect was established.";
                 match call_pass::<SummaryOutput>(
                     provider,
                     summary_prompt,
-                    summary_schema(),
+                    summary_schema,
                     "verdict summary",
                     config.limits.max_tokens,
                     summary_cache,
@@ -1257,16 +1259,17 @@ async fn run_deep_dive(
     let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
     let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
     let task = deep_dive_task(lens);
-    let full_prompt = prompt::assemble(&context, &task, &prompt::findings_schema());
-    let shrunk_prompt = prompt::assemble(&shrunk, &task, &prompt::findings_schema());
+    let schema = prompt::findings_schema();
+    let full_prompt = prompt::assemble(&context, &task);
+    let shrunk_prompt = prompt::assemble(&shrunk, &task);
 
     // The lock is held for the decision only, never across the call.
     let decision = {
         let mut gate = gate.lock().expect("budget gate lock");
         gate.authorize(PassEstimate {
             pass: "deep dive",
-            full_tokens: estimate_prompt(&full_prompt),
-            shrunk_tokens: estimate_prompt(&shrunk_prompt),
+            full_tokens: estimate_prompt(&full_prompt, &schema),
+            shrunk_tokens: estimate_prompt(&shrunk_prompt, &schema),
             max_output_tokens: config.limits.max_tokens,
             price: deep_price,
             downgrade_price: Some(triage_price),
@@ -1293,15 +1296,11 @@ async fn run_deep_dive(
         &registry.deep
     };
     let pass_cache = if downgraded { triage_cache } else { deep_cache };
-    let chosen = if shrink {
-        shrunk_prompt.clone()
-    } else {
-        full_prompt
-    };
+    let base_prompt = if shrink { shrunk_prompt } else { full_prompt };
     let dived = call_pass::<findings::ModelFindings>(
         provider,
-        chosen,
-        prompt::findings_schema(),
+        base_prompt.clone(),
+        schema,
         "deep dive",
         config.limits.max_tokens,
         pass_cache,
@@ -1312,7 +1311,7 @@ async fn run_deep_dive(
             // Shrink to the first hunk and retry once.
             call_pass::<findings::ModelFindings>(
                 provider,
-                shrunk_prompt,
+                prompt::assemble(&shrunk, &task),
                 prompt::findings_schema(),
                 "deep dive",
                 config.limits.max_tokens,
@@ -1405,11 +1404,6 @@ async fn run_deep_dive(
     // Retrieval rounds. The pass named what it wanted; the bot decides
     // what each name means and whether it is willing to read it.
     let mut result = result;
-    let base_prompt = if shrink {
-        prompt::assemble(&shrunk, &task, &prompt::findings_schema())
-    } else {
-        prompt::assemble(&context, &task, &prompt::findings_schema())
-    };
     if let Some(retriever) = retriever {
         let rounds = config.retrieval.max_rounds;
         for round in 1..=rounds {
@@ -1432,8 +1426,8 @@ async fn run_deep_dive(
                 let mut gate = gate.lock().expect("budget gate lock");
                 gate.authorize(PassEstimate {
                     pass: "retrieval round",
-                    full_tokens: estimate_prompt(&round_prompt),
-                    shrunk_tokens: estimate_prompt(&round_prompt),
+                    full_tokens: estimate_prompt(&round_prompt, &prompt::findings_schema()),
+                    shrunk_tokens: estimate_prompt(&round_prompt, &prompt::findings_schema()),
                     max_output_tokens: config.limits.max_tokens,
                     price: if downgraded { triage_price } else { deep_price },
                     downgrade_price: None,
@@ -1573,10 +1567,12 @@ fn billed_usage(err: &ProviderError) -> Option<TokenUsage> {
 }
 
 /// Estimate the input tokens a pass will actually send. The system rules
-/// and the schema travel with every request, so an estimate over the
-/// context alone underprices every pass.
-fn estimate_prompt(prompt: &prompt::Prompt) -> u64 {
-    estimate_tokens(&prompt.system) + estimate_tokens(&prompt.user)
+/// and the schema travel with every request (embedded by the transport),
+/// so an estimate over the context alone underprices every pass.
+fn estimate_prompt(prompt: &prompt::Prompt, schema: &serde_json::Value) -> u64 {
+    estimate_tokens(&prompt.system)
+        + estimate_tokens(&prompt.user)
+        + estimate_tokens(&schema.to_string())
 }
 
 fn severity_word(severity: crate::config::Severity) -> &'static str {
