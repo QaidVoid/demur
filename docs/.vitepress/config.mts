@@ -50,6 +50,7 @@ export default defineConfig({
           { text: 'The resume cache', link: '/guide/cache' },
           { text: 'Delta reviews', link: '/guide/delta-reviews' },
           { text: 'Providers', link: '/guide/providers' },
+          { text: 'Driving from Claude Code', link: '/guide/claude-code' },
           { text: 'Security model', link: '/guide/security' }
         ]
       },

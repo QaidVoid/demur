@@ -2,8 +2,9 @@
 
 demur supports any OpenAI-compatible endpoint with a configurable base URL
 (covering hosted APIs, gateways, and self-hosted runtimes such as vLLM or
-Ollama) and the Anthropic API natively. Every pipeline role names a model,
-and every role may use a different provider.
+Ollama), the Anthropic API natively, and a local Claude Code installation
+driven headlessly. Every pipeline role names a model, and every role may
+use a different provider.
 
 ## Provider configuration
 
@@ -11,7 +12,7 @@ A named provider lives under `[providers.<name>]`:
 
 ```toml
 [providers.openai]
-family = "openai"                      # openai or anthropic
+family = "openai"                      # openai, anthropic, or claude-code
 base_url = "https://api.openai.com/v1"
 key_env = "OPENAI_API_KEY"             # environment variable holding the key
 ```
@@ -22,6 +23,10 @@ family = "anthropic"
 base_url = "https://api.anthropic.com"
 key_env = "ANTHROPIC_API_KEY"
 ```
+
+The `claude-code` family takes neither a URL nor a key: each pass runs as
+a local headless process that holds its own login. See
+[Driving demur from Claude Code](/guide/claude-code).
 
 ## Keys
 
