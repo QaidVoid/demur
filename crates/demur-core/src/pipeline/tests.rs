@@ -1868,3 +1868,64 @@ async fn a_degraded_run_still_discloses_under_a_reordering_template() {
         );
     }
 }
+
+#[tokio::test]
+async fn triage_prompts_carry_ingested_clusters_not_the_raw_diff() {
+    // The fixture diff includes Cargo.lock, which ingest drops. The raw
+    // diff text must not leak into the triage prompt through any door.
+    let config = config_with("quick", "");
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![],
+        vec![summary_response()],
+    ]);
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+    let RunOutcome::Review(_) = outcome else {
+        panic!("expected a review");
+    };
+    let requests = recorded(&providers.triage).requests();
+    let sent = &requests[0].user;
+    assert!(sent.contains("File: src/auth/token.rs"), "{sent}");
+    assert!(sent.contains("File: src/util.rs"), "{sent}");
+    assert!(!sent.contains("Cargo.lock"), "raw diff leaked: {sent}");
+    assert!(!sent.contains("[[package]]"), "raw diff leaked: {sent}");
+}
+
+#[tokio::test]
+async fn cross_examination_prompts_carry_ingested_clusters_not_the_raw_diff() {
+    let config = config_with("deep", "");
+    let cross = json!({
+        "findings": [],
+        "context_requests": []
+    });
+    let providers = registry(vec![
+        vec![triage_response()],
+        vec![
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+            cross,
+        ],
+        vec![summary_response()],
+    ]);
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+    let RunOutcome::Review(_) = outcome else {
+        panic!("expected a review");
+    };
+    let requests = recorded(&providers.deep).requests();
+    let cross_request = requests
+        .iter()
+        .find(|request| request.user.contains("Cross-examine"))
+        .expect("cross-examination ran");
+    assert!(
+        cross_request.user.contains("File: src/auth/token.rs"),
+        "{cross_request:?}"
+    );
+    assert!(
+        !cross_request.user.contains("Cargo.lock"),
+        "raw diff leaked: {cross_request:?}"
+    );
+}

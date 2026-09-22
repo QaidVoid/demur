@@ -358,7 +358,7 @@ pub async fn run(
     }
 
     // Triage.
-    let context = prompt::repository_context(&input.meta, &input.diff_text);
+    let context = prompt::repository_context(&input.meta, &rendered_clusters(input));
     let shrunk_context = prompt::repository_context(&input.meta, &shrunk_diff_text(input));
     let triage_task = "Triage the changed hunks. For each file cluster, suggest review \
 lenses from: correctness, security, performance, style. Also report any finding \
@@ -592,7 +592,7 @@ publishing coverage it could not establish",
 
     // Cross-examination, deep profile only.
     if profile == Profile::Deep {
-        let context = prompt::repository_context(&input.meta, &input.diff_text);
+        let context = prompt::repository_context(&input.meta, &rendered_clusters(input));
         let shrunk_context = prompt::repository_context(&input.meta, &shrunk_diff_text(input));
         let task = "Cross-examine this pull request adversarially: adversarial inputs, \
 rollback safety, concurrency hazards, migration safety, and breaking interface \
@@ -1160,15 +1160,24 @@ fn select_lenses(
     }
 }
 
+/// The full ingested pull request, rendered the way every pass sees it:
+/// one heading per cluster, then its hunks. The raw diff text never
+/// enters a prompt.
+fn rendered_clusters(input: &PipelineInput) -> String {
+    prompt::clusters_text(
+        input
+            .ingestion
+            .clusters
+            .iter()
+            .map(|cluster| (cluster.path.as_str(), cluster.hunks.as_slice())),
+    )
+}
+
 fn shrunk_diff_text(input: &PipelineInput) -> String {
-    let mut text = String::new();
-    for cluster in input.ingestion.clusters.iter().take(5) {
-        text.push_str(&format!("File: {}\n", cluster.path));
-        for hunk in cluster.hunks.iter().take(2) {
-            text.push_str(&hunk.render());
-        }
-    }
-    text
+    prompt::clusters_text(input.ingestion.clusters.iter().take(5).map(|cluster| {
+        let width = cluster.hunks.len().min(2);
+        (cluster.path.as_str(), &cluster.hunks[..width])
+    }))
 }
 
 /// Open the resume cache when configuration asks for one. A location that
