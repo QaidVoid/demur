@@ -215,7 +215,7 @@ impl Body<'_> {
                 if self.omitted > 0 {
                     let (omitted, budget) = (self.omitted, self.comment_budget);
                     body.push_str(&format!(
-                        "### Omitted findings\n\n{omitted} finding(s) were omitted beyond the comment budget of {budget}.\n\n"
+                        "### Omitted findings\n\n{omitted} location(s) were omitted beyond the comment budget of {budget}.\n\n"
                     ));
                 }
             }
@@ -458,7 +458,7 @@ mod tests {
         let result = synthesize(input(findings, vec![Severity::Blocker], 10));
         assert_eq!(result.published.len(), 10);
         assert_eq!(result.omitted, 30);
-        assert!(result.body.contains("30 finding(s) were omitted"));
+        assert!(result.body.contains("30 location(s) were omitted"));
     }
 
     #[test]
@@ -574,6 +574,42 @@ mod tests {
             synthesize(input(spread, vec![Severity::Blocker], 10)).verdict,
             synthesize(input(same_line, vec![Severity::Blocker], 10)).verdict
         );
+    }
+
+    #[test]
+    fn concerns_across_fewer_locations_than_the_budget_omit_nothing() {
+        let mut findings: Vec<Finding> = (0..6)
+            .map(|i| finding(Severity::Note, "a.rs", &format!("concern number {i}")))
+            .collect();
+        let mut elsewhere = finding(Severity::Note, "b.rs", "elsewhere");
+        elsewhere.start_line = 9;
+        elsewhere.end_line = 9;
+        findings.push(elsewhere);
+        let result = synthesize(input(findings, vec![Severity::Blocker], 10));
+        assert_eq!(result.published.len(), 2);
+        assert_eq!(result.omitted, 0);
+    }
+
+    #[test]
+    fn omission_counts_locations_not_concerns() {
+        let mut findings: Vec<Finding> = (0..10)
+            .map(|i| {
+                let mut finding = finding(
+                    Severity::Blocker,
+                    "z.rs",
+                    &format!("blocking defect number {i}"),
+                );
+                let line = i + 1;
+                finding.start_line = line;
+                finding.end_line = line;
+                finding
+            })
+            .collect();
+        findings.extend((0..6).map(|i| finding(Severity::Note, "a.rs", &format!("note {i}"))));
+        let result = synthesize(input(findings, vec![Severity::Blocker], 10));
+        assert_eq!(result.published.len(), 10);
+        assert_eq!(result.omitted, 1);
+        assert!(result.body.contains("1 location(s) were omitted"));
     }
 
     #[test]

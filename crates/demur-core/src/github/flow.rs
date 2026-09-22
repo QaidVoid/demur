@@ -334,6 +334,12 @@ fn render_comment(finding: &Finding, fingerprint: &str) -> String {
         body.push('\n');
         body.push_str("```\n");
     }
+    for concern in &finding.further_concerns {
+        body.push_str(&format!(
+            "\n---\n\n**{}**\n\n{}\n",
+            concern.message, concern.harm
+        ));
+    }
     body.push_str(&format!("<!-- demur:fp {fingerprint} -->"));
     body
 }

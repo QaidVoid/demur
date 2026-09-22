@@ -777,6 +777,102 @@ async fn diff_anchored_findings_post_as_threaded_inline_comments() {
     assert!(outcome.published);
 }
 
+#[tokio::test]
+async fn several_concerns_on_one_line_post_as_one_inline_comment() {
+    // Two findings about the same line are one thread: the reconciled
+    // finding carries both concerns, and a reviewer resolves one thread.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7, "draft": false, "title": "t", "body": "b",
+            "head": {"sha": "newhead"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UNRELATED_DIFF))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("review body is json");
+            let comments = body["comments"].as_array().expect("comments array");
+            assert_eq!(
+                comments.len(),
+                1,
+                "one location is one comment: {comments:?}"
+            );
+            let text = comments[0]["body"].as_str().unwrap_or_default();
+            assert!(text.contains("unchecked index"), "{text}");
+            assert!(text.contains("redundant flag"), "{text}");
+            assert!(text.contains("panics the request handler"), "{text}");
+            assert!(text.contains("dead store"), "{text}");
+            assert_eq!(
+                text.matches("demur:fp").count(),
+                1,
+                "one fingerprint: {text}"
+            );
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [],
+            "cluster_lens": [{"path": "src/other.rs", "lenses": ["correctness"]}]
+        }))]),
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [
+                {
+                    "file": "src/other.rs",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "severity": "blocker",
+                    "message": "unchecked index",
+                    "harm": "Merging panics the request handler on an empty slice."
+                },
+                {
+                    "file": "src/other.rs",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "severity": "note",
+                    "message": "redundant flag",
+                    "harm": "Merging ships a dead store that misleads the next reader."
+                }
+            ]
+        }))]),
+        RecordedProvider::new(vec![Ok(json!({"summary": "s"}))]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &config(), 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+}
+
 /// Refuses the first review event with the status and body given, then
 /// accepts whatever comes next.
 struct RefuseFirst {
