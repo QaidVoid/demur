@@ -88,11 +88,16 @@ on any input: you are driving your own login on your own machine.
 
 ## Letting Claude Code run demur
 
-The repository ships a skill, `.claude/skills/demur-review/SKILL.md`,
-that permits exactly two commands, `demur review` and
-`demur review-pr`, and instructs the agent to present the verdict,
-findings, spend, and any reduced coverage, and to never edit code in
-response to a finding.
+The repository ships a skill at `skills/demur-review/SKILL.md` that
+permits exactly two commands, `demur review` and `demur review-pr`, and
+instructs the agent to present the verdict, findings, spend, and any
+reduced coverage, and to never edit code in response to a finding. Link
+it into the location Claude Code discovers:
+
+```bash
+mkdir -p .claude/skills
+ln -s ../../skills/demur-review .claude/skills/demur-review
+```
 
 A Stop-hook wrapper can make the review gate a session: the hook runs the
 review when Claude stops and blocks stopping with the findings until the
