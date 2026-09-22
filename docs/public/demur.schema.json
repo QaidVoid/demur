@@ -166,6 +166,11 @@
           "const": "anthropic",
           "description": "The native Anthropic API.",
           "type": "string"
+        },
+        {
+          "const": "claude-code",
+          "description": "A local headless Claude Code installation, driven as a subprocess.\nNeeds no key and no URL: the process uses the login its own\ninstallation holds.",
+          "type": "string"
         }
       ]
     },
@@ -370,7 +375,8 @@
       "description": "A named provider endpoint.",
       "properties": {
         "base_url": {
-          "description": "API base URL.",
+          "default": "",
+          "description": "API base URL. Required for the openai and anthropic families,\nunused by claude-code.",
           "type": "string"
         },
         "extra_body": {
@@ -398,7 +404,8 @@
           "description": "Provider family dialect."
         },
         "key_env": {
-          "description": "Environment variable holding the API key.",
+          "default": "",
+          "description": "Environment variable holding the API key. Required for the openai\nand anthropic families, unused by claude-code.",
           "type": "string"
         },
         "key_file": {
@@ -410,9 +417,7 @@
         }
       },
       "required": [
-        "family",
-        "base_url",
-        "key_env"
+        "family"
       ],
       "type": "object"
     },

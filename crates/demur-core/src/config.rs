@@ -185,6 +185,11 @@ pub enum Family {
     OpenAi,
     /// The native Anthropic API.
     Anthropic,
+    /// A local headless Claude Code installation, driven as a subprocess.
+    /// Needs no key and no URL: the process uses the login its own
+    /// installation holds.
+    #[serde(rename = "claude-code")]
+    ClaudeCode,
 }
 
 /// Review depth profiles.
@@ -701,9 +706,13 @@ pub const DEFAULT_RULE_SEVERITY: Severity = Severity::Warning;
 pub struct ProviderDef {
     /// Provider family dialect.
     pub family: Family,
-    /// API base URL.
+    /// API base URL. Required for the openai and anthropic families,
+    /// unused by claude-code.
+    #[serde(default)]
     pub base_url: String,
-    /// Environment variable holding the API key.
+    /// Environment variable holding the API key. Required for the openai
+    /// and anthropic families, unused by claude-code.
+    #[serde(default)]
     pub key_env: String,
     /// File holding the API key, for local runs.
     pub key_file: Option<PathBuf>,
@@ -865,6 +874,11 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
         });
     }
     for (name, provider) in &config.providers {
+        if provider.family == Family::ClaudeCode {
+            // The subprocess holds its own login: no URL to reach and no
+            // key to name, so there is nothing to check here.
+            continue;
+        }
         if !provider.base_url.starts_with("https://") && !provider.base_url.starts_with("http://") {
             return Err(ConfigError::Invalid {
                 field: format!("providers.{name}.base_url"),
@@ -1129,7 +1143,7 @@ output_price = 10.00
     fn missing_provider_key_env_names_the_field() {
         let text = minimal().replace("key_env = \"OPENAI_API_KEY\"\n", "");
         let text = err_text(&text);
-        assert!(text.contains("missing field `key_env`"));
+        assert!(text.contains("providers.openai.key_env"));
     }
 
     #[test]
@@ -1580,5 +1594,62 @@ output_price = 0.60
         Config::from_toml(text)
             .expect_err("config should not parse")
             .to_string()
+    }
+
+    fn subscription_only() -> String {
+        r#"
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+
+[models.deep]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+"#
+        .to_string()
+    }
+
+    #[test]
+    fn claude_code_provider_needs_no_url_or_key() {
+        let config = Config::from_toml(&subscription_only()).unwrap();
+        assert_eq!(config.providers["claude"].family, Family::ClaudeCode);
+        assert_eq!(config.models.triage.provider, "claude");
+    }
+
+    #[test]
+    fn claude_code_rejects_reasoning_knobs() {
+        let text = subscription_only().replace(
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\n\n[models.verdict]",
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\nthinking_budget = 8000\n\n[models.verdict]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.thinking_budget"));
+
+        let text = subscription_only().replace(
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\n\n[models.verdict]",
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\nreasoning_effort = \"high\"\n\n[models.verdict]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.reasoning_effort"));
+    }
+
+    #[test]
+    fn http_families_still_require_url_and_key() {
+        let text = subscription_only().replace("family = \"claude-code\"", "family = \"openai\"");
+        let text = err_text(&text);
+        assert!(text.contains("providers.claude.base_url"));
     }
 }

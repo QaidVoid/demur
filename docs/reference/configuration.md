@@ -118,10 +118,32 @@ the budget.
 
 ```toml
 [providers.openai]
-family = "openai"                  # "openai" or "anthropic"
+family = "openai"                  # "openai", "anthropic", or "claude-code"
 base_url = "https://api.openai.com/v1"
 key_env = "OPENAI_API_KEY"
 key_file = "/home/me/.secrets/openai"   # optional, local runs
+```
+
+The `openai` family speaks to any OpenAI-compatible endpoint, including
+gateways and self-hosted runtimes. The `anthropic` family speaks to the
+Anthropic API natively.
+
+The `claude-code` family runs each pass through a local headless Claude
+Code installation instead of an HTTP endpoint. It takes no `base_url` and
+no `key_env`: the subprocess holds its own login, so a subscription can
+drive a review with no API key in demur's configuration at all. Prices
+are still required, because the budget gate prices every pass before it
+runs.
+
+```toml
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
 ```
 
 Passthrough parameters are forwarded unmodified:

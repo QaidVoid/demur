@@ -2,9 +2,11 @@
 //! key resolution with redaction, and bounded retries.
 
 mod anthropic;
+mod claude;
 mod openai;
 
 pub use anthropic::AnthropicClient;
+pub use claude::ClaudeCodeClient;
 pub use openai::OpenAiClient;
 
 /// First bytes of a provider response body, for error detail.
@@ -238,10 +240,17 @@ fn build_role(model: &ModelDef, config: &Config) -> Result<AnyProvider, Provider
                 model.provider
             ),
         })?;
-    let key = resolve_key(provider)?;
     Ok(match provider.family {
-        Family::OpenAi => AnyProvider::OpenAi(OpenAiClient::new(provider, model, key)?),
-        Family::Anthropic => AnyProvider::Anthropic(AnthropicClient::new(provider, model, key)?),
+        Family::OpenAi => {
+            let key = resolve_key(provider)?;
+            AnyProvider::OpenAi(OpenAiClient::new(provider, model, key)?)
+        }
+        Family::Anthropic => {
+            let key = resolve_key(provider)?;
+            AnyProvider::Anthropic(AnthropicClient::new(provider, model, key)?)
+        }
+        // The subprocess holds its own login, so no key is resolved here.
+        Family::ClaudeCode => AnyProvider::ClaudeCode(ClaudeCodeClient::new(model)),
     })
 }
 
@@ -251,6 +260,8 @@ pub enum AnyProvider {
     OpenAi(OpenAiClient),
     /// The native Anthropic API.
     Anthropic(AnthropicClient),
+    /// A local headless Claude Code installation.
+    ClaudeCode(ClaudeCodeClient),
     /// Recorded responses, for the fixture harness and offline replay.
     Recorded(crate::pipeline::RecordedProvider),
 }
@@ -263,6 +274,7 @@ impl Provider for AnyProvider {
         match self {
             AnyProvider::OpenAi(client) => client.complete(request).await,
             AnyProvider::Anthropic(client) => client.complete(request).await,
+            AnyProvider::ClaudeCode(client) => client.complete(request).await,
             AnyProvider::Recorded(client) => client.complete(request).await,
         }
     }
@@ -439,5 +451,78 @@ mod tests {
         assert!(!is_retryable(&ProviderError::ContextOverflow {
             message: String::new()
         }));
+    }
+
+    fn subscription_only_config() -> Config {
+        let text = r#"
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+
+[models.deep]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+"#;
+        Config::from_toml(text).unwrap()
+    }
+
+    #[test]
+    fn a_subscription_only_configuration_builds_without_a_key() {
+        let registry = ProviderRegistry::from_config(&subscription_only_config()).unwrap();
+        assert!(matches!(registry.triage, AnyProvider::ClaudeCode(_)));
+        assert!(matches!(registry.deep, AnyProvider::ClaudeCode(_)));
+        assert!(matches!(registry.verdict, AnyProvider::ClaudeCode(_)));
+    }
+
+    #[test]
+    fn a_missing_http_key_still_fails_with_guidance() {
+        let config_text = r#"
+[providers.openai]
+family = "openai"
+base_url = "https://api.openai.test/v1"
+key_env = "DEMUR_TEST_MISSING_REGISTRY_KEY"
+
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "openai"
+name = "gpt-test"
+input_price = 0.15
+output_price = 0.60
+
+[models.deep]
+provider = "claude"
+name = "claude-sonnet-4-5"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "openai"
+name = "gpt-test"
+input_price = 0.15
+output_price = 0.60
+"#;
+        unsafe { env::remove_var("DEMUR_TEST_MISSING_REGISTRY_KEY") };
+        let config = Config::from_toml(config_text).unwrap();
+        let err = match ProviderRegistry::from_config(&config) {
+            Err(err) => err,
+            Ok(_) => panic!("registry should not build without the key"),
+        };
+        assert!(matches!(err, ProviderError::Auth { .. }), "{err}");
+        assert!(err.to_string().contains("DEMUR_TEST_MISSING_REGISTRY_KEY"));
     }
 }
