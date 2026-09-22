@@ -106,7 +106,7 @@ exit status are the whole contract:
 
 ```bash
 #!/bin/bash
-# .claude/hooks/demur-stop.sh — stop-hook: block on demur's verdict.
+# .claude/hooks/demur-stop.sh, a stop hook that blocks on demur's verdict
 out=$(demur review --format json 2>/dev/null)
 status=$?
 [ $status -eq 2 ] && exit 0   # a failed run is reported, not a blocker
