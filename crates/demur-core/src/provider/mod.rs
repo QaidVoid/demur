@@ -65,6 +65,12 @@ pub struct CompletionResponse {
     pub content: Value,
     /// Token usage reported for the call.
     pub usage: TokenUsage,
+    /// Cost the provider itself reported, when its transport carries one.
+    /// HTTP transports leave this empty; the keyless process transport
+    /// fills it from the agent's own accounting.
+    pub reported_cost: Option<f64>,
+    /// The model the provider says actually answered, when it reports one.
+    pub reported_model: Option<String>,
 }
 
 /// Classified provider failures. Variants carry redacted messages only.

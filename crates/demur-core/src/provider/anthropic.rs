@@ -173,6 +173,8 @@ impl Provider for AnthropicClient {
                 cached_input_tokens: cache_reads,
                 output_tokens: usage.output_tokens,
             },
+            reported_cost: None,
+            reported_model: None,
         })
     }
 }

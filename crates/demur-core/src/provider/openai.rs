@@ -158,6 +158,8 @@ impl Provider for OpenAiClient {
                 cached_input_tokens: cached.unwrap_or(0),
                 output_tokens: usage.completion_tokens,
             },
+            reported_cost: None,
+            reported_model: None,
         })
     }
 }

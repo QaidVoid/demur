@@ -394,6 +394,118 @@ async fn triage_double_overflow_fails_the_run() {
     ));
 }
 
+/// A shell script standing in for the headless claude binary.
+fn claude_fixture(name: &str, stdout: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("demur-pipeline-claude-{name}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("claude");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\ncat > /dev/null\nprintf '%s' {}\n",
+            sh_quote(stdout)
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+fn claude_config() -> Config {
+    let text = r#"
+profile = "quick"
+
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.deep]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+"#;
+    let mut config = Config::from_toml(text).unwrap();
+    config.review.template.sections = ["spend", "models"]
+        .iter()
+        .map(|name| {
+            *crate::config::Section::ALL
+                .iter()
+                .find(|section| section.name() == *name)
+                .unwrap()
+        })
+        .collect();
+    config
+}
+
+#[tokio::test]
+async fn a_claude_code_pass_books_its_reported_cost_and_model() {
+    let answer = serde_json::json!({
+        "result": "{\"findings\": [], \"cluster_lens\": []}",
+        "is_error": false,
+        "total_cost_usd": 0.0123,
+        "modelUsage": {"claude-sonnet-4-5-20260101": {"costUSD": 0.0123}}
+    })
+    .to_string();
+    let triage =
+        crate::provider::AnyProvider::ClaudeCode(crate::provider::ClaudeCodeClient::for_tests(
+            claude_fixture("costed", &answer),
+            std::time::Duration::from_secs(60),
+        ));
+    let providers = ProviderRegistry {
+        triage,
+        deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
+        verdict: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![Ok(
+            summary_response(),
+        )])),
+    };
+
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &claude_config(), &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let triage_spend = &review.spend.passes[0];
+    assert_eq!(triage_spend.pass, "triage");
+    assert!(
+        (triage_spend.cost - 0.0123).abs() < 1e-9,
+        "{}",
+        triage_spend.cost
+    );
+    assert_eq!(triage_spend.model, "claude-sonnet-4-5-20260101");
+    assert_eq!(
+        triage_spend.cost_source,
+        crate::pipeline::CostSource::AgentReported
+    );
+    assert!(
+        review
+            .body
+            .contains("triage spend: $0.0123 (agent-reported)"),
+        "{}",
+        review.body
+    );
+    assert!(review.body.contains("claude-sonnet-4-5-20260101"));
+}
+
 #[tokio::test]
 async fn exhausted_budget_degrades_to_summary_only_with_disclosure() {
     // A cap that funds triage and the summary but no deep dive at deep

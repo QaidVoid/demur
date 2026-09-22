@@ -149,6 +149,8 @@ impl crate::provider::Provider for RecordedProvider {
                 Ok(content) => Ok(CompletionResponse {
                     content: content.clone(),
                     usage: self.usage,
+                    reported_cost: None,
+                    reported_model: None,
                 }),
                 Err(error) => Err(ProviderError::Rejected {
                     message: error.to_string(),
@@ -168,6 +170,8 @@ impl crate::provider::Provider for RecordedProvider {
             Ok(content) => Ok(CompletionResponse {
                 content,
                 usage: self.usage,
+                reported_cost: None,
+                reported_model: None,
             }),
             Err(error) => Err(error),
         }
@@ -221,6 +225,33 @@ pub struct PassSpend {
     /// The model this pass actually called. A pass the budget downgraded
     /// names the cheaper model it used, not the role's configured one.
     pub model: String,
+    /// How the cost figure was computed, disclosed in the spend section.
+    pub cost_source: CostSource,
+}
+
+/// How a pass's recorded cost figure was computed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CostSource {
+    /// Token counts priced at the configured rates: the ordinary HTTP pass.
+    TokenPrice,
+    /// Token counts at the configured rates because the agent transport
+    /// reported no cost figure of its own.
+    AgentTokenPrice,
+    /// The figure the agent's own accounting reported.
+    AgentReported,
+}
+
+impl CostSource {
+    /// Derive the disclosure from what the response carried.
+    pub fn from_response(reported_cost: Option<f64>, reported_model: Option<&str>) -> CostSource {
+        if reported_cost.is_some() {
+            CostSource::AgentReported
+        } else if reported_model.is_some() {
+            CostSource::AgentTokenPrice
+        } else {
+            CostSource::TokenPrice
+        }
+    }
 }
 
 /// Spend for one run.
@@ -443,6 +474,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     cost: gate.record(&usage, &triage_price),
                     resumed: false,
                     model: config.models.triage.name.clone(),
+                    cost_source: CostSource::TokenPrice,
                 });
             }
             return Ok(RunOutcome::Failed {
@@ -456,12 +488,24 @@ you can already anchor to an exact file and line range with its concrete harm.";
         triage_result.usage,
         triage_result.resumed,
     );
+    let triage_reported = (triage_result.reported_cost, triage_result.reported_model);
     spend.push(PassSpend {
         pass: "triage".to_string(),
         usage,
-        cost: settle_pass(&mut gate, triage_hold, &usage, &triage_price, resumed),
+        cost: settle_pass(
+            &mut gate,
+            triage_hold,
+            &usage,
+            &triage_price,
+            resumed,
+            triage_reported.0,
+        ),
         resumed,
-        model: config.models.triage.name.clone(),
+        model: triage_reported
+            .1
+            .clone()
+            .unwrap_or_else(|| config.models.triage.name.clone()),
+        cost_source: CostSource::from_response(triage_reported.0, triage_reported.1.as_deref()),
     });
     log::info!(
         "triage: {} finding(s) in {:.1?}, ${:.4}",
@@ -697,9 +741,17 @@ with their concrete harm.";
                             &result.usage,
                             paid_price,
                             result.resumed,
+                            result.reported_cost,
                         ),
                         resumed: result.resumed,
-                        model: model.clone(),
+                        model: result
+                            .reported_model
+                            .clone()
+                            .unwrap_or_else(|| model.clone()),
+                        cost_source: CostSource::from_response(
+                            result.reported_cost,
+                            result.reported_model.as_deref(),
+                        ),
                     });
                     result.output
                 }
@@ -720,6 +772,7 @@ with their concrete harm.";
                             cost: gate.record(&usage, paid_price),
                             resumed: false,
                             model: model.clone(),
+                            cost_source: CostSource::TokenPrice,
                         });
                     }
                     degradations.push(Degradation::PassFailed {
@@ -867,6 +920,11 @@ coverage was complete and no defect was established.";
                 .await
                 {
                     Ok(result) => {
+                        let configured = if downgrade {
+                            config.models.triage.name.clone()
+                        } else {
+                            config.models.verdict.name.clone()
+                        };
                         spend.push(PassSpend {
                             pass: "verdict summary".to_string(),
                             usage: result.usage,
@@ -876,13 +934,14 @@ coverage was complete and no defect was established.";
                                 &result.usage,
                                 paid_price,
                                 result.resumed,
+                                result.reported_cost,
                             ),
                             resumed: result.resumed,
-                            model: if downgrade {
-                                config.models.triage.name.clone()
-                            } else {
-                                config.models.verdict.name.clone()
-                            },
+                            model: result.reported_model.clone().unwrap_or(configured),
+                            cost_source: CostSource::from_response(
+                                result.reported_cost,
+                                result.reported_model.as_deref(),
+                            ),
                         });
                         Some(result.output.summary)
                     }
@@ -900,6 +959,7 @@ coverage was complete and no defect was established.";
                                 } else {
                                     config.models.verdict.name.clone()
                                 },
+                                cost_source: CostSource::TokenPrice,
                             });
                         }
                         degradations.push(Degradation::SummaryUnavailable {
@@ -925,7 +985,14 @@ coverage was complete and no defect was established.";
         degradations: degradations.clone(),
         spend_lines: spend
             .iter()
-            .map(|pass_spend| (pass_spend.pass.clone(), pass_spend.cost, pass_spend.resumed))
+            .map(|pass_spend| {
+                (
+                    pass_spend.pass.clone(),
+                    pass_spend.cost,
+                    pass_spend.resumed,
+                    pass_spend.cost_source,
+                )
+            })
             .collect(),
         prior_spend: input.prior_spend,
         summary,
@@ -994,6 +1061,8 @@ struct PassResult<T> {
     output: T,
     usage: TokenUsage,
     resumed: bool,
+    reported_cost: Option<f64>,
+    reported_model: Option<String>,
 }
 
 /// One provider call with schema-validated output and bounded retries.
@@ -1045,6 +1114,8 @@ Respond again with only a JSON object that matches it exactly."
                     output: parsed,
                     usage: entry.usage(),
                     resumed: true,
+                    reported_cost: None,
+                    reported_model: None,
                 });
             }
             Err(err) => {
@@ -1121,6 +1192,8 @@ retrying with {raised} output tokens"
                     output: parsed,
                     usage,
                     resumed: false,
+                    reported_cost: response.reported_cost,
+                    reported_model: response.reported_model,
                 });
             }
             Err(err) => {
@@ -1390,6 +1463,7 @@ async fn run_deep_dive(
                         } else {
                             config.models.deep.name.clone()
                         },
+                        cost_source: CostSource::TokenPrice,
                     });
                 }
             }
@@ -1407,7 +1481,14 @@ async fn run_deep_dive(
     let paid_price = if downgraded { triage_price } else { deep_price };
     let cost = {
         let mut gate = gate.lock().expect("budget gate lock");
-        settle_pass(&mut gate, hold, &result.usage, paid_price, result.resumed)
+        settle_pass(
+            &mut gate,
+            hold,
+            &result.usage,
+            paid_price,
+            result.resumed,
+            result.reported_cost,
+        )
     };
     let model = if downgraded {
         config.models.triage.name.clone()
@@ -1419,7 +1500,14 @@ async fn run_deep_dive(
         usage: result.usage,
         cost,
         resumed: result.resumed,
-        model: model.clone(),
+        model: result
+            .reported_model
+            .clone()
+            .unwrap_or_else(|| model.clone()),
+        cost_source: CostSource::from_response(
+            result.reported_cost,
+            result.reported_model.as_deref(),
+        ),
     }];
     log::info!(
         "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
@@ -1489,14 +1577,25 @@ async fn run_deep_dive(
                 Ok(next) => {
                     let round_cost = {
                         let mut gate = gate.lock().expect("budget gate lock");
-                        settle_pass(&mut gate, round_hold, &next.usage, paid_price, next.resumed)
+                        settle_pass(
+                            &mut gate,
+                            round_hold,
+                            &next.usage,
+                            paid_price,
+                            next.resumed,
+                            next.reported_cost,
+                        )
                     };
                     spend_lines.push(PassSpend {
                         pass: format!("deep dive {lens} on {} (round {round})", cluster.path),
                         usage: next.usage,
                         cost: round_cost,
                         resumed: next.resumed,
-                        model: model.clone(),
+                        model: next.reported_model.clone().unwrap_or_else(|| model.clone()),
+                        cost_source: CostSource::from_response(
+                            next.reported_cost,
+                            next.reported_model.as_deref(),
+                        ),
                     });
                     degradations.push(Degradation::ContextRetrieved {
                         pass: format!("deep dive ({lens}) on {}", cluster.path),
@@ -1577,12 +1676,13 @@ fn settle_pass(
     usage: &TokenUsage,
     price: &ModelPrice,
     resumed: bool,
+    reported_cost: Option<f64>,
 ) -> f64 {
     if resumed {
         gate.release(hold);
         price.cost_of_usage(usage)
     } else {
-        gate.settle(hold, usage, price)
+        gate.settle(hold, usage, price, reported_cost)
     }
 }
 

@@ -2,6 +2,7 @@
 //! ranking, the comment budget, and the review body rendering.
 
 use crate::config::Severity;
+use crate::pipeline::CostSource;
 use crate::pipeline::budget::Degradation;
 use crate::pipeline::findings::{Finding, prepare};
 
@@ -43,8 +44,9 @@ pub struct SynthesisInput {
     pub comment_budget: u32,
     /// Degradations applied during the run, always disclosed.
     pub degradations: Vec<Degradation>,
-    /// Spend per pass for this run, as (pass, cost, resumed) triples.
-    pub spend_lines: Vec<(String, f64, bool)>,
+    /// Spend per pass for this run, as (pass, cost, resumed, source)
+    /// tuples.
+    pub spend_lines: Vec<(String, f64, bool, CostSource)>,
     /// Spend recorded by earlier runs on this pull request.
     pub prior_spend: f64,
     /// Summary paragraph drafted by the verdict model, if available.
@@ -148,7 +150,7 @@ struct Body<'a> {
     beyond_budget: &'a [Finding],
     comment_budget: u32,
     degradations: &'a [Degradation],
-    spend_lines: &'a [(String, f64, bool)],
+    spend_lines: &'a [(String, f64, bool, CostSource)],
     prior_spend: f64,
     summary: &'a Option<String>,
     rules_skipped: bool,
@@ -259,30 +261,33 @@ has no pull request title or description to judge.\n",
                 let paid: f64 = self
                     .spend_lines
                     .iter()
-                    .filter(|(_, _, resumed)| !resumed)
-                    .map(|(_, cost, _)| cost)
+                    .filter(|(_, _, resumed, _)| !resumed)
+                    .map(|(_, cost, _, _)| cost)
                     .sum();
                 let inherited: f64 = self
                     .spend_lines
                     .iter()
-                    .filter(|(_, _, resumed)| *resumed)
-                    .map(|(_, cost, _)| cost)
+                    .filter(|(_, _, resumed, _)| *resumed)
+                    .map(|(_, cost, _, _)| cost)
                     .sum();
                 let run_total = paid + inherited;
-                for (pass, cost, resumed) in self.spend_lines {
-                    let note = if *resumed {
-                        " (resumed from cache)"
-                    } else {
-                        ""
+                for (pass, cost, resumed, source) in self.spend_lines {
+                    let mut note = match source {
+                        CostSource::TokenPrice => "",
+                        CostSource::AgentTokenPrice => " (token-priced)",
+                        CostSource::AgentReported => " (agent-reported)",
                     };
+                    if *resumed {
+                        note = " (resumed from cache)";
+                    }
                     body.push_str(&format!("- {pass} spend: {}{note}\n", money(*cost)));
                 }
                 if inherited > 0.0 {
                     let resumed: Vec<&str> = self
                         .spend_lines
                         .iter()
-                        .filter(|(_, _, resumed)| *resumed)
-                        .map(|(pass, _, _)| pass.as_str())
+                        .filter(|(_, _, resumed, _)| *resumed)
+                        .map(|(pass, _, _, _)| pass.as_str())
                         .collect();
                     body.push_str(&format!(
                         "- Paid by this run: {}\n- Inherited from an earlier attempt: {} ({})\n",
@@ -399,7 +404,7 @@ mod tests {
             block_on,
             comment_budget: budget,
             degradations: Vec::new(),
-            spend_lines: vec![("triage".to_string(), 0.0021, false)],
+            spend_lines: vec![("triage".to_string(), 0.0021, false, CostSource::TokenPrice)],
             prior_spend: 0.01,
             summary: None,
             rules_skipped: false,
@@ -722,8 +727,8 @@ mod tests {
                 unreviewed: vec!["big.rs".to_string()],
             }],
             spend_lines: vec![
-                ("triage".to_string(), 0.0021, false),
-                ("deep".to_string(), 0.1130, false),
+                ("triage".to_string(), 0.0021, false, CostSource::TokenPrice),
+                ("deep".to_string(), 0.1130, false, CostSource::TokenPrice),
             ],
             prior_spend: 0.25,
             summary: None,

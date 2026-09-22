@@ -2,11 +2,13 @@
 //! subprocess. The child holds its own login, so this path resolves no
 //! key and makes no network connection of its own.
 
+use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::time::Duration;
 
 use super::{CompletionRequest, CompletionResponse, Provider, ProviderError, TokenUsage};
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::process::Command;
 
 /// The bot's fixed command. Never taken from configuration and never
@@ -42,7 +44,7 @@ impl ClaudeCodeClient {
     }
 
     #[cfg(test)]
-    fn for_tests(binary: std::path::PathBuf, timeout: Duration) -> Self {
+    pub(crate) fn for_tests(binary: std::path::PathBuf, timeout: Duration) -> Self {
         ClaudeCodeClient {
             model: "test-model".to_string(),
             binary,
@@ -126,7 +128,7 @@ impl Provider for ClaudeCodeClient {
             });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let parsed: CliResult =
+        let mut parsed: CliResult =
             serde_json::from_str(stdout.trim()).map_err(|err| ProviderError::Request {
                 message: format!(
                     "answer is not the expected JSON document: {err}; output excerpt: {}",
@@ -141,9 +143,10 @@ impl Provider for ClaudeCodeClient {
                 ),
             });
         }
-        let result = parsed.result.unwrap_or_default();
+        let reported_model = parsed.observed_model();
+        let result = parsed.result.take().unwrap_or_default();
         let content = super::openai::parse_json_content(&result)?;
-        let usage = parsed.usage.unwrap_or_default();
+        let usage = parsed.usage.take().unwrap_or_default();
         Ok(CompletionResponse {
             content,
             usage: TokenUsage {
@@ -151,6 +154,8 @@ impl Provider for ClaudeCodeClient {
                 cached_input_tokens: usage.cache_read_input_tokens,
                 output_tokens: usage.output_tokens,
             },
+            reported_cost: parsed.total_cost_usd,
+            reported_model,
         })
     }
 }
@@ -170,6 +175,28 @@ struct CliResult {
     result: Option<String>,
     is_error: Option<bool>,
     usage: Option<CliUsage>,
+    total_cost_usd: Option<f64>,
+    #[serde(rename = "modelUsage")]
+    model_usage: Option<BTreeMap<String, Value>>,
+}
+
+impl CliResult {
+    /// The model that did the work: the CLI keys its model usage by the
+    /// model id, and a fallback spends the most where it answered.
+    fn observed_model(&self) -> Option<String> {
+        let usage = self.model_usage.as_ref()?;
+        usage
+            .iter()
+            .max_by_key(|(_, spent)| {
+                spent
+                    .get("costUSD")
+                    .or_else(|| spent.get("total_cost_usd"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0)
+                    .to_bits()
+            })
+            .map(|(model, _)| model.clone())
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -240,6 +267,44 @@ mod tests {
             }
         })
         .to_string()
+    }
+
+    #[tokio::test]
+    async fn the_answer_carries_the_reported_cost_and_model() {
+        let document = serde_json::json!({
+            "result": "{\"a\": 1}",
+            "is_error": false,
+            "total_cost_usd": 0.0123,
+            "modelUsage": {
+                "claude-sonnet-4-5-20260101": {"costUSD": 0.0123},
+                "claude-haiku-4-5-20260101": {"costUSD": 0.0001}
+            }
+        })
+        .to_string();
+        let (script, _dir) = fixture("costed", &format!("printf '%s' {}", sh_quote(&document)));
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        let response = complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap();
+        assert_eq!(response.reported_cost, Some(0.0123));
+        assert_eq!(
+            response.reported_model.as_deref(),
+            Some("claude-sonnet-4-5-20260101")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_cost_figure_stays_none() {
+        let (script, _dir) = fixture(
+            "uncosted",
+            &format!("printf '%s' {}", sh_quote(&result_document("{\"a\": 1}"))),
+        );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        let response = complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap();
+        assert_eq!(response.reported_cost, None);
+        assert_eq!(response.reported_model, None);
     }
 
     #[tokio::test]

@@ -330,15 +330,24 @@ impl BudgetGate {
 
     /// Release a hold and book what the provider actually reported. A hold
     /// is never recorded as spend: it is released and replaced by the
-    /// measured cost, so the recorded figure stays exact.
+    /// measured cost, so the recorded figure stays exact. A provider that
+    /// reports its own cost is booked at that figure; otherwise the token
+    /// counts are priced at the configured rates.
     pub fn settle(
         &mut self,
         hold: Hold,
         usage: &crate::provider::TokenUsage,
         price: &ModelPrice,
+        reported_cost: Option<f64>,
     ) -> f64 {
         self.release(hold);
-        self.record(usage, price)
+        match reported_cost {
+            Some(cost) => {
+                self.spent += cost;
+                cost
+            }
+            None => self.record(usage, price),
+        }
     }
 
     /// Release a hold for a pass that never reported usage. A failure must
@@ -602,12 +611,37 @@ mod tests {
             cached_input_tokens: 0,
             output_tokens: 10,
         };
-        let cost = gate.settle(hold, &usage, &deep);
+        let cost = gate.settle(hold, &usage, &deep, None);
         let expected = deep.cost_of_usage(&usage);
         assert!((cost - expected).abs() < 1e-12, "{cost} != {expected}");
         assert!(
             (gate.remaining() - (1.0 - expected)).abs() < 1e-12,
             "the hold must be released, leaving only actual spend: {}",
+            gate.remaining()
+        );
+    }
+
+    #[test]
+    fn a_reported_cost_is_booked_over_token_pricing() {
+        let mut gate = BudgetGate::new(BudgetCap::Limited(1.0), 0.0);
+        let deep = price(2.0, 10.0);
+        let LadderDecision::Run { hold, .. } =
+            gate.authorize(test_estimate(10_000, 10_000, &deep, None))
+        else {
+            panic!("expected a run");
+        };
+        // Token pricing would call this usage far more expensive than the
+        // figure the provider itself reported.
+        let usage = crate::provider::TokenUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 0,
+            output_tokens: 100_000,
+        };
+        let cost = gate.settle(hold, &usage, &deep, Some(0.0123));
+        assert!((cost - 0.0123).abs() < 1e-12, "{cost}");
+        assert!(
+            (gate.remaining() - 0.9877).abs() < 1e-12,
+            "{}",
             gate.remaining()
         );
     }
