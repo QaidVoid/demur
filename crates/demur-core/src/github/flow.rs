@@ -339,6 +339,12 @@ fn render_comment(finding: &Finding, fingerprint: &str) -> String {
             "\n---\n\n**{}**\n\n{}\n",
             concern.message, concern.harm
         ));
+        if let Some(suggestion) = &concern.suggestion {
+            body.push_str("```\n");
+            body.push_str(suggestion);
+            body.push('\n');
+            body.push_str("```\n");
+        }
     }
     body.push_str(&format!("<!-- demur:fp {fingerprint} -->"));
     body
