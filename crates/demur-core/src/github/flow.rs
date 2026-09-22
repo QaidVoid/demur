@@ -465,9 +465,19 @@ pub fn failure_notice(
 ) -> String {
     let lines: String = spend
         .iter()
-        .map(|pass| format!("- {}: ${:.4}\n", pass.pass, pass.cost))
+        .map(|pass| {
+            if pass.resumed {
+                format!("- {}: ${:.4} (resumed from cache)\n", pass.pass, pass.cost)
+            } else {
+                format!("- {}: ${:.4}\n", pass.pass, pass.cost)
+            }
+        })
         .collect();
-    let total: f64 = spend.iter().map(|pass| pass.cost).sum();
+    let total: f64 = spend
+        .iter()
+        .filter(|pass| !pass.resumed)
+        .map(|pass| pass.cost)
+        .sum();
     let closing = if recorded {
         "The next run counts this spend against the pull request's budget."
     } else {

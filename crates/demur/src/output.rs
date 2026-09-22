@@ -42,6 +42,13 @@ pub struct JsonPassSpend {
     pub pass: String,
     /// Cost in USD.
     pub cost: f64,
+    /// How the figure was computed: token-priced when token counts were
+    /// priced at the configured rates, agent-reported when the agent's
+    /// own accounting produced the number.
+    pub cost_source: JsonCostSource,
+    /// True when the pass was served from the resume cache and an earlier
+    /// run paid for it.
+    pub resumed: bool,
 }
 
 /// The machine-readable review document.
@@ -68,6 +75,31 @@ pub enum JsonVerdict {
     /// A blocking finding stands.
     #[serde(rename = "request_changes")]
     RequestChanges,
+}
+
+/// How a pass's cost figure was computed, in JSON output.
+#[derive(Debug, Serialize)]
+pub enum JsonCostSource {
+    /// Token counts priced at the configured rates.
+    #[serde(rename = "token-priced")]
+    TokenPrice,
+    /// Token counts at the configured rates because the agent transport
+    /// reported no figure of its own.
+    #[serde(rename = "token-priced agent")]
+    AgentTokenPrice,
+    /// The figure the agent's own accounting reported.
+    #[serde(rename = "agent-reported")]
+    AgentReported,
+}
+
+impl From<demur_core::pipeline::CostSource> for JsonCostSource {
+    fn from(source: demur_core::pipeline::CostSource) -> Self {
+        match source {
+            demur_core::pipeline::CostSource::TokenPrice => JsonCostSource::TokenPrice,
+            demur_core::pipeline::CostSource::AgentTokenPrice => JsonCostSource::AgentTokenPrice,
+            demur_core::pipeline::CostSource::AgentReported => JsonCostSource::AgentReported,
+        }
+    }
 }
 
 impl From<Verdict> for JsonVerdict {
@@ -110,6 +142,8 @@ pub fn json_review(review: &demur_core::pipeline::Review) -> JsonReview {
                 .map(|pass| JsonPassSpend {
                     pass: pass.pass.clone(),
                     cost: pass.cost,
+                    cost_source: pass.cost_source.into(),
+                    resumed: pass.resumed,
                 })
                 .collect(),
             total: review.spend.total,

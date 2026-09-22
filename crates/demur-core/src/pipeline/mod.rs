@@ -242,11 +242,18 @@ pub enum CostSource {
 }
 
 impl CostSource {
-    /// Derive the disclosure from what the response carried.
-    pub fn from_response(reported_cost: Option<f64>, reported_model: Option<&str>) -> CostSource {
+    /// Derive the disclosure from the transport the pass ran on and what
+    /// it reported. A figure from the agent's own accounting wins; an
+    /// agent pass without one falls back to token pricing; the ordinary
+    /// HTTP transports are always token priced.
+    pub fn for_pass(
+        config: &Config,
+        model: &crate::config::ModelDef,
+        reported_cost: Option<f64>,
+    ) -> CostSource {
         if reported_cost.is_some() {
             CostSource::AgentReported
-        } else if reported_model.is_some() {
+        } else if config.role_is_agent(model) {
             CostSource::AgentTokenPrice
         } else {
             CostSource::TokenPrice
@@ -468,7 +475,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
                     cost: gate.record(&usage, &triage_price),
                     resumed: false,
                     model: config.models.triage.name.clone(),
-                    cost_source: CostSource::TokenPrice,
+                    cost_source: CostSource::for_pass(config, &config.models.triage, None),
                 });
             }
             return Ok(RunOutcome::Failed {
@@ -499,7 +506,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
             .1
             .clone()
             .unwrap_or_else(|| config.models.triage.name.clone()),
-        cost_source: CostSource::from_response(triage_reported.0, triage_reported.1.as_deref()),
+        cost_source: CostSource::for_pass(config, &config.models.triage, triage_reported.0),
     });
     log::info!(
         "triage: {} finding(s) in {:.1?}, ${:.4}",
@@ -705,11 +712,12 @@ with their concrete harm.";
             } else {
                 &deep_price
             };
-            let model = if downgrade {
-                &config.models.triage.name
+            let role = if downgrade {
+                &config.models.triage
             } else {
-                &config.models.deep.name
+                &config.models.deep
             };
+            let model = &role.name;
             log::info!("cross-examination: running on {model}");
             let cross_started = std::time::Instant::now();
             let chosen = if shrink { shrunk_prompt } else { full_prompt };
@@ -726,6 +734,7 @@ with their concrete harm.";
             // line, because it spent nothing.
             let cross_output = match cross {
                 Ok(result) => {
+                    let source = CostSource::for_pass(config, role, result.reported_cost);
                     spend.push(PassSpend {
                         pass: "cross-examination".to_string(),
                         usage: result.usage,
@@ -742,10 +751,7 @@ with their concrete harm.";
                             .reported_model
                             .clone()
                             .unwrap_or_else(|| model.clone()),
-                        cost_source: CostSource::from_response(
-                            result.reported_cost,
-                            result.reported_model.as_deref(),
-                        ),
+                        cost_source: source,
                     });
                     result.output
                 }
@@ -766,7 +772,7 @@ with their concrete harm.";
                             cost: gate.record(&usage, paid_price),
                             resumed: false,
                             model: model.clone(),
-                            cost_source: CostSource::TokenPrice,
+                            cost_source: CostSource::for_pass(config, role, None),
                         });
                     }
                     degradations.push(Degradation::PassFailed {
@@ -916,10 +922,10 @@ coverage was complete and no defect was established.";
                 .await
                 {
                     Ok(result) => {
-                        let configured = if downgrade {
-                            config.models.triage.name.clone()
+                        let role = if downgrade {
+                            &config.models.triage
                         } else {
-                            config.models.verdict.name.clone()
+                            &config.models.verdict
                         };
                         spend.push(PassSpend {
                             pass: "verdict summary".to_string(),
@@ -933,11 +939,11 @@ coverage was complete and no defect was established.";
                                 result.reported_cost,
                             ),
                             resumed: result.resumed,
-                            model: result.reported_model.clone().unwrap_or(configured),
-                            cost_source: CostSource::from_response(
-                                result.reported_cost,
-                                result.reported_model.as_deref(),
-                            ),
+                            model: result
+                                .reported_model
+                                .clone()
+                                .unwrap_or_else(|| role.name.clone()),
+                            cost_source: CostSource::for_pass(config, role, result.reported_cost),
                         });
                         Some(result.output.summary)
                     }
@@ -945,17 +951,18 @@ coverage was complete and no defect was established.";
                         log::warn!("verdict summary failed, publishing without it: {err}");
                         gate.release(hold);
                         if let Some(usage) = billed_usage(&err) {
+                            let role = if downgrade {
+                                &config.models.triage
+                            } else {
+                                &config.models.verdict
+                            };
                             spend.push(PassSpend {
                                 pass: "verdict summary (failed)".to_string(),
                                 usage,
                                 cost: gate.record(&usage, paid_price),
                                 resumed: false,
-                                model: if downgrade {
-                                    config.models.triage.name.clone()
-                                } else {
-                                    config.models.verdict.name.clone()
-                                },
-                                cost_source: CostSource::TokenPrice,
+                                model: role.name.clone(),
+                                cost_source: CostSource::for_pass(config, role, None),
                             });
                         }
                         degradations.push(Degradation::SummaryUnavailable {
@@ -1060,12 +1067,12 @@ impl<'a> PassCache<'a> {
         config: &Config,
         model: &'a crate::config::ModelDef,
     ) -> PassCache<'a> {
-        let keyless = config
-            .providers
-            .get(&model.provider)
-            .is_some_and(|provider| provider.family == crate::config::Family::ClaudeCode);
         PassCache {
-            store: if keyless { None } else { store },
+            store: if config.role_is_agent(model) {
+                None
+            } else {
+                store
+            },
             model,
         }
     }
@@ -1147,8 +1154,10 @@ Respond again with only a JSON object that matches it exactly."
     let mut attempts: u32 = 0;
     let mut carried_usage = TokenUsage::default();
     // Attempts discarded for failing schema validation were billed all the
-    // same, so their usage travels with the pass however it ends.
+    // same, so their usage and any cost figure they reported travel with
+    // the pass however it ends.
     let mut schema_usage = TokenUsage::default();
+    let mut schema_reported: Option<f64> = None;
     let mut last_error: Option<serde_json::Error> = None;
     loop {
         let correction = last_error.as_ref().map(|err| err.to_string());
@@ -1181,6 +1190,20 @@ retrying with {raised} output tokens"
                     ceiling = raised;
                     continue;
                 }
+                Err(ProviderError::Malformed { message, usage }) => {
+                    schema_usage.input_tokens =
+                        schema_usage.input_tokens.saturating_add(usage.input_tokens);
+                    schema_usage.cached_input_tokens = schema_usage
+                        .cached_input_tokens
+                        .saturating_add(usage.cached_input_tokens);
+                    schema_usage.output_tokens = schema_usage
+                        .output_tokens
+                        .saturating_add(usage.output_tokens);
+                    return Err(ProviderError::Malformed {
+                        message,
+                        usage: schema_usage,
+                    });
+                }
                 Err(err) => return Err(err),
             };
         attempts += 1;
@@ -1208,7 +1231,7 @@ retrying with {raised} output tokens"
                     output: parsed,
                     usage,
                     resumed: false,
-                    reported_cost: response.reported_cost,
+                    reported_cost: add_cost(schema_reported, response.reported_cost),
                     reported_model: response.reported_model,
                 });
             }
@@ -1222,6 +1245,7 @@ retrying with {raised} output tokens"
                 schema_usage.output_tokens = schema_usage
                     .output_tokens
                     .saturating_add(response.usage.output_tokens);
+                schema_reported = add_cost(schema_reported, response.reported_cost);
                 last_error = Some(err);
                 if attempts >= SCHEMA_ATTEMPTS {
                     break;
@@ -1239,6 +1263,15 @@ retrying with {raised} output tokens"
         ),
         usage: schema_usage,
     })
+}
+
+/// Sum figures where absence is not zero: a cost is known only when some
+/// attempt reported one.
+fn add_cost(left: Option<f64>, right: Option<f64>) -> Option<f64> {
+    match (left, right) {
+        (Some(summed), Some(figured)) => Some(summed + figured),
+        (summed, figured) => summed.or(figured),
+    }
 }
 
 fn deep_dive_task(lens: &str) -> String {
@@ -1469,17 +1502,18 @@ async fn run_deep_dive(
                 gate.release(hold);
                 if let Some(usage) = billed_usage(&err) {
                     let paid_price = if downgraded { triage_price } else { deep_price };
+                    let role = if downgraded {
+                        &config.models.triage
+                    } else {
+                        &config.models.deep
+                    };
                     spend_lines.push(PassSpend {
                         pass: format!("deep dive {lens} on {} (failed)", cluster.path),
                         usage,
                         cost: gate.record(&usage, paid_price),
                         resumed: false,
-                        model: if downgraded {
-                            config.models.triage.name.clone()
-                        } else {
-                            config.models.deep.name.clone()
-                        },
-                        cost_source: CostSource::TokenPrice,
+                        model: role.name.clone(),
+                        cost_source: CostSource::for_pass(config, role, None),
                     });
                 }
             }
@@ -1506,11 +1540,12 @@ async fn run_deep_dive(
             result.reported_cost,
         )
     };
-    let model = if downgraded {
-        config.models.triage.name.clone()
+    let role = if downgraded {
+        &config.models.triage
     } else {
-        config.models.deep.name.clone()
+        &config.models.deep
     };
+    let model = role.name.clone();
     let mut spend_lines = vec![PassSpend {
         pass: format!("deep dive {lens} on {}", cluster.path),
         usage: result.usage,
@@ -1520,10 +1555,7 @@ async fn run_deep_dive(
             .reported_model
             .clone()
             .unwrap_or_else(|| model.clone()),
-        cost_source: CostSource::from_response(
-            result.reported_cost,
-            result.reported_model.as_deref(),
-        ),
+        cost_source: CostSource::for_pass(config, role, result.reported_cost),
     }];
     log::info!(
         "deep dive [{}]: {} finding(s) in {:.1?}, ${:.4}",
@@ -1608,10 +1640,7 @@ async fn run_deep_dive(
                         cost: round_cost,
                         resumed: next.resumed,
                         model: next.reported_model.clone().unwrap_or_else(|| model.clone()),
-                        cost_source: CostSource::from_response(
-                            next.reported_cost,
-                            next.reported_model.as_deref(),
-                        ),
+                        cost_source: CostSource::for_pass(config, role, next.reported_cost),
                     });
                     degradations.push(Degradation::ContextRetrieved {
                         pass: format!("deep dive ({lens}) on {}", cluster.path),

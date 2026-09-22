@@ -367,6 +367,7 @@ review ran against {}. The newer commit was not reviewed.\n",
                     .spend
                     .passes
                     .iter()
+                    .filter(|pass| !pass.resumed)
                     .map(|pass| (pass.pass.clone(), pass.cost))
                     .collect();
                 let marker = continuation_marker(pr.head_sha(), state, &spend, &fingerprints);
@@ -412,7 +413,11 @@ review ran against {}. The newer commit was not reviewed.\n",
         }
         Ok(RunOutcome::Failed { error, spend }) => {
             eprintln!("{error}");
-            let total: f64 = spend.iter().map(|pass| pass.cost).sum();
+            let total: f64 = spend
+                .iter()
+                .filter(|pass| !pass.resumed)
+                .map(|pass| pass.cost)
+                .sum();
             if total > 0.0 {
                 eprintln!("spend recorded before the failure: {total:.4} USD");
             }

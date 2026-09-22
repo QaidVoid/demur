@@ -766,17 +766,22 @@ pub struct Models {
 }
 
 impl Config {
+    /// True when the role's provider drives the keyless agent transport,
+    /// which reports no token metering of its own and runs on a local
+    /// subscription rather than a resolved key.
+    pub fn role_is_agent(&self, model: &ModelDef) -> bool {
+        self.providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.family == Family::ClaudeCode)
+    }
+
     /// True when any model role names the keyless agent family. Such a
     /// configuration must never run on an untrusted head: the subprocess
     /// holds its own credentials, so a missing key guards nothing.
     pub fn selects_agent_family(&self) -> bool {
         [&self.models.triage, &self.models.deep, &self.models.verdict]
             .iter()
-            .any(|model| {
-                self.providers
-                    .get(&model.provider)
-                    .is_some_and(|provider| provider.family == Family::ClaudeCode)
-            })
+            .any(|model| self.role_is_agent(model))
     }
 
     /// Load and validate the configuration file at `path`.
@@ -889,7 +894,22 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
     for (name, provider) in &config.providers {
         if provider.family == Family::ClaudeCode {
             // The subprocess holds its own login: no URL to reach and no
-            // key to name, so there is nothing to check here.
+            // key to name. HTTP-dialect key and body knobs would be
+            // silently ignored, so naming one fails instead.
+            for field in ["key_file", "extra_body", "extra_headers"] {
+                let set = match field {
+                    "key_file" => provider.key_file.is_some(),
+                    "extra_body" => provider.extra_body.is_some(),
+                    _ => provider.extra_headers.is_some(),
+                };
+                if set {
+                    return Err(ConfigError::Invalid {
+                        field: format!("providers.{name}.{field}"),
+                        message: "is unused by the claude-code family and must not be set"
+                            .to_string(),
+                    });
+                }
+            }
             continue;
         }
         if !provider.base_url.starts_with("https://") && !provider.base_url.starts_with("http://") {
@@ -1664,5 +1684,22 @@ output_price = 15.00
         let text = subscription_only().replace("family = \"claude-code\"", "family = \"openai\"");
         let text = err_text(&text);
         assert!(text.contains("providers.claude.base_url"));
+    }
+
+    #[test]
+    fn claude_code_provider_rejects_http_dialect_knobs() {
+        let text = subscription_only().replace(
+            "family = \"claude-code\"",
+            "family = \"claude-code\"\nkey_file = \"/tmp/nope\"",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("providers.claude.key_file"));
+
+        let text = subscription_only().replace(
+            "family = \"claude-code\"",
+            "family = \"claude-code\"\n\n[providers.claude.extra_headers]\nX-Debug = \"1\"",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("providers.claude.extra_headers"));
     }
 }

@@ -134,29 +134,33 @@ async fn run() -> Result<(), String> {
 
     // The fork path: without a provider key there is nothing this job can
     // do, so it explains itself in the job summary and exits successfully
-    // without any provider or review API call.
-    let is_fork = pr.head.repo.as_ref().is_some_and(|head| head.fork);
+    // without any provider or review API call. A head whose origin cannot
+    // be classified counts as untrusted for every guard below, never as
+    // trusted.
+    let head_fork = pr.head.repo.as_ref().is_some_and(|head| head.fork);
+    let untrusted_head = pr.head.repo.as_ref().is_none_or(|head| head.fork);
 
-    if is_fork && config.selects_agent_family() {
-        // The keyless family needs no key to be dangerous: on a fork its
-        // subprocess would act on untrusted input, so it is refused here
-        // before the registry is even built.
-        write_summary(&fork_notice())?;
+    if untrusted_head && config.selects_agent_family() {
+        // The keyless family needs no key to be dangerous: on an untrusted
+        // head its subprocess would act on input written outside the
+        // repository, so it is refused here before the registry is even
+        // built.
+        write_summary(&fork_family_notice())?;
         return Ok(());
     }
 
-    if is_fork && config.cache.disable_for_untrusted_head() {
+    if untrusted_head && config.cache.disable_for_untrusted_head() {
         eprintln!("fork pull request: the resume cache is not read");
     }
     // What a pass asks to retrieve is shaped by the diff it read, and on a
     // fork that diff was written by someone outside the repository.
-    if is_fork && config.retrieval.disable_for_untrusted_head() {
+    if untrusted_head && config.retrieval.disable_for_untrusted_head() {
         eprintln!("fork pull request: context retrieval is not performed");
     }
     let registry = match ProviderRegistry::from_config(&config) {
         Ok(registry) => registry,
         Err(key_error) => {
-            if is_fork {
+            if head_fork {
                 write_summary(&fork_notice())?;
                 return Ok(());
             }
@@ -187,6 +191,18 @@ available. The `pull_request_target` workaround is not recommended: \
 checking out the pull request head under that event executes untrusted \
 code with repository secrets in scope."
         .to_string()
+}
+
+/// The notice for the keyless agent family on an untrusted head. No key
+/// is involved, so the reason is different: the subprocess carries its
+/// own login.
+pub fn fork_family_notice() -> String {
+    format!(
+        "{}\n\nThis configuration names the claude-code family, which is \
+refused on fork heads regardless of keys: the review would run a \
+subprocess holding its own credentials on untrusted input.",
+        fork_notice()
+    )
 }
 
 fn write_summary(text: &str) -> Result<(), String> {

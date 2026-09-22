@@ -191,6 +191,65 @@ output_price = 15.00
 }
 
 #[tokio::test]
+async fn the_keyless_family_is_refused_when_the_head_origin_is_unknown() {
+    let github = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&github)
+        .await;
+    let config = r#"
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.deep]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+"#
+    .to_string();
+    // A head with no repository attached cannot be classified, so it
+    // counts as untrusted for the family guard.
+    let event = serde_json::json!({
+        "action": "opened",
+        "pull_request": {
+            "number": 7,
+            "draft": false,
+            "head": {"sha": "headsha", "repo": null}
+        }
+    });
+    let (job, envs) = Job::with_config("unknown-head", event, config);
+    let output = run_binary(&envs, &github.uri());
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = fs::read_to_string(&job.summary_path).unwrap();
+    assert!(summary.contains("review skipped"), "{summary}");
+    assert!(
+        summary.contains("regardless of keys"),
+        "the family reason must be stated: {summary}"
+    );
+    github.verify().await;
+}
+
+#[tokio::test]
 async fn full_review_run_publishes_review_and_check_run() {
     let github = MockServer::start().await;
     let provider = MockServer::start().await;

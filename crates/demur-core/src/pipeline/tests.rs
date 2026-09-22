@@ -1762,6 +1762,114 @@ async fn a_pass_receives_the_context_it_asked_for() {
 }
 
 #[tokio::test]
+async fn a_discarded_agent_attempt_is_priced_into_the_pass() {
+    let invalid = serde_json::json!({
+        "result": "{\"nope\": true}",
+        "is_error": false,
+        "total_cost_usd": 0.004
+    })
+    .to_string();
+    let valid = serde_json::json!({
+        "result": "{\"findings\": [], \"cluster_lens\": []}",
+        "is_error": false,
+        "total_cost_usd": 0.0123
+    })
+    .to_string();
+    let dir = std::env::temp_dir().join("demur-pipeline-claude-retried");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("claude");
+    let _ = std::fs::remove_file(dir.join("called"));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\ncat > /dev/null\nif [ -f {:?}/called ]; then\n  printf '%s' {}\nelse\n  touch {:?}/called\n  printf '%s' {}\nfi\n",
+            dir,
+            sh_quote(&valid),
+            dir,
+            sh_quote(&invalid)
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    let triage = crate::provider::AnyProvider::ClaudeCode(
+        crate::provider::ClaudeCodeClient::for_tests(script, std::time::Duration::from_secs(60)),
+    );
+    let providers = ProviderRegistry {
+        triage,
+        deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
+        verdict: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![Ok(
+            summary_response(),
+        )])),
+    };
+
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &claude_config(), &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let triage_spend = &review.spend.passes[0];
+    assert!(
+        (triage_spend.cost - 0.0163).abs() < 1e-9,
+        "both attempts must be booked: {}",
+        triage_spend.cost
+    );
+    assert_eq!(
+        triage_spend.cost_source,
+        crate::pipeline::CostSource::AgentReported
+    );
+}
+
+#[tokio::test]
+async fn an_agent_pass_without_a_figure_is_disclosed_as_token_priced() {
+    let answer = serde_json::json!({
+        "result": "{\"findings\": [], \"cluster_lens\": []}",
+        "is_error": false,
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 5,
+            "cache_read_input_tokens": 7,
+            "cache_creation_input_tokens": 3
+        }
+    })
+    .to_string();
+    let triage =
+        crate::provider::AnyProvider::ClaudeCode(crate::provider::ClaudeCodeClient::for_tests(
+            claude_fixture("uncosted-agent", &answer),
+            std::time::Duration::from_secs(60),
+        ));
+    let providers = ProviderRegistry {
+        triage,
+        deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
+        verdict: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![Ok(
+            summary_response(),
+        )])),
+    };
+
+    let RunOutcome::Review(review) = crate::pipeline::run(&providers, &claude_config(), &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let triage_spend = &review.spend.passes[0];
+    assert_eq!(
+        triage_spend.cost_source,
+        crate::pipeline::CostSource::AgentTokenPrice
+    );
+    assert!(
+        triage_spend.cost > 0.0,
+        "token counts are still priced: {}",
+        triage_spend.cost
+    );
+    assert_eq!(triage_spend.model, "sonnet");
+    assert!(review.body.contains("(token-priced)"), "{}", review.body);
+}
+
+#[tokio::test]
 async fn retrieval_is_off_unless_enabled() {
     let checkout = checkout_with(&[("src/auth/verify.rs", "pub fn verify_token() {}\n")]);
     let mut config = retrieval_config(false);

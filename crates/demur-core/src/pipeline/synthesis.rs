@@ -273,12 +273,12 @@ has no pull request title or description to judge.\n",
                 let run_total = paid + inherited;
                 for (pass, cost, resumed, source) in self.spend_lines {
                     let mut note = match source {
-                        CostSource::TokenPrice => "",
-                        CostSource::AgentTokenPrice => " (token-priced)",
-                        CostSource::AgentReported => " (agent-reported)",
+                        CostSource::TokenPrice => String::new(),
+                        CostSource::AgentTokenPrice => " (token-priced)".to_string(),
+                        CostSource::AgentReported => " (agent-reported)".to_string(),
                     };
                     if *resumed {
-                        note = " (resumed from cache)";
+                        note.push_str(" (resumed from cache)");
                     }
                     body.push_str(&format!("- {pass} spend: {}{note}\n", money(*cost)));
                 }
@@ -743,6 +743,34 @@ mod tests {
             result
                 .body
                 .contains("Cumulative spend for this pull request: $0.3651")
+        );
+    }
+
+    #[test]
+    fn a_resumed_pass_keeps_its_source_note() {
+        let result = synthesize(SynthesisInput {
+            findings: vec![],
+            block_on: vec![Severity::Blocker],
+            comment_budget: 10,
+            degradations: vec![],
+            spend_lines: vec![(
+                "deep".to_string(),
+                0.1130,
+                true,
+                CostSource::AgentTokenPrice,
+            )],
+            prior_spend: 0.0,
+            summary: None,
+            rules_skipped: false,
+            template: crate::config::Template::default(),
+            models: Vec::new(),
+        });
+        assert!(
+            result
+                .body
+                .contains("deep spend: $0.1130 (token-priced) (resumed from cache)"),
+            "{}",
+            result.body
         );
     }
 }

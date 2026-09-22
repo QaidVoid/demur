@@ -1560,3 +1560,46 @@ diff --git a/src/old.rs b/src/old.rs
         "a second thread fingerprint appeared: {review_body}"
     );
 }
+
+#[test]
+fn a_failed_run_notice_totals_live_spend_only() {
+    use crate::pipeline::{CostSource, PassSpend};
+    use crate::provider::TokenUsage;
+    let spend = vec![
+        PassSpend {
+            pass: "triage".to_string(),
+            usage: TokenUsage::default(),
+            cost: 0.0021,
+            resumed: true,
+            model: "t".to_string(),
+            cost_source: CostSource::TokenPrice,
+        },
+        PassSpend {
+            pass: "deep dive (failed)".to_string(),
+            usage: TokenUsage::default(),
+            cost: 0.113,
+            resumed: false,
+            model: "d".to_string(),
+            cost_source: CostSource::TokenPrice,
+        },
+    ];
+    let notice = failure_notice(
+        &crate::pipeline::PipelineError::Provider(crate::provider::ProviderError::Rejected {
+            message: "no".to_string(),
+        }),
+        &spend,
+        true,
+    );
+    assert!(
+        notice.contains("0.1130 USD"),
+        "the total counts live passes only: {notice}"
+    );
+    assert!(
+        !notice.contains("0.1151"),
+        "resumed spend must not be double counted: {notice}"
+    );
+    assert!(
+        notice.contains("(resumed from cache)"),
+        "the resumed line is annotated: {notice}"
+    );
+}
