@@ -894,15 +894,23 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
     for (name, provider) in &config.providers {
         if provider.family == Family::ClaudeCode {
             // The subprocess holds its own login: no URL to reach and no
-            // key to name. HTTP-dialect key and body knobs would be
-            // silently ignored, so naming one fails instead.
-            for field in ["key_file", "extra_body", "extra_headers"] {
-                let set = match field {
-                    "key_file" => provider.key_file.is_some(),
-                    "extra_body" => provider.extra_body.is_some(),
-                    _ => provider.extra_headers.is_some(),
-                };
-                if set {
+            // key to name. HTTP-dialect knobs would be silently ignored,
+            // so naming one fails instead.
+            let set = |field: &str| match field {
+                "base_url" => !provider.base_url.is_empty(),
+                "key_env" => !provider.key_env.trim().is_empty(),
+                "key_file" => provider.key_file.is_some(),
+                "extra_body" => provider.extra_body.is_some(),
+                _ => provider.extra_headers.is_some(),
+            };
+            for field in [
+                "base_url",
+                "key_env",
+                "key_file",
+                "extra_body",
+                "extra_headers",
+            ] {
+                if set(field) {
                     return Err(ConfigError::Invalid {
                         field: format!("providers.{name}.{field}"),
                         message: "is unused by the claude-code family and must not be set"
@@ -1688,18 +1696,25 @@ output_price = 15.00
 
     #[test]
     fn claude_code_provider_rejects_http_dialect_knobs() {
-        let text = subscription_only().replace(
-            "family = \"claude-code\"",
-            "family = \"claude-code\"\nkey_file = \"/tmp/nope\"",
-        );
-        let text = err_text(&text);
-        assert!(text.contains("providers.claude.key_file"));
-
-        let text = subscription_only().replace(
-            "family = \"claude-code\"",
-            "family = \"claude-code\"\n\n[providers.claude.extra_headers]\nX-Debug = \"1\"",
-        );
-        let text = err_text(&text);
-        assert!(text.contains("providers.claude.extra_headers"));
+        for (field, line) in [
+            ("key_file", "key_file = \"/tmp/nope\""),
+            ("extra_body", "extra_body = { temperature = 1 }"),
+            (
+                "extra_headers",
+                "[providers.claude.extra_headers]\nX-Debug = \"1\"",
+            ),
+            ("base_url", "base_url = \"https://api.test\""),
+            ("key_env", "key_env = \"CLAUDE_KEY\""),
+        ] {
+            let text = subscription_only().replace(
+                "family = \"claude-code\"",
+                &format!("family = \"claude-code\"\n{line}"),
+            );
+            let text = err_text(&text);
+            assert!(
+                text.contains(&format!("providers.claude.{field}")),
+                "{field}: {text}"
+            );
+        }
     }
 }

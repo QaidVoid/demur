@@ -150,12 +150,13 @@ async fn run() -> Result<(), String> {
     }
 
     if untrusted_head && config.cache.disable_for_untrusted_head() {
-        eprintln!("fork pull request: the resume cache is not read");
+        eprintln!("untrusted pull request head: the resume cache is not read");
     }
-    // What a pass asks to retrieve is shaped by the diff it read, and on a
-    // fork that diff was written by someone outside the repository.
+    // What a pass asks to retrieve is shaped by the diff it read, and on an
+    // untrusted head that diff was written by someone outside the
+    // repository.
     if untrusted_head && config.retrieval.disable_for_untrusted_head() {
-        eprintln!("fork pull request: context retrieval is not performed");
+        eprintln!("untrusted pull request head: context retrieval is not performed");
     }
     let registry = match ProviderRegistry::from_config(&config) {
         Ok(registry) => registry,
@@ -197,12 +198,18 @@ code with repository secrets in scope."
 /// is involved, so the reason is different: the subprocess carries its
 /// own login.
 pub fn fork_family_notice() -> String {
-    format!(
-        "{}\n\nThis configuration names the claude-code family, which is \
-refused on fork heads regardless of keys: the review would run a \
-subprocess holding its own credentials on untrusted input.",
-        fork_notice()
-    )
+    "## demur: review skipped\n\n\
+The head of this pull request is a fork, or its origin cannot be \
+identified, and this configuration names the claude-code family. The \
+review would run a subprocess holding its own credentials on untrusted \
+input, which the family refuses regardless of keys, so no review was \
+attempted.\n\n\
+To review such pull requests, a maintainer can run demur locally \
+against the pull request, or configure a self-hosted runner. The \
+`pull_request_target` workaround is not recommended: checking out the \
+pull request head under that event executes untrusted code with \
+repository secrets in scope."
+        .to_string()
 }
 
 fn write_summary(text: &str) -> Result<(), String> {
