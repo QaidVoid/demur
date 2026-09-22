@@ -1154,8 +1154,9 @@ Respond again with only a JSON object that matches it exactly."
     let mut attempts: u32 = 0;
     let mut carried_usage = TokenUsage::default();
     // Attempts discarded for failing schema validation were billed all the
-    // same, so their usage and any cost figure they reported travel with
-    // the pass however it ends.
+    // same, so their token usage travels with the pass however it ends. A
+    // reported cost figure can only ride a completed pass; a failed ending
+    // prices the carried tokens at the configured rates.
     let mut schema_usage = TokenUsage::default();
     let mut schema_reported: Option<f64> = None;
     let mut last_error: Option<serde_json::Error> = None;
@@ -1166,15 +1167,7 @@ Respond again with only a JSON object that matches it exactly."
             match complete_with_retries(provider, &request, &RetryPolicy::default()).await {
                 Ok(response) => response,
                 Err(ProviderError::OutputTruncated { message, usage }) => {
-                    carried_usage.input_tokens = carried_usage
-                        .input_tokens
-                        .saturating_add(usage.input_tokens);
-                    carried_usage.cached_input_tokens = carried_usage
-                        .cached_input_tokens
-                        .saturating_add(usage.cached_input_tokens);
-                    carried_usage.output_tokens = carried_usage
-                        .output_tokens
-                        .saturating_add(usage.output_tokens);
+                    carried_usage = add_usage(carried_usage, usage);
                     if escalations >= MAX_CEILING_ESCALATIONS || ceiling >= MAX_OUTPUT_CEILING {
                         return Err(ProviderError::OutputTruncated {
                             message,
@@ -1191,17 +1184,10 @@ retrying with {raised} output tokens"
                     continue;
                 }
                 Err(ProviderError::Malformed { message, usage }) => {
-                    schema_usage.input_tokens =
-                        schema_usage.input_tokens.saturating_add(usage.input_tokens);
-                    schema_usage.cached_input_tokens = schema_usage
-                        .cached_input_tokens
-                        .saturating_add(usage.cached_input_tokens);
-                    schema_usage.output_tokens = schema_usage
-                        .output_tokens
-                        .saturating_add(usage.output_tokens);
+                    schema_usage = add_usage(schema_usage, usage);
                     return Err(ProviderError::Malformed {
                         message,
-                        usage: schema_usage,
+                        usage: add_usage(schema_usage, carried_usage),
                     });
                 }
                 Err(err) => return Err(err),
@@ -1209,19 +1195,7 @@ retrying with {raised} output tokens"
         attempts += 1;
         match serde_json::from_value::<T>(response.content.clone()) {
             Ok(parsed) => {
-                let mut usage = response.usage;
-                usage.input_tokens = usage
-                    .input_tokens
-                    .saturating_add(carried_usage.input_tokens)
-                    .saturating_add(schema_usage.input_tokens);
-                usage.cached_input_tokens = usage
-                    .cached_input_tokens
-                    .saturating_add(carried_usage.cached_input_tokens)
-                    .saturating_add(schema_usage.cached_input_tokens);
-                usage.output_tokens = usage
-                    .output_tokens
-                    .saturating_add(carried_usage.output_tokens)
-                    .saturating_add(schema_usage.output_tokens);
+                let usage = add_usage(add_usage(response.usage, carried_usage), schema_usage);
                 // Only a completed, schema-valid pass is stored. A failure
                 // anywhere above leaves nothing behind to resume from.
                 if let (Some(store), Some(key)) = (cache.store, key.as_ref()) {
@@ -1236,15 +1210,7 @@ retrying with {raised} output tokens"
                 });
             }
             Err(err) => {
-                schema_usage.input_tokens = schema_usage
-                    .input_tokens
-                    .saturating_add(response.usage.input_tokens);
-                schema_usage.cached_input_tokens = schema_usage
-                    .cached_input_tokens
-                    .saturating_add(response.usage.cached_input_tokens);
-                schema_usage.output_tokens = schema_usage
-                    .output_tokens
-                    .saturating_add(response.usage.output_tokens);
+                schema_usage = add_usage(schema_usage, response.usage);
                 schema_reported = add_cost(schema_reported, response.reported_cost);
                 last_error = Some(err);
                 if attempts >= SCHEMA_ATTEMPTS {
@@ -1261,8 +1227,18 @@ retrying with {raised} output tokens"
                 .map(|err| err.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
-        usage: schema_usage,
+        usage: add_usage(schema_usage, carried_usage),
     })
+}
+
+/// Sum two usage figures. Discarded attempts only ever add.
+fn add_usage(mut left: TokenUsage, right: TokenUsage) -> TokenUsage {
+    left.input_tokens = left.input_tokens.saturating_add(right.input_tokens);
+    left.cached_input_tokens = left
+        .cached_input_tokens
+        .saturating_add(right.cached_input_tokens);
+    left.output_tokens = left.output_tokens.saturating_add(right.output_tokens);
+    left
 }
 
 /// Sum figures where absence is not zero: a cost is known only when some

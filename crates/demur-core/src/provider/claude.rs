@@ -106,15 +106,11 @@ impl Provider for ClaudeCodeClient {
                 });
             }
         };
-        if let Err(err) = stdin_task
-            .await
-            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
-        {
-            return Err(ProviderError::Request {
-                message: format!("writing the prompt failed: {err}"),
-            });
-        }
-
+        // A child that exits early without reading the prompt breaks the
+        // write. Its own exit status and stderr name the cause, so they
+        // are reported first and the write failure only preempts an
+        // otherwise successful answer, which a truncated prompt cannot
+        // be trusted to produce.
         if !output.status.success() {
             return Err(ProviderError::Request {
                 message: format!(
@@ -122,6 +118,17 @@ impl Provider for ClaudeCodeClient {
                     output.status,
                     stderr_tail(&output.stderr)
                 ),
+            });
+        }
+        let wrote = match tokio::time::timeout(timeout, stdin_task).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(err),
+            Ok(Err(join)) => Err(std::io::Error::other(join.to_string())),
+            Err(_) => Err(std::io::Error::other("the prompt write did not finish")),
+        };
+        if let Err(err) = wrote {
+            return Err(ProviderError::Request {
+                message: format!("writing the prompt failed: {err}"),
             });
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -324,6 +331,23 @@ mod tests {
             "uncosted",
             &format!("printf '%s' {}", sh_quote(&result_document("{\"a\": 1}"))),
         );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        let response = complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap();
+        assert_eq!(response.reported_cost, None);
+        assert_eq!(response.reported_model, None);
+    }
+
+    #[tokio::test]
+    async fn a_zero_cost_model_usage_names_no_model() {
+        let document = serde_json::json!({
+            "result": "{\"a\": 1}",
+            "is_error": false,
+            "modelUsage": {"claude-sonnet-4-5-20260101": {"costUSD": 0.0}}
+        })
+        .to_string();
+        let (script, _dir) = fixture("free", &format!("printf '%s' {}", sh_quote(&document)));
         let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
         let response = complete_with_retries(&client, &request(), &fast_policy())
             .await

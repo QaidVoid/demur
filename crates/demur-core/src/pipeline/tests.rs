@@ -2442,3 +2442,47 @@ async fn retrieval_rounds_carry_earlier_attachments_and_end_with_final_findings(
         "the last round asks for findings: {round_two}"
     );
 }
+
+#[tokio::test]
+async fn a_failed_pass_bills_every_discarded_attempt() {
+    // One truncated attempt raises the ceiling, three schema-invalid
+    // answers exhaust the retries, and the failure must bill the tokens
+    // of all four.
+    let steps = vec![
+        Err(ProviderError::OutputTruncated {
+            message: "cut".to_string(),
+            usage: crate::provider::TokenUsage {
+                input_tokens: 10,
+                cached_input_tokens: 1,
+                output_tokens: 100,
+            },
+        }),
+        Ok(json!({"findings": "none"})),
+        Ok(json!({"findings": "also none"})),
+        Ok(json!({"findings": "still none"})),
+    ];
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(steps),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![]),
+    );
+    let outcome = crate::pipeline::run(&providers, &config_with("quick", ""), &input())
+        .await
+        .unwrap();
+    let RunOutcome::Failed { error, spend } = outcome else {
+        panic!("expected a failed run");
+    };
+    assert!(
+        matches!(
+            error,
+            PipelineError::Provider(ProviderError::Malformed { .. })
+        ),
+        "{error}"
+    );
+    assert_eq!(spend.len(), 1, "{}", error);
+    let billed = spend[0].usage;
+    assert_eq!(billed.input_tokens, 10 + 3 * 100);
+    assert_eq!(billed.cached_input_tokens, 1);
+    assert_eq!(billed.output_tokens, 100 + 3 * 20);
+    assert!(spend[0].cost > 0.0);
+}
