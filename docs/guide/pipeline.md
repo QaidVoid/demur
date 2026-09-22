@@ -31,8 +31,11 @@ held to the same contract as every other pass.
 ### 4. Verdict synthesis
 
 Findings are deduplicated and force ranked by the harm they argue. Anything
-missing a location or arguing no concrete harm is dropped here. The comment
-budget then decides how many are published inline.
+missing a location or arguing no concrete harm is dropped here. Findings that
+cite the same location are then reconciled into one: a line yields one comment
+carrying every concern raised about it, and nothing is dropped in the merge.
+The comment budget bounds locations to read, not arguments made, and the body
+states how many locations were omitted when the budget binds.
 
 The verdict itself is not a model output. It is computed from the severities
 that survive synthesis against your `block_on` list. A model cannot approve a
@@ -46,9 +49,9 @@ without the paragraph. It never costs you the findings the deep dives paid for.
 ### 5. Publication
 
 One review event with inline comments and suggestion blocks where a fix can be
-expressed, plus one check run whose conclusion is the verdict. Publication
-reports the verdict and never recomputes it, so the review and the check can
-never disagree.
+expressed, one comment per location, plus one check run whose conclusion is the
+verdict. Publication reports the verdict and never recomputes it, so the review
+and the check can never disagree.
 
 Publication is atomic. Nothing is posted until synthesis completes, so a
 cancelled job costs tokens but never a partial verdict.
