@@ -137,6 +137,14 @@ async fn run() -> Result<(), String> {
     // without any provider or review API call.
     let is_fork = pr.head.repo.as_ref().is_some_and(|head| head.fork);
 
+    if is_fork && config.selects_agent_family() {
+        // The keyless family needs no key to be dangerous: on a fork its
+        // subprocess would act on untrusted input, so it is refused here
+        // before the registry is even built.
+        write_summary(&fork_notice())?;
+        return Ok(());
+    }
+
     if is_fork && config.cache.disable_for_untrusted_head() {
         eprintln!("fork pull request: the resume cache is not read");
     }

@@ -345,14 +345,8 @@ pub async fn run(
     let store_ref: Option<&dyn crate::cache::Store> = store
         .as_ref()
         .map(|store| store as &dyn crate::cache::Store);
-    let triage_cache = PassCache {
-        store: store_ref,
-        model: &config.models.triage,
-    };
-    let deep_cache = PassCache {
-        store: store_ref,
-        model: &config.models.deep,
-    };
+    let triage_cache = PassCache::for_role(store_ref, config, &config.models.triage);
+    let deep_cache = PassCache::for_role(store_ref, config, &config.models.deep);
 
     let profile = config.profile.unwrap_or(Profile::Standard);
     let triage_price = ModelPrice::from_model(&config.models.triage);
@@ -899,16 +893,18 @@ coverage was complete and no defect was established.";
                 // finding are already settled, so a failure here costs a
                 // paragraph, never the run that paid for the deep dives.
                 let store = open_cache(config);
-                let summary_cache = PassCache {
-                    store: store
-                        .as_ref()
-                        .map(|store| store as &dyn crate::cache::Store),
-                    model: if downgrade {
+                let store_ref: Option<&dyn crate::cache::Store> = store
+                    .as_ref()
+                    .map(|store| store as &dyn crate::cache::Store);
+                let summary_cache = PassCache::for_role(
+                    store_ref,
+                    config,
+                    if downgrade {
                         &config.models.triage
                     } else {
                         &config.models.verdict
                     },
-                };
+                );
                 match call_pass::<SummaryOutput>(
                     provider,
                     summary_prompt,
@@ -1053,6 +1049,26 @@ pub struct PassCache<'a> {
     pub store: Option<&'a dyn crate::cache::Store>,
     /// The model this pass will actually call.
     pub model: &'a crate::config::ModelDef,
+}
+
+impl<'a> PassCache<'a> {
+    /// A pass cache for one role. The agent family never participates: its
+    /// configured name cannot vouch for the model the login actually ran,
+    /// so a cache hit could answer with another model's work.
+    pub fn for_role(
+        store: Option<&'a dyn crate::cache::Store>,
+        config: &Config,
+        model: &'a crate::config::ModelDef,
+    ) -> PassCache<'a> {
+        let keyless = config
+            .providers
+            .get(&model.provider)
+            .is_some_and(|provider| provider.family == crate::config::Family::ClaudeCode);
+        PassCache {
+            store: if keyless { None } else { store },
+            model,
+        }
+    }
 }
 
 /// Outcome of one pass: its output, its usage, and whether the cache

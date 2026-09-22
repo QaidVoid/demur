@@ -766,6 +766,19 @@ pub struct Models {
 }
 
 impl Config {
+    /// True when any model role names the keyless agent family. Such a
+    /// configuration must never run on an untrusted head: the subprocess
+    /// holds its own credentials, so a missing key guards nothing.
+    pub fn selects_agent_family(&self) -> bool {
+        [&self.models.triage, &self.models.deep, &self.models.verdict]
+            .iter()
+            .any(|model| {
+                self.providers
+                    .get(&model.provider)
+                    .is_some_and(|provider| provider.family == Family::ClaudeCode)
+            })
+    }
+
     /// Load and validate the configuration file at `path`.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text = std::fs::read_to_string(path).map_err(|err| match err.kind() {

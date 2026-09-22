@@ -19,10 +19,6 @@ struct Job {
 
 impl Job {
     fn new(name: &str, event: serde_json::Value, base_url: &str) -> (Job, Vec<std::ffi::OsString>) {
-        let dir = tempfile::tempdir().unwrap();
-        let event_path = dir.path().join("event.json");
-        fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
-        let summary_path = dir.path().join("step-summary.md");
         let config = format!(
             r#"
 [providers.openai]
@@ -49,6 +45,18 @@ input_price = 0.15
 output_price = 0.60
 "#
         );
+        Self::with_config(name, event, config)
+    }
+
+    fn with_config(
+        name: &str,
+        event: serde_json::Value,
+        config: String,
+    ) -> (Job, Vec<std::ffi::OsString>) {
+        let dir = tempfile::tempdir().unwrap();
+        let event_path = dir.path().join("event.json");
+        fs::write(&event_path, serde_json::to_string(&event).unwrap()).unwrap();
+        let summary_path = dir.path().join("step-summary.md");
         fs::write(dir.path().join(".demur.toml"), config).unwrap();
         let envs = vec![
             std::ffi::OsString::from(format!("GITHUB_EVENT_PATH={}", event_path.display())),
@@ -134,6 +142,52 @@ async fn missing_key_on_a_non_fork_fails_with_setup_guidance() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(KEY_ENV), "stderr: {stderr}");
     assert!(!stderr.contains(KEY_VALUE));
+}
+
+#[tokio::test]
+async fn a_keyless_family_is_refused_on_a_fork_head() {
+    let github = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .expect(0)
+        .mount(&github)
+        .await;
+    let config = r#"
+[providers.claude]
+family = "claude-code"
+
+[models.triage]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.deep]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "claude"
+name = "sonnet"
+input_price = 3.00
+output_price = 15.00
+"#
+    .to_string();
+    let (job, envs) = Job::with_config("forkless-key", event("opened", false, true), config);
+    let output = run_binary(&envs, &github.uri());
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = fs::read_to_string(&job.summary_path).unwrap();
+    assert!(summary.contains("review skipped"), "{summary}");
+    assert!(summary.contains("fork"), "{summary}");
+    github.verify().await;
 }
 
 #[tokio::test]

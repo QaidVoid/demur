@@ -1058,6 +1058,82 @@ async fn a_failed_pass_leaves_nothing_to_resume() {
     );
 }
 
+/// A claude stand-in that records every invocation beside itself.
+fn counting_claude_fixture(
+    name: &str,
+    calls: &std::path::Path,
+    answer: &str,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join("demur-claude-cache-fixture");
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join(format!("claude-{name}"));
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/bash\necho called >> {}\ncat > /dev/null\nprintf '%s' {}\n",
+            sh_quote(&calls.display().to_string()),
+            sh_quote(answer)
+        ),
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+#[tokio::test]
+async fn the_agent_family_does_no_cache_io() {
+    let cache_dir = tempfile::tempdir().unwrap();
+    let work_dir = tempfile::tempdir().unwrap();
+    let calls = work_dir.path().join("calls.log");
+    let triage_answer = serde_json::json!({
+        "result": "{\"findings\": [], \"cluster_lens\": []}",
+        "is_error": false
+    })
+    .to_string();
+    let verdict_answer = serde_json::json!({
+        "result": "{\"summary\": \"No defect was established.\"}",
+        "is_error": false
+    })
+    .to_string();
+    let mut config = claude_config();
+    config.cache.enabled = true;
+    config.cache.dir = Some(cache_dir.path().to_path_buf());
+
+    for _ in 0..2 {
+        let providers = ProviderRegistry {
+            triage: crate::provider::AnyProvider::ClaudeCode(
+                crate::provider::ClaudeCodeClient::for_tests(
+                    counting_claude_fixture("triage", &calls, &triage_answer),
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
+            deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
+            verdict: crate::provider::AnyProvider::ClaudeCode(
+                crate::provider::ClaudeCodeClient::for_tests(
+                    counting_claude_fixture("verdict", &calls, &verdict_answer),
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
+        };
+        crate::pipeline::run(&providers, &config, &input())
+            .await
+            .unwrap();
+    }
+    // Both runs reached the process transport: nothing was written by the
+    // first run for the second to resume, because the family never
+    // participates in the cache.
+    let calls_made = std::fs::read_to_string(&calls).unwrap().lines().count();
+    assert_eq!(calls_made, 4, "two passes per run, no resume");
+    let stored = std::fs::read_dir(cache_dir.path())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .count();
+    assert_eq!(stored, 0, "no entry is ever written for the family");
+}
+
 #[tokio::test]
 async fn a_changed_model_is_not_served_from_cache() {
     let dir = tempfile::tempdir().unwrap();
