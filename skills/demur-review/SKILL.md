@@ -30,7 +30,9 @@ the run failed. On success the JSON has:
   `end_line`, `message`, `harm`, and optionally `suggestion`,
 - `omitted`: how many findings fell beyond the comment budget,
 - `degradations`: coverage reductions the run applied,
-- `spend`: per-pass and total cost.
+- `spend`: per-pass and total cost, each pass naming its `cost_source`
+  ("token-priced", "token-priced agent", or "agent-reported") and
+  whether it was `resumed` from an earlier run.
 
 ## How you present it
 
@@ -40,8 +42,9 @@ the run failed. On success the JSON has:
 - Disclose reduced coverage. If `degradations` is non-empty, say what ran
   reduced: a shrunken pass, a failed pass, or clusters without a deep dive
   must reach the user, never hidden behind the verdict.
-- State the spend when the user cares about cost. Figures marked
-  agent-reported come from the provider itself.
+- State the spend when the user cares about cost. An "agent-reported"
+  cost source means the figure comes from the provider's own accounting;
+  any other source is demur pricing token counts at the configured rates.
 
 ## What you never do
 

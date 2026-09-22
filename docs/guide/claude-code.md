@@ -53,17 +53,25 @@ The command is fixed in the bot. It never comes from configuration and
 never from model output. Each pass:
 
 - runs `claude -p` with exec-form arguments, no shell;
-- sends the pass prompt on standard input, never on the command line;
+- sends the untrusted pull request content on standard input, never on
+  the command line; only the static instructions and the schema ride the
+  arguments;
 - passes the output schema to `--json-schema`, so the answer validates
   before demur reads it;
 - disables tools and follow-up turns (`--tools ""`, `--max-turns 1`): a
   pass is one prompt in and one answer out;
-- is bounded by a 600 second wall clock, after which the pass fails as an
-  ordinary request error and the degradation ladder applies.
+- gives each spawned process 600 seconds. A process that exceeds the
+  bound is killed and the request retried within the usual retry bound;
+  a pass that keeps failing fails as an ordinary request error and the
+  degradation ladder applies.
 
 A schema-invalid answer follows the same corrective retry path as any
 other family. A run that exceeds its budget still skips or shrinks with a
 disclosure, exactly as it would over HTTP.
+
+The CLI's own output ceiling is not carried per request. demur's
+`limits.max_tokens` prices and gates the pass; the CLI applies whatever
+ceiling its own configuration sets.
 
 ## Cost and the resume cache
 
@@ -81,9 +89,10 @@ stale can be served.
 
 ## Fork pull requests
 
-A GitHub Action run on a fork pull request refuses the family and
-publishes the usual fork notice, because the subprocess would act on
-input written by someone outside the repository. Locally the family runs
+A GitHub Action run on a fork pull request refuses the family before any
+pass, because the subprocess would act on input written by someone
+outside the repository while carrying its own credentials. The job
+summary explains this and no review is attempted. Locally the family runs
 on any input: you are driving your own login on your own machine.
 
 ## Letting Claude Code run demur
@@ -101,29 +110,42 @@ ln -s ../../skills/demur-review .claude/skills/demur-review
 
 A Stop-hook wrapper can make the review gate a session: the hook runs the
 review when Claude stops and blocks stopping with the findings until the
-verdict approves. The wrapper stays thin, because the JSON output and the
-exit status are the whole contract:
+verdict approves. The hook contract is exit status based: exit 0 lets the
+session stop, and exit 2 blocks it with whatever the hook printed on
+stderr fed back to Claude. The wrapper stays thin, because the JSON
+output and the exit status are the whole contract:
 
 ```bash
 #!/bin/bash
 # .claude/hooks/demur-stop.sh, a stop hook that blocks on demur's verdict
-out=$(demur review --format json 2>/dev/null)
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+demur review --format json >"$work/review.json" 2>"$work/error"
 status=$?
-[ $status -eq 2 ] && exit 0   # a failed run is reported, not a blocker
-[ $status -eq 0 ] && exit 0   # approved: let the session stop
-python3 - "$out" <<'EOF'
+case $status in
+  0) exit 0 ;;                    # approved: let the session stop
+  2) cat "$work/error" >&2        # a failed run is reported, not a blocker
+     exit 0 ;;
+esac
+if [ ! -s "$work/review.json" ]; then
+  echo "demur exited with $status but produced no review document" >&2
+  cat "$work/error" >&2
+  exit 2
+fi
+python3 - "$work/review.json" <<'EOF' >&2
 import json, sys
-review = json.loads(sys.argv[1])
+review = json.load(open(sys.argv[1]))
 lines = [f"- [{f['severity']}] {f['file']}:{f['start_line']} {f['message']}"
          for f in review["findings"]]
 print("demur requested changes. Resolve these or override explicitly:")
 print("\n".join(lines))
 EOF
-exit 1
+exit 2   # blocks the stop and feeds the findings back to Claude
 ```
 
-demur gains no hook-specific subcommand. The JSON document above is all a
-hook needs.
+The document travels through a file and the findings are printed to
+stderr, so a large review cannot overflow an argument list, and a failed
+run is reported instead of being silently swallowed.
 
 ## Why not ACP
 
