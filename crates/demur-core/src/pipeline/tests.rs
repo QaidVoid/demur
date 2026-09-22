@@ -439,6 +439,7 @@ async fn carried_blocker_sets_the_verdict_on_a_clean_delta() {
         message: "unfixed sql injection".to_string(),
         harm: "Merging leaves the injection reachable by any user.".to_string(),
         suggestion: None,
+        further_concerns: Vec::new(),
     };
     let mut run_input = input();
     run_input.carried_findings = vec![carried];

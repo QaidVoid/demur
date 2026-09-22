@@ -195,6 +195,7 @@ reviewer has to reconstruct from the diff what the section would have stated."
             message,
             harm,
             suggestion: None,
+            further_concerns: Vec::new(),
         }
     }
 }

@@ -288,6 +288,7 @@ fn carried_to_finding(carried: &CarriedFinding) -> Finding {
         message: carried.message.clone(),
         harm: carried.harm.clone(),
         suggestion: None,
+        further_concerns: Vec::new(),
     }
 }
 
@@ -405,6 +406,7 @@ mod tests {
             message: message.to_string(),
             harm: format!("Merging {} causes concrete harm.", message),
             suggestion: None,
+            further_concerns: Vec::new(),
         }
     }
 

@@ -372,6 +372,7 @@ mod tests {
             message: message.to_string(),
             harm: format!("Merging {} causes concrete harm to users.", message),
             suggestion: None,
+            further_concerns: Vec::new(),
         }
     }
 

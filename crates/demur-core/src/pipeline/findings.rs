@@ -55,6 +55,15 @@ pub struct ModelFindings {
     pub context_requests: Vec<String>,
 }
 
+/// One concern about a location: a statement and the harm merging causes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Concern {
+    /// Short statement of the defect.
+    pub message: String,
+    /// The concrete harm merging would cause.
+    pub harm: String,
+}
+
 /// A validated finding anchored to the pull request diff.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Finding {
@@ -72,6 +81,10 @@ pub struct Finding {
     pub harm: String,
     /// A concrete fix, when one can be expressed.
     pub suggestion: Option<String>,
+    /// Further concerns raised about this location, filled by
+    /// reconciliation. The leading concern is `message` and `harm`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub further_concerns: Vec<Concern>,
 }
 
 impl Finding {
@@ -173,6 +186,7 @@ pub fn validate(raw: &ModelFinding, diff_paths: &[String]) -> Option<Finding> {
             .as_ref()
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty()),
+        further_concerns: Vec::new(),
     })
 }
 
