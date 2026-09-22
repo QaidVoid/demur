@@ -94,23 +94,17 @@ pub async fn review_pull_request(
         .collect();
 
     // Carry unresolved prior findings into synthesis, minus those a human
-    // dismissed. Dismissed fingerprints also suppress fresh findings with
-    // the same fingerprint.
+    // dismissed. Every fingerprint a carried record holds suppresses fresh
+    // findings with the same fingerprint, both in the pipeline and at
+    // anchoring, so a carried finding is never re-threaded.
     let mut carried = Vec::new();
     let mut suppress = dismissed.clone();
-    let suppress_for_fingerprints = suppress.clone();
     if let Some(marker) = &prior_marker {
-        let current: Vec<(Finding, String)> = Vec::new();
-        let decisions = delta::carry_forward(marker, &dismissed, &current, &changed);
-        for (finding, decision) in decisions {
-            if decision == CarryDecision::Carried
-                && let Some(record) = marker
-                    .findings
-                    .iter()
-                    .find(|record| record.message == finding.message && record.path == finding.file)
-            {
-                suppress.insert(record.fingerprint.clone());
-                carried.push((finding, record.fingerprint.clone()));
+        let decisions = delta::carry_forward(marker, &dismissed, &[], &changed);
+        for (finding, decision, fingerprints) in decisions {
+            if decision == CarryDecision::Carried {
+                suppress.extend(fingerprints.iter().cloned());
+                carried.push((finding, fingerprints));
             }
         }
     }
@@ -132,10 +126,10 @@ pub async fn review_pull_request(
         diff_text,
         prior_spend: prior_marker
             .as_ref()
-            .map(|marker| marker.spend.values().sum())
+            .map(|marker| marker.cumulative_spend())
             .unwrap_or(0.0),
         carried_findings,
-        suppress_fingerprints: suppress,
+        suppress_fingerprints: suppress.clone(),
         // The Action checks the repository out before running, so the
         // working directory is the checkout retrieval may read.
         repo_root: std::env::current_dir().ok(),
@@ -184,7 +178,7 @@ pub async fn review_pull_request(
         &review.published,
         &input.ingestion,
         &cluster_hunks,
-        &suppress_for_fingerprints,
+        &suppress,
     );
 
     // Did the head move while we worked?
@@ -277,21 +271,20 @@ fn carried_states(
     prior: Option<&Marker>,
     dismissed: &HashSet<String>,
     changed: &HashMap<String, BTreeSet<u32>>,
-) -> Vec<(Finding, CarryDecision, CarriedState)> {
+) -> Vec<(Finding, CarryDecision, CarriedState, Vec<String>)> {
     let Some(prior) = prior else {
         return Vec::new();
     };
-    let decisions = delta::carry_forward(prior, dismissed, &[], changed);
-    decisions
+    delta::carry_forward(prior, dismissed, &[], changed)
         .into_iter()
-        .map(|(finding, decision)| {
+        .map(|(finding, decision, fingerprints)| {
             let state = match decision {
                 CarryDecision::Carried | CarryDecision::Reproduced => CarriedState::Unresolved,
                 CarryDecision::Dismissed | CarryDecision::ResolvedByChanges => {
                     CarriedState::Resolved
                 }
             };
-            (finding, decision, state)
+            (finding, decision, state, fingerprints)
         })
         .collect()
 }

@@ -24,6 +24,11 @@ pub struct Marker {
     pub run_count: u32,
     /// Per-pass spend of the run that wrote this marker, in USD.
     pub spend: BTreeMap<String, f64>,
+    /// Cumulative spend of every run recorded on this pull request, in
+    /// USD. Absent in markers written before it existed; those fall back
+    /// to summing the per-pass map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_spend: Option<f64>,
     /// Findings carried in the marker with their resolution state.
     pub findings: Vec<CarriedFinding>,
 }
@@ -49,6 +54,10 @@ pub struct CarriedFinding {
     pub state: CarriedState,
     /// Index of the run that first published the finding.
     pub first_seen: u32,
+    /// Fingerprints the defect was stored under before it merged into
+    /// this record, kept so earlier markers keep suppressing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
 }
 
 /// Resolution state of a carried finding.
@@ -62,6 +71,16 @@ pub enum CarriedState {
     Resolved,
 }
 
+impl CarriedFinding {
+    /// Every fingerprint the defect has been stored under.
+    pub fn fingerprints(&self) -> Vec<String> {
+        let mut all = Vec::with_capacity(self.aliases.len() + 1);
+        all.push(self.fingerprint.clone());
+        all.extend(self.aliases.iter().cloned());
+        all
+    }
+}
+
 const MARKER_PREFIX: &str = "<!-- demur:state ";
 const MARKER_SUFFIX: &str = " -->";
 
@@ -73,8 +92,16 @@ impl Marker {
             head_sha: head_sha.to_string(),
             run_count: 1,
             spend: BTreeMap::new(),
+            total_spend: None,
             findings: Vec::new(),
         }
+    }
+
+    /// Everything this pull request has spent across runs. Markers from
+    /// before cumulative recording fall back to their last run's map.
+    pub fn cumulative_spend(&self) -> f64 {
+        self.total_spend
+            .unwrap_or_else(|| self.spend.values().sum())
     }
 
     /// Encode into the hidden HTML comment form.
@@ -143,12 +170,13 @@ impl Marker {
         Some(marker)
     }
 
-    /// The fingerprint strings of unresolved findings.
+    /// The fingerprint strings of unresolved findings, including the
+    /// earlier fingerprints merged records still carry.
     pub fn unresolved_fingerprints(&self) -> HashSet<String> {
         self.findings
             .iter()
             .filter(|finding| finding.state == CarriedState::Unresolved)
-            .map(|finding| finding.fingerprint.clone())
+            .flat_map(|finding| finding.fingerprints())
             .collect()
     }
 }
@@ -256,25 +284,38 @@ pub enum CarryDecision {
 /// Decide carry-forward for every unresolved prior finding. Dismissed
 /// fingerprints stay silent, reproduced findings are not posted twice,
 /// findings whose cited lines changed without reproduction resolve, and
-/// everything else carries into synthesis.
+/// everything else carries into synthesis. Each decision carries every
+/// fingerprint the record has been stored under, so suppression covers
+/// the aliases a merged record holds.
 pub fn carry_forward(
     prior: &Marker,
     dismissed: &HashSet<String>,
     current: &[(Finding, String)],
     changed_lines: &HashMap<String, BTreeSet<u32>>,
-) -> Vec<(Finding, CarryDecision)> {
+) -> Vec<(Finding, CarryDecision, Vec<String>)> {
     let reproduced: HashSet<_> = current.iter().map(|(_, fp)| fp).collect();
     let mut decisions = Vec::new();
     for carried in &prior.findings {
         if carried.state != CarriedState::Unresolved {
             continue;
         }
-        if dismissed.contains(&carried.fingerprint) {
-            decisions.push((carried_to_finding(carried), CarryDecision::Dismissed));
+        let fingerprints = carried.fingerprints();
+        let dismissed_all = fingerprints.iter().any(|fp| dismissed.contains(fp));
+        let reproduced_all = fingerprints.iter().any(|fp| reproduced.contains(fp));
+        if dismissed_all {
+            decisions.push((
+                carried_to_finding(carried),
+                CarryDecision::Dismissed,
+                fingerprints,
+            ));
             continue;
         }
-        if reproduced.contains(&carried.fingerprint) {
-            decisions.push((carried_to_finding(carried), CarryDecision::Reproduced));
+        if reproduced_all {
+            decisions.push((
+                carried_to_finding(carried),
+                CarryDecision::Reproduced,
+                fingerprints,
+            ));
             continue;
         }
         let lines_changed = changed_lines.get(&carried.path).is_some_and(|lines| {
@@ -284,10 +325,15 @@ pub fn carry_forward(
             decisions.push((
                 carried_to_finding(carried),
                 CarryDecision::ResolvedByChanges,
+                fingerprints,
             ));
             continue;
         }
-        decisions.push((carried_to_finding(carried), CarryDecision::Carried));
+        decisions.push((
+            carried_to_finding(carried),
+            CarryDecision::Carried,
+            fingerprints,
+        ));
     }
     decisions
 }
@@ -350,59 +396,121 @@ pub fn derive_scope(prior: Option<&Marker>, prior_head_is_ancestor: bool) -> Rev
 }
 
 /// Build the marker for a run that just finished: it records the reviewed
-/// head, the run's spend, and every finding still standing, with the new
-/// resolution states applied.
+/// head, the run's spend on top of everything earlier runs spent, and
+/// every finding still standing with the new resolution states applied.
+/// Records describing the same defect merge into one that carries every
+/// fingerprint the defect has been stored under.
 pub fn build_marker(
     head_sha: &str,
     prior: Option<&Marker>,
     run_spend: &BTreeMap<String, f64>,
-    prior_decisions: &[(Finding, CarryDecision, CarriedState)],
+    prior_decisions: &[(Finding, CarryDecision, CarriedState, Vec<String>)],
     current: &[(Finding, String)],
 ) -> Marker {
     let mut marker = Marker::new(head_sha);
     marker.run_count = prior.map_or(1, |prior| prior.run_count + 1);
     marker.spend = run_spend.clone();
+    marker.total_spend =
+        Some(prior.map_or(0.0, |prior| prior.cumulative_spend()) + run_spend.values().sum::<f64>());
     let run = marker.run_count;
 
-    // Findings from earlier runs that still stand, with updated states.
-    for (finding, _, state) in prior_decisions {
+    let mut records: Vec<CarriedFinding> = Vec::new();
+    let mut index: HashMap<(String, String), usize> = HashMap::new();
+    let insert = |records: &mut Vec<CarriedFinding>,
+                  index: &mut HashMap<(String, String), usize>,
+                  record: CarriedFinding| {
+        let key = (
+            record.path.clone(),
+            crate::pipeline::findings::normalize_message(&record.message),
+        );
+        match index.get(&key) {
+            Some(&position) => {
+                let lead = &mut records[position];
+                if record.severity.rank() > lead.severity.rank() {
+                    lead.severity = record.severity;
+                }
+                if record.state == CarriedState::Unresolved {
+                    lead.state = CarriedState::Unresolved;
+                }
+                lead.first_seen = lead.first_seen.min(record.first_seen);
+                for fingerprint in record.fingerprints() {
+                    if fingerprint != lead.fingerprint && !lead.aliases.contains(&fingerprint) {
+                        lead.aliases.push(fingerprint);
+                    }
+                }
+            }
+            None => {
+                index.insert(key, records.len());
+                records.push(record);
+            }
+        }
+    };
+
+    // Findings from earlier runs that still stand, with updated states
+    // and the fingerprints they were published under.
+    for (finding, _, state, fingerprints) in prior_decisions {
         let old = prior.and_then(|prior| {
             prior
                 .findings
                 .iter()
                 .find(|carried| carried.message == finding.message && carried.path == finding.file)
         });
-        marker.findings.push(CarriedFinding {
-            fingerprint: fnv1a(&format!(
-                "{}\u{0}{}\u{0}{}",
-                finding.file,
-                "",
-                crate::pipeline::findings::normalize_message(&finding.message)
-            )),
-            path: finding.file.clone(),
-            start_line: finding.start_line,
-            end_line: finding.end_line,
-            severity: finding.severity,
-            message: finding.message.clone(),
-            harm: finding.harm.clone(),
-            state: *state,
-            first_seen: old.map_or(run, |carried| carried.first_seen),
-        });
+        let (lead, mut aliases) = match fingerprints.split_first() {
+            Some((first, rest)) => ((*first).clone(), rest.to_vec()),
+            None => (
+                fnv1a(&format!(
+                    "{}\u{0}{}\u{0}{}",
+                    finding.file,
+                    "",
+                    crate::pipeline::findings::normalize_message(&finding.message)
+                )),
+                Vec::new(),
+            ),
+        };
+        if let Some(old) = old {
+            for fingerprint in old.fingerprints() {
+                if fingerprint != lead && !aliases.contains(&fingerprint) {
+                    aliases.push(fingerprint);
+                }
+            }
+        }
+        insert(
+            &mut records,
+            &mut index,
+            CarriedFinding {
+                fingerprint: lead,
+                path: finding.file.clone(),
+                start_line: finding.start_line,
+                end_line: finding.end_line,
+                severity: finding.severity,
+                message: finding.message.clone(),
+                harm: finding.harm.clone(),
+                state: *state,
+                first_seen: old.map_or(run, |carried| carried.first_seen),
+                aliases,
+            },
+        );
     }
     // Findings this run published.
-    for (finding, fp) in current {
-        marker.findings.push(CarriedFinding {
-            fingerprint: fp.clone(),
-            path: finding.file.clone(),
-            start_line: finding.start_line,
-            end_line: finding.end_line,
-            severity: finding.severity,
-            message: finding.message.clone(),
-            harm: finding.harm.clone(),
-            state: CarriedState::Unresolved,
-            first_seen: run,
-        });
+    for (finding, fingerprint) in current {
+        insert(
+            &mut records,
+            &mut index,
+            CarriedFinding {
+                fingerprint: fingerprint.clone(),
+                path: finding.file.clone(),
+                start_line: finding.start_line,
+                end_line: finding.end_line,
+                severity: finding.severity,
+                message: finding.message.clone(),
+                harm: finding.harm.clone(),
+                state: CarriedState::Unresolved,
+                first_seen: run,
+                aliases: Vec::new(),
+            },
+        );
     }
+    marker.findings = records;
     marker
 }
 
@@ -439,6 +547,7 @@ mod tests {
             harm: "harm".to_string(),
             state,
             first_seen,
+            aliases: Vec::new(),
         }
     }
 
@@ -649,14 +758,14 @@ mod tests {
         assert!(
             decisions
                 .iter()
-                .any(|(_, decision)| *decision == CarryDecision::Dismissed)
+                .any(|(_, decision, _)| *decision == CarryDecision::Dismissed)
         );
         // The reproduced finding is not carried twice; the new one is not
         // in the prior marker at all, so no carry decision covers it.
         assert!(
             !decisions
                 .iter()
-                .any(|(_, decision)| *decision == CarryDecision::Carried)
+                .any(|(_, decision, _)| *decision == CarryDecision::Carried)
         );
     }
 
@@ -721,5 +830,97 @@ mod tests {
         crate::diff::parse_unified_diff(
             "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1,2 +1,3 @@\n fn one() {\n+    let x = 1;\n }",
         )
+    }
+
+    #[test]
+    fn carried_fingerprints_survive_two_generations() {
+        let spend = BTreeMap::new();
+        let published = vec![(
+            finding("src/a.rs", "Off-by-one error", Severity::Blocker),
+            "fp-anchored".to_string(),
+        )];
+        let first = build_marker("head1", None, &spend, &[], &published);
+        assert_eq!(first.findings[0].fingerprint, "fp-anchored");
+        assert!(first.findings[0].aliases.is_empty());
+
+        let decision = (
+            finding("src/a.rs", "Off-by-one error", Severity::Blocker),
+            CarryDecision::Carried,
+            CarriedState::Unresolved,
+            vec!["fp-anchored".to_string()],
+        );
+        let second = build_marker("head2", Some(&first), &spend, &[decision], &[]);
+        assert_eq!(second.findings.len(), 1);
+        assert_eq!(second.findings[0].fingerprint, "fp-anchored");
+        assert!(second.findings[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn duplicate_records_merge_and_keep_every_fingerprint() {
+        let spend = BTreeMap::new();
+        let decisions = [
+            (
+                finding("src/a.rs", "same defect", Severity::Note),
+                CarryDecision::Carried,
+                CarriedState::Unresolved,
+                vec!["fp-old".to_string()],
+            ),
+            (
+                finding("src/a.rs", "same defect", Severity::Blocker),
+                CarryDecision::Carried,
+                CarriedState::Unresolved,
+                vec!["fp-new".to_string()],
+            ),
+        ];
+        let marker = build_marker("head", None, &spend, &decisions, &[]);
+        assert_eq!(marker.findings.len(), 1);
+        let record = &marker.findings[0];
+        assert_eq!(record.severity, Severity::Blocker);
+        assert!(record.fingerprints().contains(&"fp-old".to_string()));
+        assert!(record.fingerprints().contains(&"fp-new".to_string()));
+
+        // Either fingerprint silences a reproduction.
+        let decisions = carry_forward(&marker, &HashSet::new(), &[], &HashMap::new());
+        assert_eq!(decisions[0].1, CarryDecision::Carried);
+        let dismissed = carry_forward(
+            &marker,
+            &HashSet::from(["fp-old".to_string()]),
+            &[],
+            &HashMap::new(),
+        );
+        assert_eq!(dismissed[0].1, CarryDecision::Dismissed);
+    }
+
+    #[test]
+    fn reproduced_and_carried_records_collapse_into_one() {
+        let spend = BTreeMap::new();
+        let decisions = [(
+            finding("src/a.rs", "still here", Severity::Warning),
+            CarryDecision::Reproduced,
+            CarriedState::Unresolved,
+            vec!["fp-same".to_string()],
+        )];
+        let current = vec![(
+            finding("src/a.rs", "still here", Severity::Warning),
+            "fp-same".to_string(),
+        )];
+        let marker = build_marker("head", None, &spend, &decisions, &current);
+        assert_eq!(marker.findings.len(), 1);
+        assert!(marker.findings[0].aliases.is_empty());
+    }
+
+    #[test]
+    fn cumulative_spend_adds_across_runs_and_falls_back_for_legacy() {
+        let mut run = BTreeMap::new();
+        run.insert("triage".to_string(), 0.1);
+        let first = build_marker("head1", None, &run, &[], &[]);
+        assert_eq!(first.cumulative_spend(), 0.1);
+
+        let second = build_marker("head2", Some(&first), &run, &[], &[]);
+        assert!((second.cumulative_spend() - 0.2).abs() < 1e-9);
+
+        let mut legacy = Marker::new("head");
+        legacy.spend.insert("triage".to_string(), 0.3);
+        assert_eq!(legacy.cumulative_spend(), 0.3);
     }
 }

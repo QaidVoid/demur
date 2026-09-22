@@ -66,6 +66,7 @@ fn prior_marker_body(head: &str, run_count: u32) -> String {
         harm: "Merging leaves the injection reachable by any user.".to_string(),
         state: crate::delta::CarriedState::Unresolved,
         first_seen: 1,
+        aliases: Vec::new(),
     });
     marker.encode()
 }
@@ -1115,4 +1116,134 @@ async fn a_refused_event_falls_back_whether_it_is_403_or_422() {
         assert_eq!(calls[2], "COMMENT", "status {status}");
         assert!(calls[3].contains("the finding"), "status {status}");
     }
+}
+
+#[tokio::test]
+async fn a_carried_finding_is_not_rethreaded_on_its_stored_line() {
+    // The delta touches src/old.rs below the carried blocker's line, so
+    // the carried line itself shows up as context of the new diff. The
+    // blocker stays in the body and must not become a second thread.
+    let delta_diff = "\
+diff --git a/src/old.rs b/src/old.rs
+--- a/src/old.rs
++++ b/src/old.rs
+@@ -2,6 +2,7 @@ fn old() {
+     let a = 1;
+     let b = 2;
+     let c = 3;
++    let d = 4;
+     let e = 5;
+ }";
+    // The marker stores the fingerprint the anchor formula computes for
+    // the carried finding, which is what a fresh reproduction produces.
+    let files = crate::diff::parse_unified_diff(delta_diff);
+    let hunks: Vec<crate::diff::Hunk> = files[0].hunks.clone();
+    let carried_finding = crate::pipeline::findings::Finding {
+        file: "src/old.rs".to_string(),
+        start_line: 4,
+        end_line: 4,
+        severity: crate::config::Severity::Blocker,
+        message: "unfixed sql injection".to_string(),
+        harm: "Merging leaves the injection reachable by any user.".to_string(),
+        suggestion: None,
+        further_concerns: Vec::new(),
+    };
+    let stored_fp = crate::delta::fingerprint(&carried_finding, &hunks);
+    let mut prior = Marker::new("oldhead");
+    prior.run_count = 1;
+    prior.spend.insert("triage".to_string(), 0.01);
+    prior.findings.push(CarriedFinding {
+        fingerprint: stored_fp,
+        path: "src/old.rs".to_string(),
+        start_line: 4,
+        end_line: 4,
+        severity: crate::config::Severity::Blocker,
+        message: "unfixed sql injection".to_string(),
+        harm: "Merging leaves the injection reachable by any user.".to_string(),
+        state: crate::delta::CarriedState::Unresolved,
+        first_seen: 1,
+        aliases: Vec::new(),
+    });
+    let server = MockServer::start().await;
+    let prior_body = prior.encode();
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7,
+            "draft": false,
+            "title": "t",
+            "head": {"sha": "newhead"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ahead"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(delta_diff))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "user": {"login": "github-actions[bot]"}, "body": prior_body, "state": "CHANGES_REQUESTED"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(&server)
+        .await;
+    let thread_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&thread_bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    // No new findings; only the carried blocker stands.
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [],
+            "cluster_lens": [{"path": "src/old.rs", "lenses": []}]
+        }))]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![Ok(json!({"summary": "The blocker stands."}))]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &config(), 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+    assert_eq!(outcome.check_conclusion, "failure");
+    let bodies = thread_bodies.lock().unwrap();
+    let review_body = &bodies[0];
+    assert!(
+        review_body.contains("unfixed sql injection"),
+        "{review_body}"
+    );
+    // The carried finding's line is context of this diff; no new thread
+    // may be created for it.
+    assert!(
+        !review_body.contains("demur:fp"),
+        "carried finding re-threaded: {review_body}"
+    );
 }
