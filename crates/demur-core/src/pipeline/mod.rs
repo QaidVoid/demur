@@ -1407,6 +1407,7 @@ async fn run_deep_dive(
     // Retrieval rounds. The pass named what it wanted; the bot decides
     // what each name means and whether it is willing to read it.
     let mut result = result;
+    let mut carried_prompt = base_prompt;
     if let Some(retriever) = retriever {
         let rounds = config.retrieval.max_rounds;
         for round in 1..=rounds {
@@ -1424,7 +1425,10 @@ async fn run_deep_dive(
                 lens,
                 requested.len()
             );
-            let round_prompt = prompt::with_retrieved(&base_prompt, &resolved);
+            // Attachments accumulate, so a later round still sees what an
+            // earlier one attached. Only on the last permitted round must
+            // the pass stop asking.
+            let round_prompt = prompt::with_retrieved(&carried_prompt, &resolved, round == rounds);
             let decision = {
                 let mut gate = gate.lock().expect("budget gate lock");
                 gate.authorize(PassEstimate {
@@ -1449,7 +1453,7 @@ async fn run_deep_dive(
             };
             match call_pass::<findings::ModelFindings>(
                 provider,
-                round_prompt,
+                round_prompt.clone(),
                 prompt::findings_schema(),
                 "deep dive",
                 config.limits.max_tokens,
@@ -1475,6 +1479,7 @@ async fn run_deep_dive(
                         attached,
                     });
                     result = next;
+                    carried_prompt = round_prompt;
                 }
                 Err(err) => {
                     gate.lock().expect("budget gate lock").release(round_hold);

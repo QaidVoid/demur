@@ -1975,3 +1975,78 @@ async fn the_verdict_prompt_never_sees_a_duplicated_defect() {
     assert_eq!(review.published.len(), 1);
     assert_eq!(review.published[0].further_concerns.len(), 1);
 }
+
+#[tokio::test]
+async fn retrieval_rounds_carry_earlier_attachments_and_end_with_final_findings() {
+    // The dive asks twice: the second round must still see the first
+    // round's attachment, and only the second round asks for final
+    // findings.
+    let checkout = checkout_with(&[
+        (
+            "src/auth/verify.rs",
+            "pub fn verify_token(a: &str, b: &str) -> bool {\n    a == b\n}\n",
+        ),
+        ("src/auth/limits.rs", "pub const MAX_ATTEMPTS: u32 = 3;\n"),
+    ]);
+    let ask_one = json!({
+        "findings": [],
+        "context_requests": ["symbol:verify_token"]
+    });
+    let ask_two = json!({
+        "findings": [],
+        "context_requests": ["file:src/auth/limits.rs"]
+    });
+    let settled = json!({
+        "findings": [{
+            "file": "src/auth/token.rs",
+            "start_line": 2,
+            "end_line": 3,
+            "severity": "blocker",
+            "message": "credential compared without constant time",
+            "harm": "Merging leaks token bytes through timing to any caller."
+        }]
+    });
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(triage_response())]),
+        RecordedProvider::new(vec![
+            Ok(ask_one.clone()),
+            Ok(ask_two.clone()),
+            Ok(settled.clone()),
+        ]),
+        RecordedProvider::new(vec![Ok(summary_response())]),
+    );
+    let mut config = retrieval_config(true);
+    config.limits.deep_calls = 1;
+    config.retrieval.max_rounds = 2;
+    let mut input = input();
+    input.repo_root = Some(checkout.path().to_path_buf());
+
+    let RunOutcome::Review(_) = crate::pipeline::run(&providers, &config, &input)
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let requests = recorded(&providers.deep).requests();
+    assert_eq!(requests.len(), 3, "initial plus two rounds");
+    let round_one = &requests[1].user;
+    assert!(round_one.contains("pub fn verify_token"), "{round_one}");
+    assert!(
+        !round_one.contains("MAX_ATTEMPTS"),
+        "round one cannot see round two's content: {round_one}"
+    );
+    assert!(
+        !round_one.contains("Now produce your final findings"),
+        "a round with another left must not demand final findings"
+    );
+    let round_two = &requests[2].user;
+    assert!(
+        round_two.contains("pub fn verify_token"),
+        "round two lost round one's attachment: {round_two}"
+    );
+    assert!(round_two.contains("MAX_ATTEMPTS"), "{round_two}");
+    assert!(
+        round_two.contains("Now produce your final findings"),
+        "the last round asks for findings: {round_two}"
+    );
+}
