@@ -77,7 +77,7 @@ impl Provider for ClaudeCodeClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|err| ProviderError::Request {
+            .map_err(|err| ProviderError::Rejected {
                 message: format!("could not start {CLAUDE_BIN}: {err}"),
             })?;
 
@@ -86,28 +86,17 @@ impl Provider for ClaudeCodeClient {
         let timeout = self.timeout;
         #[cfg(not(test))]
         let timeout = PASS_TIMEOUT;
-        let output = tokio::time::timeout(timeout, async move {
-            use tokio::io::AsyncWriteExt;
-            let mut stdin = child.stdin.take().expect("child stdin was piped");
-            stdin
-                .write_all(user.as_bytes())
-                .await
-                .map_err(|err| format!("writing the prompt failed: {err}"))?;
-            stdin
-                .flush()
-                .await
-                .map_err(|err| format!("writing the prompt failed: {err}"))?;
-            drop(stdin);
-            child
-                .wait_with_output()
-                .await
-                .map_err(|err| format!("waiting for the answer failed: {err}"))
-        })
-        .await;
+        let stdin = child.stdin.take().expect("child stdin was piped");
+        let stdin_task = tokio::spawn(write_prompt(stdin, user));
+        let waited = tokio::time::timeout(timeout, child.wait_with_output()).await;
 
-        let output = match output {
+        let output = match waited {
             Ok(Ok(output)) => output,
-            Ok(Err(message)) => return Err(ProviderError::Request { message }),
+            Ok(Err(err)) => {
+                return Err(ProviderError::Request {
+                    message: format!("waiting for the answer failed: {err}"),
+                });
+            }
             Err(_) => {
                 return Err(ProviderError::Request {
                     message: format!(
@@ -117,6 +106,14 @@ impl Provider for ClaudeCodeClient {
                 });
             }
         };
+        if let Err(err) = stdin_task
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join.to_string())))
+        {
+            return Err(ProviderError::Request {
+                message: format!("writing the prompt failed: {err}"),
+            });
+        }
 
         if !output.status.success() {
             return Err(ProviderError::Request {
@@ -145,7 +142,21 @@ impl Provider for ClaudeCodeClient {
         }
         let reported_model = parsed.observed_model();
         let result = parsed.result.take().unwrap_or_default();
-        let content = super::openai::parse_json_content(&result)?;
+        let content = match super::openai::parse_json_content(&result) {
+            Ok(content) => content,
+            Err(mut err) => {
+                if let (Some(cli), ProviderError::Malformed { usage, .. }) =
+                    (parsed.usage.as_ref(), &mut err)
+                {
+                    *usage = TokenUsage {
+                        input_tokens: cli.input_tokens + cli.cache_creation_input_tokens,
+                        cached_input_tokens: cli.cache_read_input_tokens,
+                        output_tokens: cli.output_tokens,
+                    };
+                }
+                return Err(err);
+            }
+        };
         let usage = parsed.usage.take().unwrap_or_default();
         Ok(CompletionResponse {
             content,
@@ -167,6 +178,18 @@ fn stderr_tail(stderr: &[u8]) -> String {
     chars[start..].iter().collect()
 }
 
+/// Feed the prompt while the answer is drained, so a child that stops
+/// reading cannot wedge the pass against a full pipe.
+async fn write_prompt(
+    mut stdin: tokio::process::ChildStdin,
+    prompt: String,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stdin.write_all(prompt.as_bytes()).await?;
+    stdin.flush().await?;
+    stdin.shutdown().await
+}
+
 /// The fields demur reads from the CLI's `--output-format json` document.
 /// Everything else is ignored, so unrelated CLI additions never break a
 /// pass.
@@ -182,20 +205,22 @@ struct CliResult {
 
 impl CliResult {
     /// The model that did the work: the CLI keys its model usage by the
-    /// model id, and a fallback spends the most where it answered.
+    /// model id, and a fallback spends the most where it answered. A
+    /// document without a positive spend figure names no model, because a
+    /// free fallback entry is not evidence of what answered.
     fn observed_model(&self) -> Option<String> {
         let usage = self.model_usage.as_ref()?;
-        usage
+        let figure = |spent: &Value| {
+            spent
+                .get("costUSD")
+                .or_else(|| spent.get("total_cost_usd"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        };
+        let (model, spent) = usage
             .iter()
-            .max_by_key(|(_, spent)| {
-                spent
-                    .get("costUSD")
-                    .or_else(|| spent.get("total_cost_usd"))
-                    .and_then(Value::as_f64)
-                    .unwrap_or(0.0)
-                    .to_bits()
-            })
-            .map(|(model, _)| model.clone())
+            .max_by_key(|(_, spent)| figure(spent).to_bits())?;
+        (figure(spent) > 0.0).then(|| model.clone())
     }
 }
 
@@ -347,6 +372,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let script = dir.join("claude");
         // First call answers in prose, the second in the expected shape.
+        // The marker is cleared at setup, not by the script, so repeated
+        // test runs stay idempotent.
+        let _ = std::fs::remove_file(dir.join("called"));
         std::fs::write(
             &script,
             format!(
