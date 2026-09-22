@@ -3,7 +3,7 @@
 
 use crate::config::Severity;
 use crate::pipeline::budget::Degradation;
-use crate::pipeline::findings::{Finding, dedupe, rank, reconcile};
+use crate::pipeline::findings::{Finding, prepare};
 
 /// The review verdict. Publication reports it and never recomputes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +76,7 @@ pub struct Synthesis {
 /// Compute the verdict, enforce the comment budget, and render the body.
 pub fn synthesize(input: SynthesisInput) -> Synthesis {
     let SynthesisInput {
-        mut findings,
+        findings,
         block_on,
         comment_budget,
         degradations,
@@ -87,9 +87,7 @@ pub fn synthesize(input: SynthesisInput) -> Synthesis {
         template,
         models,
     } = input;
-    rank(&mut findings);
-    let findings = dedupe(findings);
-    let findings = reconcile(findings);
+    let findings = prepare(findings);
 
     let blocking_rank = block_on
         .iter()

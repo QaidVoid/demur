@@ -1929,3 +1929,49 @@ async fn cross_examination_prompts_carry_ingested_clusters_not_the_raw_diff() {
         "raw diff leaked: {cross_request:?}"
     );
 }
+
+#[tokio::test]
+async fn the_verdict_prompt_never_sees_a_duplicated_defect() {
+    // Triage and a dive report the exact same defect. The verdict pass
+    // must see it once; the published body is unchanged by the dedupe.
+    let triage = json!({
+        "findings": [{
+            "file": "src/auth/token.rs",
+            "start_line": 2,
+            "end_line": 3,
+            "severity": "blocker",
+            "message": "hardcoded credential",
+            "harm": "Merging publishes a live credential reachable by attackers."
+        }],
+        "cluster_lens": [
+            {"path": "src/auth/token.rs", "lenses": ["security"]},
+            {"path": "src/util.rs", "lenses": ["correctness"]}
+        ]
+    });
+    let config = config_with("standard", "");
+    let providers = registry(vec![
+        vec![triage],
+        vec![
+            dive_response("hardcoded credential"),
+            dive_response("second"),
+        ],
+        vec![summary_response()],
+    ]);
+    let outcome = crate::pipeline::run(&providers, &config, &input())
+        .await
+        .unwrap();
+    let RunOutcome::Review(review) = outcome else {
+        panic!("expected a review");
+    };
+    let requests = recorded(&providers.verdict).requests();
+    let summary_prompt = &requests[0].user;
+    let occurrences = summary_prompt.matches("hardcoded credential").count();
+    assert_eq!(
+        occurrences, 1,
+        "verdict prompt saw a duplicate: {summary_prompt}"
+    );
+    // The two same-location findings reconcile into one carrying both
+    // concerns, so publication discards nothing.
+    assert_eq!(review.published.len(), 1);
+    assert_eq!(review.published[0].further_concerns.len(), 1);
+}

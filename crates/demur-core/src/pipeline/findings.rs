@@ -237,6 +237,14 @@ pub fn rank(findings: &mut [Finding]) {
     });
 }
 
+/// Prepare a finding set for any consumer that argues about it: rank,
+/// deduplicate, and reconcile. Idempotent, so a prompt built from a
+/// prepared set and a synthesis run over the same set agree.
+pub fn prepare(mut findings: Vec<Finding>) -> Vec<Finding> {
+    rank(&mut findings);
+    reconcile(dedupe(findings))
+}
+
 /// Reconcile findings that cite the same location into one finding
 /// carrying every concern raised about it. Merges and never discards: the
 /// leading concern is the first, which is the highest-ranked, and the

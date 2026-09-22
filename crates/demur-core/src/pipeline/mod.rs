@@ -763,6 +763,9 @@ async fn synthesize_review(
 ) -> Result<Review, PipelineError> {
     let mut all = findings;
     all.extend(input.carried_findings.iter().cloned());
+    // The verdict pass sees the prepared set, so duplicated defects never
+    // overweigh the summary prose; synthesis re-prepares idempotently.
+    let all = findings::prepare(all);
 
     // The verdict model drafts the summary prose; the verdict itself is
     // computed mechanically in synthesis and never by the model.
