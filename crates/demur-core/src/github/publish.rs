@@ -30,7 +30,12 @@ pub async fn publish_review(
     comments: &[InlineComment],
 ) -> Result<Publication, GitHubError> {
     let body_with_marker = match marker {
-        Some(marker) => format!("{}\n\n{}", body, marker.encode()),
+        // An oversized marker ships no marker at all, which makes the next
+        // run a full review, rather than breaking publication.
+        Some(marker) => match marker.encode_bounded() {
+            Some(encoded) => format!("{}\n\n{}", body, encoded),
+            None => body.to_string(),
+        },
         None => body.to_string(),
     };
     let event = match verdict {
@@ -70,4 +75,36 @@ review was posted as a comment. The check run carries the verdict.\nGitHub said:
         event_submitted,
         fallback_used,
     })
+}
+
+/// Publish an explanatory notice as a comment review carrying the state
+/// marker, plus a check run whose conclusion says what happened. The
+/// marker keeps carried state and recorded spend alive for the next run.
+pub async fn publish_notice(
+    client: &GitHubClient,
+    number: u64,
+    head_sha: &str,
+    body: &str,
+    marker: Option<&Marker>,
+    conclusion: &'static str,
+) -> Result<(), GitHubError> {
+    let body_with_marker = match marker {
+        Some(marker) => match marker.encode_bounded() {
+            Some(encoded) => format!("{}\n\n{}", body, encoded),
+            None => body.to_string(),
+        },
+        None => body.to_string(),
+    };
+    client
+        .create_review(number, ReviewEvent::Comment, &body_with_marker, &[])
+        .await?;
+    client
+        .create_check_run(
+            head_sha,
+            conclusion,
+            "demur: no review was performed",
+            &body_with_marker,
+        )
+        .await?;
+    Ok(())
 }

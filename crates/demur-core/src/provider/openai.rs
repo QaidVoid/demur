@@ -110,6 +110,7 @@ impl Provider for OpenAiClient {
         let parsed: WireResponse =
             serde_json::from_str(&text).map_err(|err| ProviderError::Malformed {
                 message: redact(&format!("body is not a chat completion: {err}"), &self.key),
+                usage: TokenUsage::default(),
             })?;
         let finish_reason = parsed
             .choices
@@ -229,6 +230,7 @@ pub(crate) fn parse_json_content(text: &str) -> Result<Value, ProviderError> {
     };
     serde_json::from_str(stripped).map_err(|err| ProviderError::Malformed {
         message: format!("content is not a JSON object matching the schema: {err}"),
+        usage: TokenUsage::default(),
     })
 }
 
@@ -270,7 +272,7 @@ fn truncated_or_malformed(
     if finish_reason == "length" {
         ProviderError::OutputTruncated { message, usage }
     } else {
-        ProviderError::Malformed { message }
+        ProviderError::Malformed { message, usage }
     }
 }
 

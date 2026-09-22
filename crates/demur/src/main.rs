@@ -206,6 +206,14 @@ cache entries to, so caching it could reuse an answer about code you have since 
             eprintln!("{notice}");
             Ok(EXIT_FAILED)
         }
+        Ok(RunOutcome::Failed { error, spend }) => {
+            eprintln!("{error}");
+            let total: f64 = spend.iter().map(|pass| pass.cost).sum();
+            if total > 0.0 {
+                eprintln!("spend recorded before the failure: {total:.4} USD");
+            }
+            Ok(EXIT_FAILED)
+        }
         Err(err) => {
             eprintln!("{err}");
             Ok(EXIT_FAILED)

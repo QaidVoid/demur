@@ -95,6 +95,9 @@ pub enum ProviderError {
     Malformed {
         /// Redacted detail about the violation.
         message: String,
+        /// Usage billed to the attempts that were discarded. Zero when the
+        /// failure happened before anything was billed.
+        usage: TokenUsage,
     },
     /// The model spent its whole output budget without producing usable
     /// text. Retryable only with a raised ceiling.

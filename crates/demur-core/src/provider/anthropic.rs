@@ -122,6 +122,7 @@ impl Provider for AnthropicClient {
                     &format!("body is not a messages response: {err}"),
                     &self.key,
                 ),
+                usage: TokenUsage::default(),
             })?;
         let joined = parsed
             .content
@@ -144,6 +145,7 @@ impl Provider for AnthropicClient {
             }
             return Err(ProviderError::Malformed {
                 message: redact(&detail, &self.key),
+                usage: TokenUsage::default(),
             });
         }
         let content = match parse_json_content(&joined) {

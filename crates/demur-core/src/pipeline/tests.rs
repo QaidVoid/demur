@@ -172,8 +172,8 @@ async fn standard_profile_adds_deep_dives_and_no_cross_examination() {
         .map(|pass| pass.pass.as_str())
         .collect();
     assert_eq!(pass_names.len(), 4);
-    assert_eq!(pass_names[1], "deep dive security");
-    assert_eq!(pass_names[2], "deep dive correctness");
+    assert_eq!(pass_names[1], "deep dive security on src/auth/token.rs");
+    assert_eq!(pass_names[2], "deep dive correctness on src/util.rs");
     assert!(!pass_names.contains(&"cross-examination"));
     assert!(review.body.contains("hardcoded credential"));
 }
@@ -283,13 +283,19 @@ async fn malformed_output_fails_the_run_without_a_review() {
         vec![],
         vec![],
     ]);
-    let err = crate::pipeline::run(&providers, &config, &input())
+    let outcome = crate::pipeline::run(&providers, &config, &input())
         .await
-        .unwrap_err();
+        .unwrap();
+    let RunOutcome::Failed { error, spend } = outcome else {
+        panic!("expected a failed run, got {outcome:?}");
+    };
     assert!(matches!(
-        err,
+        error,
         PipelineError::Provider(ProviderError::Malformed { .. })
     ));
+    // The schema-invalid attempts were billed, so the failure carries the
+    // spend line for them.
+    assert!(spend.iter().any(|pass| pass.pass == "triage (failed)"));
 }
 
 #[tokio::test]
@@ -557,9 +563,12 @@ async fn auth_failure_on_a_deep_dive_fails_the_run_immediately() {
         })],
         vec![Ok(summary_response())],
     );
-    let error = crate::pipeline::run(&providers, &config, &input())
+    let outcome = crate::pipeline::run(&providers, &config, &input())
         .await
-        .expect_err("an auth failure must stop the run");
+        .unwrap();
+    let RunOutcome::Failed { error, .. } = outcome else {
+        panic!("expected a failed run, got {outcome:?}");
+    };
     let PipelineError::Provider(ProviderError::Auth { .. }) = error else {
         panic!("expected an auth failure, got {error}");
     };
@@ -1170,7 +1179,10 @@ async fn disclosed_spend_follows_the_planned_order() {
         .collect();
     assert_eq!(
         dives,
-        vec!["deep dive security", "deep dive correctness"],
+        vec![
+            "deep dive security on src/auth/token.rs",
+            "deep dive correctness on src/util.rs"
+        ],
         "spend must follow the planned order, not the completion order"
     );
 }

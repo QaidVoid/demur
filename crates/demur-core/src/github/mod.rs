@@ -10,7 +10,10 @@ pub use publish::{Publication, publish_review};
 #[cfg(test)]
 mod tests;
 
-pub use flow::{FlowError, FlowOutcome, anchor_findings, review_pull_request};
+pub use flow::{
+    FlowError, FlowOutcome, PullRequestState, anchor_findings, continuation_marker,
+    pull_request_state, review_pull_request,
+};
 
 use crate::delta::Marker;
 use crate::provider::redact;

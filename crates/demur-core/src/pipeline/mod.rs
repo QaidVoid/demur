@@ -140,6 +140,7 @@ impl crate::provider::Provider for RecordedProvider {
                 .find(|(marker, _, _)| request.user.contains(marker.as_str()))
                 .ok_or_else(|| ProviderError::Malformed {
                     message: "no recorded response matches this request".to_string(),
+                    usage: TokenUsage::default(),
                 })?;
             if !delay.is_zero() {
                 tokio::time::sleep(*delay).await;
@@ -161,6 +162,7 @@ impl crate::provider::Provider for RecordedProvider {
             .pop_front()
             .ok_or_else(|| ProviderError::Malformed {
                 message: "no more recorded steps".to_string(),
+                usage: TokenUsage::default(),
             })?;
         match step {
             Ok(content) => Ok(CompletionResponse {
@@ -269,6 +271,15 @@ pub enum RunOutcome {
         /// Metadata rule violations, which are evaluated without a
         /// provider call and therefore survive a run that funds no pass.
         violations: Vec<findings::Finding>,
+    },
+    /// The run failed after some passes had already run and been billed.
+    /// The recorded spend travels out so it can be persisted before the
+    /// error is reported.
+    Failed {
+        /// Why the run failed.
+        error: PipelineError,
+        /// Spend recorded up to the failure.
+        spend: Vec<PassSpend>,
     },
 }
 
@@ -398,7 +409,20 @@ you can already anchor to an exact file and line range with its concrete harm.";
         Ok(result) => result,
         Err(err) => {
             gate.release(triage_hold);
-            return Err(err.into());
+            let mut spend = Vec::new();
+            if let ProviderError::Malformed { usage, .. } = &err {
+                spend.push(PassSpend {
+                    pass: "triage (failed)".to_string(),
+                    usage: *usage,
+                    cost: gate.record(usage, &triage_price),
+                    resumed: false,
+                    model: config.models.triage.name.clone(),
+                });
+            }
+            return Ok(RunOutcome::Failed {
+                error: err.into(),
+                spend,
+            });
         }
     };
     let (triage_output, usage, resumed) = (
@@ -531,15 +555,18 @@ you can already anchor to an exact file and line range with its concrete harm.";
         // synthesis is the one a serial run would have produced.
         let mut stood_down = false;
         for outcome in outcomes.into_iter().flatten() {
-            if let Some(err) = outcome.fatal {
-                return Err(err.into());
-            }
+            spend.extend(outcome.spend);
             degradations.extend(outcome.degradations);
             if outcome.stood_down {
                 stood_down = true;
             }
-            spend.extend(outcome.spend);
             all_findings.extend(outcome.findings);
+            if let Some(err) = outcome.fatal {
+                return Ok(RunOutcome::Failed {
+                    error: err.into(),
+                    spend: std::mem::take(&mut spend),
+                });
+            }
         }
         if stood_down {
             degradations.push(Degradation::SummaryOnly {
@@ -547,13 +574,16 @@ you can already anchor to an exact file and line range with its concrete harm.";
             });
         }
         if failures.load(std::sync::atomic::Ordering::SeqCst) > MAX_FAILED_DIVES {
-            return Err(PipelineError::Provider(ProviderError::Rejected {
-                message: format!(
-                    "{} deep dives failed against the provider; the run stopped rather than \
+            return Ok(RunOutcome::Failed {
+                error: PipelineError::Provider(ProviderError::Rejected {
+                    message: format!(
+                        "{} deep dives failed against the provider; the run stopped rather than \
 publishing coverage it could not establish",
-                    failures.load(std::sync::atomic::Ordering::SeqCst)
-                ),
-            }));
+                        failures.load(std::sync::atomic::Ordering::SeqCst)
+                    ),
+                }),
+                spend: std::mem::take(&mut spend),
+            });
         }
         if !unreviewed.is_empty() {
             degradations.push(Degradation::DeepCallsCapped { unreviewed });
@@ -649,11 +679,23 @@ with their concrete harm.";
                 }
                 Err(err @ ProviderError::Auth { .. }) => {
                     gate.release(cross_hold);
-                    return Err(err.into());
+                    return Ok(RunOutcome::Failed {
+                        error: err.into(),
+                        spend: std::mem::take(&mut spend),
+                    });
                 }
                 Err(err) => {
                     gate.release(cross_hold);
                     log::warn!("cross-examination failed: {err}");
+                    if let ProviderError::Malformed { usage, .. } = &err {
+                        spend.push(PassSpend {
+                            pass: "cross-examination (failed)".to_string(),
+                            usage: *usage,
+                            cost: gate.record(usage, paid_price),
+                            resumed: false,
+                            model: model.clone(),
+                        });
+                    }
                     degradations.push(Degradation::PassFailed {
                         pass: "cross-examination".to_string(),
                         reason: err.to_string(),
@@ -983,6 +1025,9 @@ Respond again with only a JSON object that matches it exactly."
     let mut escalations: u32 = 0;
     let mut attempts: u32 = 0;
     let mut carried_usage = TokenUsage::default();
+    // Attempts discarded for failing schema validation were billed all the
+    // same, so their usage travels with the pass however it ends.
+    let mut schema_usage = TokenUsage::default();
     let mut last_error: Option<serde_json::Error> = None;
     loop {
         let correction = last_error.as_ref().map(|err| err.to_string());
@@ -1023,13 +1068,16 @@ retrying with {raised} output tokens"
                 let mut usage = response.usage;
                 usage.input_tokens = usage
                     .input_tokens
-                    .saturating_add(carried_usage.input_tokens);
+                    .saturating_add(carried_usage.input_tokens)
+                    .saturating_add(schema_usage.input_tokens);
                 usage.cached_input_tokens = usage
                     .cached_input_tokens
-                    .saturating_add(carried_usage.cached_input_tokens);
+                    .saturating_add(carried_usage.cached_input_tokens)
+                    .saturating_add(schema_usage.cached_input_tokens);
                 usage.output_tokens = usage
                     .output_tokens
-                    .saturating_add(carried_usage.output_tokens);
+                    .saturating_add(carried_usage.output_tokens)
+                    .saturating_add(schema_usage.output_tokens);
                 // Only a completed, schema-valid pass is stored. A failure
                 // anywhere above leaves nothing behind to resume from.
                 if let (Some(store), Some(key)) = (cache.store, key.as_ref()) {
@@ -1042,6 +1090,15 @@ retrying with {raised} output tokens"
                 });
             }
             Err(err) => {
+                schema_usage.input_tokens = schema_usage
+                    .input_tokens
+                    .saturating_add(response.usage.input_tokens);
+                schema_usage.cached_input_tokens = schema_usage
+                    .cached_input_tokens
+                    .saturating_add(response.usage.cached_input_tokens);
+                schema_usage.output_tokens = schema_usage
+                    .output_tokens
+                    .saturating_add(response.usage.output_tokens);
                 last_error = Some(err);
                 if attempts >= SCHEMA_ATTEMPTS {
                     break;
@@ -1057,6 +1114,7 @@ retrying with {raised} output tokens"
                 .map(|err| err.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
+        usage: schema_usage,
     })
 }
 
@@ -1262,17 +1320,35 @@ async fn run_deep_dive(
             };
         }
         Err(err) => {
-            gate.lock().expect("budget gate lock").release(hold);
+            let gate = &mut *gate.lock().expect("budget gate lock");
+            gate.release(hold);
             log::warn!("deep dive [{lens}] on {} failed: {err}", cluster.path);
             degradations.push(Degradation::PassFailed {
                 pass: format!("deep dive ({lens}) on {}", cluster.path),
                 reason: err.to_string(),
             });
+            let mut spend_lines = Vec::new();
+            // Schema-invalid responses were still billed; record them.
+            if let ProviderError::Malformed { usage, .. } = &err {
+                let paid_price = if downgraded { triage_price } else { deep_price };
+                spend_lines.push(PassSpend {
+                    pass: format!("deep dive {lens} on {} (failed)", cluster.path),
+                    usage: *usage,
+                    cost: gate.record(usage, paid_price),
+                    resumed: false,
+                    model: if downgraded {
+                        config.models.triage.name.clone()
+                    } else {
+                        config.models.deep.name.clone()
+                    },
+                });
+            }
             if failures.fetch_add(1, Ordering::SeqCst) + 1 > MAX_FAILED_DIVES {
                 stop.store(true, Ordering::SeqCst);
             }
             return DiveOutcome {
                 degradations,
+                spend: spend_lines,
                 ..empty(false)
             };
         }
@@ -1289,7 +1365,7 @@ async fn run_deep_dive(
         config.models.deep.name.clone()
     };
     let mut spend_lines = vec![PassSpend {
-        pass: format!("deep dive {lens}"),
+        pass: format!("deep dive {lens} on {}", cluster.path),
         usage: result.usage,
         cost,
         resumed: result.resumed,
@@ -1367,7 +1443,7 @@ async fn run_deep_dive(
                         settle_pass(&mut gate, round_hold, &next.usage, paid_price, next.resumed)
                     };
                     spend_lines.push(PassSpend {
-                        pass: format!("deep dive {lens} retrieval round {round}"),
+                        pass: format!("deep dive {lens} on {} (round {round})", cluster.path),
                         usage: next.usage,
                         cost: round_cost,
                         resumed: next.resumed,

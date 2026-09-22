@@ -5,7 +5,7 @@
 use demur_core::config::CONFIG_FILE_NAME;
 use demur_core::config::Config;
 use demur_core::diff::parse_unified_diff;
-use demur_core::github::{GitHubClient, publish_review};
+use demur_core::github::{GitHubClient, continuation_marker, publish_review, pull_request_state};
 use demur_core::ingest::ingest;
 use demur_core::pipeline::prompt::MetaOrigin;
 use demur_core::pipeline::prompt::PullRequestMeta;
@@ -249,12 +249,38 @@ pub async fn review_pr(
         .pull_request(parsed.number)
         .await
         .map_err(|e| e.to_string())?;
-    let diff = client
-        .pull_request_diff(parsed.number)
-        .await
-        .map_err(|e| e.to_string())?;
-    let files = parse_unified_diff(&diff);
-    let ingestion = ingest(&files, &config);
+    // Publishing shares the GitHub-held state with the Action, so the
+    // review derives its scope from the prior marker, carries findings,
+    // and continues the run and spend history. A printed review covers
+    // the full input every time and touches no state.
+    let state = if publish {
+        Some(
+            pull_request_state(&client, parsed.number, pr.head_sha(), &config)
+                .await
+                .map_err(|e| e.to_string())?,
+        )
+    } else {
+        None
+    };
+    let (ingestion, diff) = match &state {
+        Some(state) => (state.ingestion.clone(), state.diff_text.clone()),
+        None => {
+            let diff = client
+                .pull_request_diff(parsed.number)
+                .await
+                .map_err(|e| e.to_string())?;
+            let files = parse_unified_diff(&diff);
+            (ingest(&files, &config), diff)
+        }
+    };
+    let (prior_spend, carried, suppress) = match &state {
+        Some(state) => (
+            state.prior_spend,
+            state.carried_findings.clone(),
+            state.suppress.clone(),
+        ),
+        None => (0.0, Vec::new(), std::collections::HashSet::new()),
+    };
     let pipeline_input = PipelineInput {
         meta: PullRequestMeta {
             title: if pr.title.is_empty() {
@@ -268,9 +294,9 @@ pub async fn review_pr(
         },
         ingestion: ingestion.clone(),
         diff_text: diff,
-        prior_spend: 0.0,
-        carried_findings: Vec::new(),
-        suppress_fingerprints: std::collections::HashSet::new(),
+        prior_spend,
+        carried_findings: carried,
+        suppress_fingerprints: suppress,
         repo_root: Some(repo.clone()),
     };
 
@@ -307,16 +333,14 @@ your name, not under a bot identity, and without demur's mark."
                 // published from here has resolvable threads and a marker
                 // a later run can read. A body-only review silently costs
                 // delta scope, carry-forward, and dismissal.
-                let cluster_hunks: std::collections::HashMap<String, Vec<_>> = ingestion
-                    .clusters
-                    .iter()
-                    .map(|cluster| (cluster.path.clone(), cluster.hunks.clone()))
-                    .collect();
+                let state = state
+                    .as_ref()
+                    .expect("a publishing run built the shared state");
                 let (fingerprints, comments) = demur_core::github::anchor_findings(
                     &review.published,
                     &ingestion,
-                    &cluster_hunks,
-                    &std::collections::HashSet::new(),
+                    &state.cluster_hunks,
+                    &state.suppress,
                 );
                 let spend: std::collections::BTreeMap<String, f64> = review
                     .spend
@@ -324,13 +348,7 @@ your name, not under a bot identity, and without demur's mark."
                     .iter()
                     .map(|pass| (pass.pass.clone(), pass.cost))
                     .collect();
-                let marker = demur_core::delta::build_marker(
-                    pr.head_sha(),
-                    None,
-                    &spend,
-                    &[],
-                    &fingerprints,
-                );
+                let marker = continuation_marker(pr.head_sha(), state, &spend, &fingerprints);
                 publish_review(
                     &client,
                     parsed.number,
@@ -350,6 +368,14 @@ your name, not under a bot identity, and without demur's mark."
         }
         Ok(RunOutcome::Skipped { notice, .. }) => {
             eprintln!("{notice}");
+            Ok(crate::EXIT_FAILED)
+        }
+        Ok(RunOutcome::Failed { error, spend }) => {
+            eprintln!("{error}");
+            let total: f64 = spend.iter().map(|pass| pass.cost).sum();
+            if total > 0.0 {
+                eprintln!("spend recorded before the failure: {total:.4} USD");
+            }
             Ok(crate::EXIT_FAILED)
         }
         Err(err) => {
