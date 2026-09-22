@@ -131,9 +131,11 @@ Anthropic API natively.
 The `claude-code` family runs each pass through a local headless Claude
 Code installation instead of an HTTP endpoint. It takes no `base_url` and
 no `key_env`: the subprocess holds its own login, so a subscription can
-drive a review with no API key in demur's configuration at all. Prices
-are still required, because the budget gate prices every pass before it
-runs.
+drive a review with no API key in demur's configuration at all. None of
+the HTTP-dialect keys apply to it: naming `base_url`, `key_env`,
+`key_file`, `extra_body`, or `extra_headers` on a `claude-code` provider
+fails validation. Prices are still required, because the budget gate
+prices every pass before it runs.
 
 ```toml
 [providers.claude]
@@ -146,7 +148,7 @@ input_price = 3.00
 output_price = 15.00
 ```
 
-Passthrough parameters are forwarded unmodified:
+Passthrough parameters are forwarded unmodified by the HTTP families:
 
 ```toml
 [providers.openai.extra_body]

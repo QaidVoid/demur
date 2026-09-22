@@ -25,7 +25,9 @@ key_env = "ANTHROPIC_API_KEY"
 ```
 
 The `claude-code` family takes neither a URL nor a key: each pass runs as
-a local headless process that holds its own login. See
+a local headless process that holds its own login. Naming a `key_env`,
+`key_file`, `base_url`, `extra_body`, or `extra_headers` on it fails
+validation, because the transport cannot use them. See
 [Driving demur from Claude Code](/guide/claude-code).
 
 ## Keys

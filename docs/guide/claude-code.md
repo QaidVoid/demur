@@ -14,8 +14,11 @@ or transmits a key on this path, because there is none to see.
 
 ## Configuration
 
-No `base_url`, no `key_env`, no key file. Prices stay required, because
-the budget gate prices every pass before it runs:
+No `base_url`, no `key_env`, no key file. Naming any of those, or the
+HTTP-dialect `extra_body` and `extra_headers` knobs, fails validation,
+because a setting the transport cannot use is a setting that silently
+does nothing. Prices stay required, because the budget gate prices every
+pass before it runs:
 
 ```toml
 profile = "standard"
@@ -89,11 +92,12 @@ stale can be served.
 
 ## Fork pull requests
 
-A GitHub Action run on a fork pull request refuses the family before any
-pass, because the subprocess would act on input written by someone
-outside the repository while carrying its own credentials. The job
-summary explains this and no review is attempted. Locally the family runs
-on any input: you are driving your own login on your own machine.
+A GitHub Action run on a fork pull request, or on one whose head origin
+cannot be identified, refuses the family before any pass, because the
+subprocess would act on input written by someone outside the repository
+while carrying its own credentials. The job summary explains this and no
+review is attempted. Locally the family runs on any input: you are
+driving your own login on your own machine.
 
 ## Letting Claude Code run demur
 
@@ -112,14 +116,22 @@ A Stop-hook wrapper can make the review gate a session: the hook runs the
 review when Claude stops and blocks stopping with the findings until the
 verdict approves. The hook contract is exit status based: exit 0 lets the
 session stop, and exit 2 blocks it with whatever the hook printed on
-stderr fed back to Claude. The wrapper stays thin, because the JSON
-output and the exit status are the whole contract:
+stderr fed back to Claude. The hook input on standard input tells the
+wrapper when a stop was already blocked once (`stop_hook_active`), and
+honoring it keeps one blocked stop from looping into a paid re-review.
+The wrapper stays thin, because the JSON output and the exit status are
+the whole contract:
 
 ```bash
 #!/bin/bash
 # .claude/hooks/demur-stop.sh, a stop hook that blocks on demur's verdict
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# A stop that a previous block already caused must not re-run the review.
+if python3 -c 'import json, sys
+sys.exit(0 if json.load(sys.stdin).get("stop_hook_active") else 1)' 2>/dev/null; then
+  exit 0
+fi
 demur review --format json >"$work/review.json" 2>"$work/error"
 status=$?
 case $status in
