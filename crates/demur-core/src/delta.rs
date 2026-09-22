@@ -164,14 +164,27 @@ fn fnv1a(data: &str) -> String {
 }
 
 /// Compute a finding fingerprint from path, enclosing symbol, and the
-/// normalized message, so shifted lines still match.
+/// normalized messages of every concern at the location, so shifted lines
+/// still match and a reconciled thread keeps its identity when ranking
+/// orders its concerns differently between runs.
 pub fn fingerprint(finding: &Finding, hunks: &[Hunk]) -> String {
     let symbol = enclosing_symbol(finding.start_line, hunks);
+    let mut messages: Vec<String> = Vec::with_capacity(finding.further_concerns.len() + 1);
+    messages.push(crate::pipeline::findings::normalize_message(
+        &finding.message,
+    ));
+    for concern in &finding.further_concerns {
+        messages.push(crate::pipeline::findings::normalize_message(
+            &concern.message,
+        ));
+    }
+    messages.sort();
+    messages.dedup();
     fnv1a(&format!(
         "{}\u{0}{}\u{0}{}",
         finding.file,
         symbol.unwrap_or_default(),
-        crate::pipeline::findings::normalize_message(&finding.message)
+        messages.join("\u{1}")
     ))
 }
 
@@ -566,6 +579,42 @@ mod tests {
         assert_ne!(
             fingerprint(&original, &hunks),
             fingerprint(&other_file, &hunks)
+        );
+    }
+
+    #[test]
+    fn reconciled_thread_fingerprint_is_stable_when_the_leader_changes() {
+        let hunks = vec![Hunk {
+            old_start: 1,
+            old_lines: 6,
+            new_start: 1,
+            new_lines: 7,
+            lines: vec![crate::diff::DiffLine {
+                kind: crate::diff::LineKind::Context,
+                old_line: Some(1),
+                new_line: Some(1),
+                content: "fn issue() {".to_string(),
+            }],
+        }];
+        let mut led_by_blocker = finding("src/a.rs", "unchecked index", Severity::Blocker);
+        led_by_blocker
+            .further_concerns
+            .push(crate::pipeline::findings::Concern {
+                message: "redundant flag".to_string(),
+                harm: "harm".to_string(),
+                suggestion: None,
+            });
+        let mut led_by_note = finding("src/a.rs", "redundant flag", Severity::Blocker);
+        led_by_note
+            .further_concerns
+            .push(crate::pipeline::findings::Concern {
+                message: "unchecked index".to_string(),
+                harm: "harm".to_string(),
+                suggestion: None,
+            });
+        assert_eq!(
+            fingerprint(&led_by_blocker, &hunks),
+            fingerprint(&led_by_note, &hunks)
         );
     }
 
