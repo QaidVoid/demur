@@ -5,14 +5,14 @@
 mod flow;
 mod publish;
 
-pub use publish::{Publication, publish_review};
+pub use publish::{Publication, publish_notice, publish_review};
 
 #[cfg(test)]
 mod tests;
 
 pub use flow::{
-    FlowError, FlowOutcome, PullRequestState, anchor_findings, continuation_marker,
-    pull_request_state, review_pull_request,
+    FlowError, FlowOutcome, PullRequestState, anchor_findings, continuation_marker, failure_notice,
+    publish_skip_notice, pull_request_state, review_pull_request, state_only_marker,
 };
 
 use crate::delta::Marker;
@@ -451,17 +451,26 @@ impl GitHubClient {
     }
 
     /// The newest decodable marker from the bot's own prior reviews,
-    /// chosen by the highest recorded run count so the result does not
-    /// depend on the API's list order. Reviews without a decodable marker
-    /// are ignored, so stripped or tampered bodies degrade to a full
-    /// review.
+    /// chosen by the highest recorded run count, ties broken toward the
+    /// later review, so the result does not depend on the API's list
+    /// order. Ties are real: a skip or failure notice marker keeps the
+    /// run count of the full marker it succeeds. Reviews without a
+    /// decodable marker are ignored, so stripped or tampered bodies
+    /// degrade to a full review.
     pub async fn prior_marker(&self, number: u64) -> Result<Option<Marker>, GitHubError> {
         let reviews = self.reviews(number).await?;
         Ok(reviews
             .iter()
-            .filter_map(|review| review.body.as_deref())
-            .filter_map(Marker::decode)
-            .max_by_key(|marker| marker.run_count))
+            .enumerate()
+            .filter_map(|(index, review)| {
+                review
+                    .body
+                    .as_deref()
+                    .and_then(Marker::decode)
+                    .map(|marker| (index, marker))
+            })
+            .max_by_key(|(index, marker)| (marker.run_count, *index))
+            .map(|(_, marker)| marker))
     }
 
     /// The fingerprints of findings whose review threads a human resolved.

@@ -410,11 +410,11 @@ you can already anchor to an exact file and line range with its concrete harm.";
         Err(err) => {
             gate.release(triage_hold);
             let mut spend = Vec::new();
-            if let ProviderError::Malformed { usage, .. } = &err {
+            if let Some(usage) = billed_usage(&err) {
                 spend.push(PassSpend {
                     pass: "triage (failed)".to_string(),
-                    usage: *usage,
-                    cost: gate.record(usage, &triage_price),
+                    usage,
+                    cost: gate.record(&usage, &triage_price),
                     resumed: false,
                     model: config.models.triage.name.clone(),
                 });
@@ -687,11 +687,11 @@ with their concrete harm.";
                 Err(err) => {
                     gate.release(cross_hold);
                     log::warn!("cross-examination failed: {err}");
-                    if let ProviderError::Malformed { usage, .. } = &err {
+                    if let Some(usage) = billed_usage(&err) {
                         spend.push(PassSpend {
                             pass: "cross-examination (failed)".to_string(),
-                            usage: *usage,
-                            cost: gate.record(usage, paid_price),
+                            usage,
+                            cost: gate.record(&usage, paid_price),
                             resumed: false,
                             model: model.clone(),
                         });
@@ -859,13 +859,17 @@ coverage was complete and no defect was established.";
                     Err(err) => {
                         log::warn!("verdict summary failed, publishing without it: {err}");
                         gate.release(hold);
-                        if let ProviderError::OutputTruncated { usage, .. } = &err {
+                        if let Some(usage) = billed_usage(&err) {
                             spend.push(PassSpend {
                                 pass: "verdict summary (failed)".to_string(),
-                                usage: *usage,
-                                cost: gate.record(usage, paid_price),
+                                usage,
+                                cost: gate.record(&usage, paid_price),
                                 resumed: false,
-                                model: config.models.verdict.name.clone(),
+                                model: if downgrade {
+                                    config.models.triage.name.clone()
+                                } else {
+                                    config.models.verdict.name.clone()
+                                },
                             });
                         }
                         degradations.push(Degradation::SummaryUnavailable {
@@ -1142,7 +1146,15 @@ fn select_lenses(
         _ => false,
     };
     match lens_map.get(&cluster.path) {
-        Some(names) => names.iter().filter(|name| enabled(name)).cloned().collect(),
+        Some(names) => {
+            // A triage response may name a lens twice; two identical dives
+            // would only double the spend under one name.
+            let mut chosen: Vec<String> =
+                names.iter().filter(|name| enabled(name)).cloned().collect();
+            chosen.sort();
+            chosen.dedup();
+            chosen
+        }
         None if lenses.correctness => vec!["correctness".to_string()],
         None => Vec::new(),
     }
@@ -1320,28 +1332,30 @@ async fn run_deep_dive(
             };
         }
         Err(err) => {
-            let gate = &mut *gate.lock().expect("budget gate lock");
-            gate.release(hold);
             log::warn!("deep dive [{lens}] on {} failed: {err}", cluster.path);
             degradations.push(Degradation::PassFailed {
                 pass: format!("deep dive ({lens}) on {}", cluster.path),
                 reason: err.to_string(),
             });
             let mut spend_lines = Vec::new();
-            // Schema-invalid responses were still billed; record them.
-            if let ProviderError::Malformed { usage, .. } = &err {
-                let paid_price = if downgraded { triage_price } else { deep_price };
-                spend_lines.push(PassSpend {
-                    pass: format!("deep dive {lens} on {} (failed)", cluster.path),
-                    usage: *usage,
-                    cost: gate.record(usage, paid_price),
-                    resumed: false,
-                    model: if downgraded {
-                        config.models.triage.name.clone()
-                    } else {
-                        config.models.deep.name.clone()
-                    },
-                });
+            // The lock covers the release and the booking only.
+            {
+                let gate = &mut *gate.lock().expect("budget gate lock");
+                gate.release(hold);
+                if let Some(usage) = billed_usage(&err) {
+                    let paid_price = if downgraded { triage_price } else { deep_price };
+                    spend_lines.push(PassSpend {
+                        pass: format!("deep dive {lens} on {} (failed)", cluster.path),
+                        usage,
+                        cost: gate.record(&usage, paid_price),
+                        resumed: false,
+                        model: if downgraded {
+                            config.models.triage.name.clone()
+                        } else {
+                            config.models.deep.name.clone()
+                        },
+                    });
+                }
             }
             if failures.fetch_add(1, Ordering::SeqCst) + 1 > MAX_FAILED_DIVES {
                 stop.store(true, Ordering::SeqCst);
@@ -1533,6 +1547,19 @@ fn settle_pass(
         price.cost_of_usage(usage)
     } else {
         gate.settle(hold, usage, price)
+    }
+}
+
+/// The usage a failed pass burned and its error carries, so a run that
+/// fails after billing still reports what it spent. Malformed covers
+/// schema-invalid responses; OutputTruncated covers attempts that grew
+/// past every ceiling and can never be recovered by a retry.
+fn billed_usage(err: &ProviderError) -> Option<TokenUsage> {
+    match err {
+        ProviderError::Malformed { usage, .. } | ProviderError::OutputTruncated { usage, .. } => {
+            Some(*usage)
+        }
+        _ => None,
     }
 }
 

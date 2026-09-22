@@ -53,8 +53,10 @@ expressed, one comment per location, plus one check run whose conclusion is the
 verdict. Publication reports the verdict and never recomputes it, so the review
 and the check can never disagree.
 
-Publication is atomic. Nothing is posted until synthesis completes, so a
-cancelled job costs tokens but never a partial verdict.
+Publication is atomic. No review is posted until synthesis completes, so a
+cancelled job costs tokens but never a partial verdict. A run that fails or
+is stood down before a verdict posts only an explanatory notice with the
+state marker, never a review that looks like one.
 
 ## Profiles
 

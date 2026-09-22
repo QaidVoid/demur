@@ -84,10 +84,10 @@ In particular:
 ### Coverage and spend
 
 - triage spend: $0.0021 (resumed from cache)
-- deep dive security spend: $0.1087 (resumed from cache)
-- deep dive correctness spend: $0.1107
+- deep dive security on src/big.rs spend: $0.1087 (resumed from cache)
+- deep dive correctness on src/util.rs spend: $0.1107
 - Paid by this run: $0.1107
-- Inherited from an earlier attempt: $0.1108 (triage, deep dive security)
+- Inherited from an earlier attempt: $0.1108 (triage, deep dive security on src/big.rs)
 - Total spend this run: $0.2215
 ```
 

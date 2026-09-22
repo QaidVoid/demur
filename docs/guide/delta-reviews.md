@@ -9,9 +9,15 @@ and still fails the check.</p>
 demur keeps no database and no cache. Every review it publishes carries a hidden
 marker in the review body, an inert HTML comment recording:
 
-- the head commit it reviewed,
-- what each pass spent,
-- the fingerprint, severity, and resolution state of every finding it published.
+- the head commit it reviewed, empty only on a run that failed before
+  reviewing anything,
+- what every run so far has spent, accumulated across the pull request,
+- the fingerprint, severity, and resolution state of every finding it
+  published, plus the earlier fingerprints each finding was stored under.
+
+A run that skips or fails before a verdict publishes a notice carrying its
+own marker: the delta base and the run count stay where the last review left
+them, and the spend a failed run recorded stays alive for the next run's cap.
 
 On the next run demur reads its own prior reviews on the pull request. That is
 the entire state mechanism. It works on a fork, it works after a cache

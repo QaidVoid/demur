@@ -82,46 +82,16 @@ pub async fn review_pull_request(
         Ok(RunOutcome::Review(review)) => *review,
         Ok(RunOutcome::Skipped { notice, violations }) => {
             // The check run must not report success as if a review
-            // happened. A carried blocker keeps it failed, and so does a
-            // rule violation at a blocking severity, which costs nothing
-            // to establish and is therefore known even here.
-            let blocking_rank = config
-                .block_on
-                .severities
-                .iter()
-                .map(|severity| severity.rank())
-                .min()
-                .unwrap_or_else(|| crate::config::Severity::Blocker.rank());
-            let blocking_violation = violations
-                .iter()
-                .any(|violation| violation.severity.rank() >= blocking_rank);
-            let carried_blocker = blocking_violation
-                || state.prior_marker.as_ref().is_some_and(|marker| {
-                    marker.findings.iter().any(|record| {
-                        record.state == CarriedState::Unresolved
-                            && record.severity == crate::config::Severity::Blocker
-                    })
-                });
-            // Nothing was reviewed, so the reviewed head, the run count,
-            // and every carried finding stay exactly as they were; only
-            // dismissals read from GitHub are recorded.
-            let marker = state_only_marker(
-                state.prior_marker.as_ref(),
-                &state.dismissed,
-                &BTreeMap::new(),
-            );
-            let conclusion = if carried_blocker {
-                "failure"
-            } else {
-                "neutral"
-            };
-            super::publish::publish_notice(
+            // happened, so the shared notice publication decides its
+            // conclusion from what was already known for certain.
+            let conclusion = publish_skip_notice(
                 client,
                 number,
                 &head_sha,
+                &state,
                 &notice,
-                marker.as_ref(),
-                conclusion,
+                &violations,
+                &config.block_on.severities,
             )
             .await?;
             return Ok(FlowOutcome {
@@ -134,36 +104,32 @@ pub async fn review_pull_request(
         Ok(RunOutcome::Failed { error, spend }) => {
             // The failed run's billed passes count against the cap, so the
             // notice carries a marker that preserves prior state plus the
-            // spend recorded before the failure.
+            // spend recorded before the failure. Resumed passes were
+            // counted by the run that first paid them.
             let run_spend: BTreeMap<String, f64> = spend
                 .iter()
+                .filter(|pass| !pass.resumed)
                 .map(|pass| (pass.pass.clone(), pass.cost))
                 .collect();
             let marker =
                 state_only_marker(state.prior_marker.as_ref(), &state.dismissed, &run_spend);
-            let total: f64 = run_spend.values().sum();
-            let lines: String = spend
-                .iter()
-                .map(|pass| format!("- {}: ${:.4}\n", pass.pass, pass.cost))
-                .collect();
-            let notice = format!(
-                "## demur: review failed\n\n\
-The review ran but failed before a verdict was reached: {error}\n\n\
-Spend recorded before the failure ({total:.4} USD):\n{lines}\n\
-The next run counts this spend against the pull request's budget."
-            );
+            let notice = failure_notice(&error, &spend, marker.is_some());
             if let Err(publish_err) = super::publish::publish_notice(
                 client,
                 number,
                 &head_sha,
                 &notice,
                 marker.as_ref(),
+                "demur: review failed",
                 "failure",
             )
             .await
             {
                 log::warn!("could not publish the failure notice: {publish_err}");
-                log::warn!("the {total:.4} USD recorded by this run could not be persisted");
+                log::warn!(
+                    "the {:.4} USD recorded by this run could not be persisted",
+                    run_spend.values().sum::<f64>()
+                );
             }
             return Err(error.into());
         }
@@ -175,6 +141,7 @@ The next run counts this spend against the pull request's budget."
         &state.ingestion,
         &state.cluster_hunks,
         &state.suppress,
+        &state.carried_findings,
     );
 
     // Did the head move while we worked?
@@ -188,10 +155,13 @@ review ran against {head_sha}. The newer commit was not reviewed.\n"
         ));
     }
 
+    // Resumed passes re-report what the run that first paid them already
+    // recorded, so only live spend joins the marker.
     let spend: BTreeMap<String, f64> = review
         .spend
         .passes
         .iter()
+        .filter(|pass| !pass.resumed)
         .map(|pass| (pass.pass.clone(), pass.cost))
         .collect();
     let marker = continuation_marker(&head_sha, &state, &spend, &fingerprints);
@@ -225,18 +195,32 @@ review ran against {head_sha}. The newer commit was not reviewed.\n"
 /// those anchored in the current diff. Shared so every path that publishes
 /// a review publishes the same one: a body-only review is a review with no
 /// resolvable threads, and a review with no fingerprints is a review no
-/// later run can carry forward or silence.
+/// later run can carry forward or silence. A published finding whose path
+/// and normalized message match a carried record is that same defect: its
+/// stored fingerprint may not be exactly recomputable once reconciled
+/// concerns or the enclosing symbol have moved, so the identity carried
+/// records merge on decides here too.
 pub fn anchor_findings(
     published: &[Finding],
     ingestion: &crate::ingest::Ingestion,
     cluster_hunks: &HashMap<String, Vec<crate::diff::Hunk>>,
     suppress: &HashSet<String>,
+    carried: &[Finding],
 ) -> (Vec<(Finding, String)>, Vec<InlineComment>) {
+    use crate::pipeline::findings::normalize_message;
+    let carried_identities: HashSet<(String, String)> = carried
+        .iter()
+        .map(|finding| (finding.file.clone(), normalize_message(&finding.message)))
+        .collect();
     let mut fingerprints: Vec<(Finding, String)> = Vec::new();
     for finding in published {
         if let Some(hunks) = cluster_hunks.get(&finding.file) {
             let fingerprint = delta::fingerprint(finding, hunks);
             if suppress.contains(&fingerprint) {
+                continue;
+            }
+            let identity = (finding.file.clone(), normalize_message(&finding.message));
+            if carried_identities.contains(&identity) {
                 continue;
             }
             fingerprints.push((finding.clone(), fingerprint));
@@ -296,8 +280,12 @@ pub async fn pull_request_state(
 ) -> Result<PullRequestState, FlowError> {
     let prior_marker = client.prior_marker(number).await?;
     let prior_is_ancestor = match &prior_marker {
-        Some(marker) => client.is_ancestor(&marker.head_sha, head_sha).await?,
-        None => false,
+        // An empty head marks spend carried by a failed run; it was never
+        // a reviewed commit, so it cannot be an ancestor or a delta base.
+        Some(marker) if !marker.head_sha.is_empty() => {
+            client.is_ancestor(&marker.head_sha, head_sha).await?
+        }
+        _ => false,
     };
     let scope = delta::derive_scope(prior_marker.as_ref(), prior_is_ancestor);
     match &scope {
@@ -408,26 +396,128 @@ fn carried_states(
         .collect()
 }
 
+/// Publish the notice a stood-down run produced: a comment review with the
+/// state-only marker and a check run that does not claim a review
+/// happened. A carried blocker keeps the conclusion failed, and so does a
+/// rule violation at a blocking severity, which costs nothing to establish
+/// and is therefore known even here. Shared by every publishing
+/// distribution. Returns the check run conclusion.
+pub async fn publish_skip_notice(
+    client: &GitHubClient,
+    number: u64,
+    head_sha: &str,
+    state: &PullRequestState,
+    notice: &str,
+    violations: &[Finding],
+    block_on: &[crate::config::Severity],
+) -> Result<&'static str, GitHubError> {
+    // Nothing was reviewed, so the reviewed head, the run count, and every
+    // carried finding stay exactly as they were; only dismissals read from
+    // GitHub are recorded.
+    let marker = state_only_marker(
+        state.prior_marker.as_ref(),
+        &state.dismissed,
+        &BTreeMap::new(),
+    );
+    let blocking_rank = block_on
+        .iter()
+        .map(|severity| severity.rank())
+        .min()
+        .unwrap_or_else(|| crate::config::Severity::Blocker.rank());
+    let blocking_violation = violations
+        .iter()
+        .any(|violation| violation.severity.rank() >= blocking_rank);
+    let carried_blocker = blocking_violation
+        || state.prior_marker.as_ref().is_some_and(|prior| {
+            prior.findings.iter().any(|record| {
+                record.state == CarriedState::Unresolved
+                    && record.severity == crate::config::Severity::Blocker
+            })
+        });
+    let conclusion = if carried_blocker {
+        "failure"
+    } else {
+        "neutral"
+    };
+    super::publish::publish_notice(
+        client,
+        number,
+        head_sha,
+        notice,
+        marker.as_ref(),
+        "demur: no review was performed",
+        conclusion,
+    )
+    .await?;
+    Ok(conclusion)
+}
+
+/// The notice body for a run that billed passes and then failed before a
+/// verdict. `recorded` says whether a marker could carry the spend into
+/// the next run; on a first run nothing can, and promising it anyway
+/// would hide lost money behind a log line. Shared by every distribution
+/// that publishes, so the Action and the CLI tell the reader the same
+/// story.
+pub fn failure_notice(
+    error: &PipelineError,
+    spend: &[crate::pipeline::PassSpend],
+    recorded: bool,
+) -> String {
+    let lines: String = spend
+        .iter()
+        .map(|pass| format!("- {}: ${:.4}\n", pass.pass, pass.cost))
+        .collect();
+    let total: f64 = spend.iter().map(|pass| pass.cost).sum();
+    let closing = if recorded {
+        "The next run counts this spend against the pull request's budget."
+    } else {
+        "There was no earlier marker to attach this spend to, so it could \
+not be recorded and the next run starts without it."
+    };
+    format!(
+        "## demur: review failed\n\n\
+The review ran but failed before a verdict was reached: {error}\n\n\
+Spend recorded before the failure ({total:.4} USD):\n{lines}\n\
+{closing}"
+    )
+}
+
 /// The marker for a run that reviewed nothing: prior state with the run's
 /// recorded spend added. The reviewed head and the run count stay as the
 /// prior marker had them, so the next run's delta base is still the last
 /// head anything was actually reviewed at, and no finding resolves,
-/// because nothing was reviewed that could resolve it.
-fn state_only_marker(
+/// because nothing was reviewed that could resolve it. Live spend only:
+/// resumed passes re-report what the run that first paid them already
+/// recorded. A first run with no prior state still gets a marker when it
+/// billed something; its empty head carries the spend without ever
+/// serving as a delta base.
+pub fn state_only_marker(
     prior: Option<&Marker>,
     dismissed: &HashSet<String>,
     run_spend: &BTreeMap<String, f64>,
 ) -> Option<Marker> {
-    let prior = prior?;
-    let mut marker = delta::build_marker(
-        &prior.head_sha,
-        Some(prior),
-        run_spend,
-        &carried_states(Some(prior), dismissed, &HashMap::new()),
-        &[],
-    );
-    marker.run_count = prior.run_count;
-    Some(marker)
+    let live: BTreeMap<String, f64> = run_spend
+        .iter()
+        .filter(|(_, cost)| **cost > 0.0)
+        .map(|(pass, cost)| (pass.clone(), *cost))
+        .collect();
+    match prior {
+        Some(prior) => {
+            let mut marker = delta::build_marker(
+                &prior.head_sha,
+                Some(prior),
+                &live,
+                &carried_states(Some(prior), dismissed, &HashMap::new()),
+                &[],
+            );
+            marker.run_count = prior.run_count;
+            Some(marker)
+        }
+        None if live.values().any(|cost| *cost > 0.0) => {
+            Some(delta::build_marker("", None, &live, &[], &[]))
+        }
+        None => None,
+    }
 }
 
 /// The set of new-side lines the diff touches for one file, when the file

@@ -109,8 +109,8 @@ Every review ends with its own accounting:
 
 - deep dive (security) on src/big.rs: context was shrunk to the highest-risk content
 - triage spend: $0.0021
-- deep dive security spend: $0.1087
-- deep dive correctness spend: $0.1107
+- deep dive security on src/big.rs spend: $0.1087
+- deep dive correctness on src/util.rs spend: $0.1107
 - Total spend this run: $0.2215
 - Cumulative spend for this pull request: $0.6321 (earlier runs: $0.4106)
 ```

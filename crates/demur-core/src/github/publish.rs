@@ -78,14 +78,16 @@ review was posted as a comment. The check run carries the verdict.\nGitHub said:
 }
 
 /// Publish an explanatory notice as a comment review carrying the state
-/// marker, plus a check run whose conclusion says what happened. The
-/// marker keeps carried state and recorded spend alive for the next run.
+/// marker when one fits, plus a check run whose title and conclusion say
+/// what happened. The marker keeps carried state and recorded spend alive
+/// for the next run.
 pub async fn publish_notice(
     client: &GitHubClient,
     number: u64,
     head_sha: &str,
     body: &str,
     marker: Option<&Marker>,
+    title: &'static str,
     conclusion: &'static str,
 ) -> Result<(), GitHubError> {
     let body_with_marker = match marker {
@@ -99,12 +101,7 @@ pub async fn publish_notice(
         .create_review(number, ReviewEvent::Comment, &body_with_marker, &[])
         .await?;
     client
-        .create_check_run(
-            head_sha,
-            conclusion,
-            "demur: no review was performed",
-            &body_with_marker,
-        )
+        .create_check_run(head_sha, conclusion, title, &body_with_marker)
         .await?;
     Ok(())
 }

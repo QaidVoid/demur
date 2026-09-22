@@ -388,9 +388,13 @@ pub enum ReviewScope {
 pub fn derive_scope(prior: Option<&Marker>, prior_head_is_ancestor: bool) -> ReviewScope {
     match prior {
         None => ReviewScope::Full,
-        Some(marker) if prior_head_is_ancestor => ReviewScope::Delta {
-            since_sha: marker.head_sha.clone(),
-        },
+        // A marker with no reviewed head (a failed run that still billed
+        // passes) carries spend but can never serve as a delta base.
+        Some(marker) if !marker.head_sha.is_empty() && prior_head_is_ancestor => {
+            ReviewScope::Delta {
+                since_sha: marker.head_sha.clone(),
+            }
+        }
         Some(_) => ReviewScope::Full,
     }
 }
@@ -433,6 +437,10 @@ pub fn build_marker(
                     lead.state = CarriedState::Unresolved;
                 }
                 lead.first_seen = lead.first_seen.min(record.first_seen);
+                // The lead keeps its own line range, so resolution by
+                // changed lines watches the lead's lines; the aliases keep
+                // every fingerprint the merged records were published
+                // under.
                 for fingerprint in record.fingerprints() {
                     if fingerprint != lead.fingerprint && !lead.aliases.contains(&fingerprint) {
                         lead.aliases.push(fingerprint);
@@ -922,5 +930,24 @@ mod tests {
         let mut legacy = Marker::new("head");
         legacy.spend.insert("triage".to_string(), 0.3);
         assert_eq!(legacy.cumulative_spend(), 0.3);
+    }
+
+    #[test]
+    fn ten_runs_each_spending_a_tenth_exhaust_the_cap_on_the_tenth() {
+        let mut prior: Option<Marker> = None;
+        for run in 1..=10 {
+            let mut spend = BTreeMap::new();
+            spend.insert("triage".to_string(), 0.01);
+            let marker = build_marker("head", prior.as_ref(), &spend, &[], &[]);
+            assert!(
+                (marker.cumulative_spend() - 0.01 * f64::from(run)).abs() < 1e-9,
+                "run {run} spent {}",
+                marker.cumulative_spend()
+            );
+            prior = Some(marker);
+        }
+        let tenth = prior.expect("ten markers");
+        assert!((tenth.cumulative_spend() - 0.1).abs() < 1e-9);
+        assert_eq!(tenth.run_count, 10);
     }
 }

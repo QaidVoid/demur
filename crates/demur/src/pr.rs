@@ -5,7 +5,9 @@
 use demur_core::config::CONFIG_FILE_NAME;
 use demur_core::config::Config;
 use demur_core::diff::parse_unified_diff;
-use demur_core::github::{GitHubClient, continuation_marker, publish_review, pull_request_state};
+use demur_core::github::{
+    GitHubClient, continuation_marker, publish_notice, publish_review, pull_request_state,
+};
 use demur_core::ingest::ingest;
 use demur_core::pipeline::prompt::MetaOrigin;
 use demur_core::pipeline::prompt::PullRequestMeta;
@@ -336,11 +338,30 @@ your name, not under a bot identity, and without demur's mark."
                 let state = state
                     .as_ref()
                     .expect("a publishing run built the shared state");
+                // The head can move while the review runs, exactly as the
+                // Action guards; inline comments against a stale head cost
+                // the whole publication.
+                let current_head = client
+                    .pull_request(parsed.number)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .head_sha()
+                    .to_string();
+                let head_moved = current_head != pr.head_sha();
+                let mut body = review.body.clone();
+                if head_moved {
+                    body.push_str(&format!(
+                        "\n\nNote: the pull request head advanced to {current_head} while this \
+review ran against {}. The newer commit was not reviewed.\n",
+                        pr.head_sha()
+                    ));
+                }
                 let (fingerprints, comments) = demur_core::github::anchor_findings(
                     &review.published,
                     &ingestion,
                     &state.cluster_hunks,
                     &state.suppress,
+                    &state.carried_findings,
                 );
                 let spend: std::collections::BTreeMap<String, f64> = review
                     .spend
@@ -354,7 +375,7 @@ your name, not under a bot identity, and without demur's mark."
                     parsed.number,
                     pr.head_sha(),
                     review.verdict,
-                    &review.body,
+                    &body,
                     Some(&marker),
                     &comments,
                 )
@@ -366,8 +387,27 @@ your name, not under a bot identity, and without demur's mark."
                 Verdict::RequestChanges => crate::EXIT_REQUEST_CHANGES,
             })
         }
-        Ok(RunOutcome::Skipped { notice, .. }) => {
-            eprintln!("{notice}");
+        Ok(RunOutcome::Skipped { notice, violations }) => {
+            if publish {
+                // The stood-down run still publishes its marker, exactly
+                // as the Action would, so the history keeps coherent.
+                let state = state
+                    .as_ref()
+                    .expect("a publishing run built the shared state");
+                demur_core::github::publish_skip_notice(
+                    &client,
+                    parsed.number,
+                    pr.head_sha(),
+                    state,
+                    &notice,
+                    &violations,
+                    &config.block_on.severities,
+                )
+                .await
+                .map_err(|err| publication_failure(err, identity.badged))?;
+            } else {
+                eprintln!("{notice}");
+            }
             Ok(crate::EXIT_FAILED)
         }
         Ok(RunOutcome::Failed { error, spend }) => {
@@ -375,6 +415,36 @@ your name, not under a bot identity, and without demur's mark."
             let total: f64 = spend.iter().map(|pass| pass.cost).sum();
             if total > 0.0 {
                 eprintln!("spend recorded before the failure: {total:.4} USD");
+            }
+            // A publishing run persists the billed spend the same way the
+            // Action does, so a PR reviewed from a workstation does not
+            // quietly forget what a failed run cost.
+            if publish {
+                let state = state
+                    .as_ref()
+                    .expect("a publishing run built the shared state");
+                let run_spend: std::collections::BTreeMap<String, f64> = spend
+                    .iter()
+                    .filter(|pass| !pass.resumed)
+                    .map(|pass| (pass.pass.clone(), pass.cost))
+                    .collect();
+                let marker = demur_core::github::state_only_marker(
+                    state.prior_marker.as_ref(),
+                    &state.dismissed,
+                    &run_spend,
+                );
+                let notice = demur_core::github::failure_notice(&error, &spend, marker.is_some());
+                publish_notice(
+                    &client,
+                    parsed.number,
+                    pr.head_sha(),
+                    &notice,
+                    marker.as_ref(),
+                    "demur: review failed",
+                    "failure",
+                )
+                .await
+                .map_err(|err| publication_failure(err, identity.badged))?;
             }
             Ok(crate::EXIT_FAILED)
         }

@@ -808,6 +808,7 @@ fn a_dismissed_reconciled_thread_suppresses_every_concern() {
         &ingestion,
         &cluster_hunks,
         &Default::default(),
+        &[],
     );
     assert_eq!(fingerprints.len(), 1);
     assert_eq!(comments.len(), 1);
@@ -816,7 +817,7 @@ fn a_dismissed_reconciled_thread_suppresses_every_concern() {
     let suppress: std::collections::HashSet<String> =
         fingerprints.iter().map(|(_, fp)| fp.clone()).collect();
     let (fingerprints, comments) =
-        super::flow::anchor_findings(&[reconciled], &ingestion, &cluster_hunks, &suppress);
+        super::flow::anchor_findings(&[reconciled], &ingestion, &cluster_hunks, &suppress, &[]);
     assert!(fingerprints.is_empty());
     assert!(comments.is_empty());
 }
@@ -1245,5 +1246,317 @@ diff --git a/src/old.rs b/src/old.rs
     assert!(
         !review_body.contains("demur:fp"),
         "carried finding re-threaded: {review_body}"
+    );
+}
+
+/// The escaped form a marker's head field takes inside a raw request
+/// body: the review payload quotes the marker JSON as one string.
+fn contains_encoded_head(body: &str, head: &str) -> bool {
+    body.contains(&format!("\\\"head_sha\\\":\\\"{head}\\\""))
+}
+
+/// A prior marker with recorded spend and no findings, for runs that skip
+/// or fail before anything is carried.
+fn spend_only_marker_body(head: &str, run_count: u32) -> String {
+    let mut marker = Marker::new(head);
+    marker.run_count = run_count;
+    marker.spend.insert("triage".to_string(), 0.01);
+    marker.encode()
+}
+
+async fn spend_prior_mocks(server: &MockServer, prior_body: String) {
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7, "draft": false, "title": "t", "head": {"sha": "newhead"}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ahead"})))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(UNRELATED_DIFF))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "user": {"login": "github-actions[bot]"}, "body": prior_body, "state": "COMMENTED"}
+        ])))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_failed_run_publishes_its_spend_and_keeps_the_delta_base() {
+    let server = MockServer::start().await;
+    spend_prior_mocks(&server, spend_only_marker_body("oldhead", 1)).await;
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    let check_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&check_bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        })
+        .mount(&server)
+        .await;
+
+    // Three schema-invalid responses exhaust the pass's validation
+    // attempts, so the run fails as Malformed with the attempts' usage.
+    let bad = json!({"findings": "not an array"});
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(bad.clone()), Ok(bad.clone()), Ok(bad)]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![]),
+    );
+    let result = super::flow::review_pull_request(&client(&server), &providers, &config(), 7).await;
+    assert!(result.is_err(), "a failed review must fail the flow");
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "one notice review: {bodies:?}");
+    let notice = &bodies[0];
+    assert!(notice.contains("## demur: review failed"), "{notice}");
+    assert!(notice.contains("triage (failed)"), "{notice}");
+    assert!(notice.contains("counts this spend"), "{notice}");
+    // The notice marker keeps the last reviewed head and run count, so
+    // the next run reviews the delta the failed run never covered.
+    assert!(contains_encoded_head(notice, "oldhead"), "{notice}");
+    assert!(notice.contains("\\\"run_count\\\":1"), "{notice}");
+    let checks = check_bodies.lock().unwrap();
+    assert!(checks[0].contains("\"failure\""), "{checks:?}");
+}
+
+#[tokio::test]
+async fn a_skipped_run_publishes_a_neutral_notice_that_keeps_the_delta_base() {
+    let server = MockServer::start().await;
+    spend_prior_mocks(&server, spend_only_marker_body("oldhead", 1)).await;
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    let check_bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&check_bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({}))
+        })
+        .mount(&server)
+        .await;
+
+    // The prior run already spent past this cap, so nothing may be reviewed.
+    let capped = Config::from_toml(
+        r#"
+[budget]
+per_pr_usd = 0.005
+
+[providers.openai]
+family = "openai"
+base_url = "https://provider.test/v1"
+key_env = "TEST_KEY"
+
+[models.triage]
+provider = "openai"
+name = "t"
+input_price = 0.15
+output_price = 0.60
+
+[models.deep]
+provider = "openai"
+name = "d"
+input_price = 3.00
+output_price = 15.00
+
+[models.verdict]
+provider = "openai"
+name = "t"
+input_price = 0.15
+output_price = 0.60
+"#,
+    )
+    .unwrap();
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &capped, 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+    assert_eq!(outcome.check_conclusion, "neutral");
+    assert!(
+        outcome.summary.contains("Review skipped"),
+        "{}",
+        outcome.summary
+    );
+    let bodies = bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1, "one notice review: {bodies:?}");
+    assert!(bodies[0].contains("Review skipped"), "{bodies:?}");
+    assert!(contains_encoded_head(&bodies[0], "oldhead"), "{bodies:?}");
+    assert!(bodies[0].contains("\\\"run_count\\\":1"), "{bodies:?}");
+    let checks = check_bodies.lock().unwrap();
+    assert!(checks[0].contains("\"neutral\""), "{checks:?}");
+}
+
+#[tokio::test]
+async fn a_carried_defect_is_not_rethreaded_when_its_stored_fingerprint_is_unrecomputable() {
+    // The stored fingerprint predates reconciliation: no recomputation
+    // over the current hunks can reproduce it, because the carried record
+    // keeps no concern messages and the enclosing symbol may have moved.
+    // A fresh finding reporting the same defect must still be suppressed
+    // by the identity carried records merge on.
+    let delta_diff = "\
+diff --git a/src/old.rs b/src/old.rs
+--- a/src/old.rs
++++ b/src/old.rs
+@@ -2,6 +2,7 @@ fn old() {
+     let a = 1;
+     let b = 2;
+     let c = 3;
++    let d = 4;
+     let e = 5;
+ }";
+    let mut prior = Marker::new("oldhead");
+    prior.run_count = 1;
+    prior.findings.push(CarriedFinding {
+        fingerprint: "fp-unrecomputable-legacy".to_string(),
+        path: "src/old.rs".to_string(),
+        start_line: 4,
+        end_line: 4,
+        severity: crate::config::Severity::Blocker,
+        message: "unfixed sql injection".to_string(),
+        harm: "Merging leaves the injection reachable by any user.".to_string(),
+        state: crate::delta::CarriedState::Unresolved,
+        first_seen: 1,
+        aliases: Vec::new(),
+    });
+    let server = MockServer::start().await;
+    let prior_body = prior.encode();
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7,
+            "draft": false,
+            "title": "t",
+            "head": {"sha": "newhead"}
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github+json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"status": "ahead"})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/compare/oldhead...newhead"))
+        .and(header("accept", "application/vnd.github.v3.diff"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(delta_diff))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "user": {"login": "github-actions[bot]"}, "body": prior_body, "state": "CHANGES_REQUESTED"}
+        ])))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}
+        })))
+        .mount(&server)
+        .await;
+    let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = std::sync::Arc::clone(&bodies);
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(move |request: &Request| {
+            let body = String::from_utf8(request.body.clone()).unwrap();
+            recorder.lock().unwrap().push(body);
+            ResponseTemplate::new(200).set_body_json(json!({"id": 11}))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/repos/owner/repo/check-runs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+
+    // Triage reports the same defect fresh, anchored to the same line.
+    let providers = ProviderRegistry::recorded(
+        RecordedProvider::new(vec![Ok(json!({
+            "findings": [{
+                "file": "src/old.rs",
+                "start_line": 4,
+                "end_line": 4,
+                "severity": "blocker",
+                "message": "unfixed sql injection",
+                "harm": "Merging leaves the injection reachable by any user."
+            }],
+            "cluster_lens": [{"path": "src/old.rs", "lenses": []}]
+        }))]),
+        RecordedProvider::new(vec![]),
+        RecordedProvider::new(vec![Ok(json!({"summary": "The blocker stands."}))]),
+    );
+    let outcome = super::flow::review_pull_request(&client(&server), &providers, &config(), 7)
+        .await
+        .unwrap();
+    assert!(outcome.published);
+    assert_eq!(outcome.check_conclusion, "failure");
+    let bodies = bodies.lock().unwrap();
+    let review_body = &bodies[0];
+    let payload: serde_json::Value = serde_json::from_str(review_body).unwrap();
+    assert!(
+        review_body.contains("unfixed sql injection"),
+        "the standing defect must still be named: {review_body}"
+    );
+    let comments = payload["comments"].as_array().unwrap();
+    assert!(
+        comments.is_empty(),
+        "the carried defect was re-threaded: {comments:?}"
+    );
+    assert!(
+        !review_body.contains("demur:fp"),
+        "a second thread fingerprint appeared: {review_body}"
     );
 }

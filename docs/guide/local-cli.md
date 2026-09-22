@@ -30,8 +30,10 @@ demur pr https://github.com/owner/repo/pull/42
 The target may be a pull request number inside a repository checkout or a
 full URL. The GitHub token comes from `GITHUB_TOKEN`, then `GH_TOKEN`, and
 finally from the GitHub CLI when it is authenticated (`gh auth login`). The
-pull request diff is fetched and reviewed in full: the CLI keeps no state,
-so it never reads or writes the bot's review markers.
+CLI writes nothing unless you pass `--publish`. It still reads the bot's
+prior markers from GitHub, so a run after an Action review covers only the
+new commits, carries unresolved findings, and honors what earlier runs
+already spent against the cap.
 
 ## Progress logs
 
@@ -62,7 +64,10 @@ A failed run never reports as a clean review.
 The CLI never writes to GitHub by default. `demur pr --publish` posts the
 review, and it says so first: the findings will appear under the identity
 that owns the token, not under a bot identity. A locally published review
-carries no bot state, so it does not affect delta reviews.
+continues the same history an Action run would: its marker sets the delta
+base for whatever runs next, wherever they run. A publishing run that skips
+or fails posts the same notice the Action would, so billed spend is never
+lost.
 
 ## Budgets apply locally
 
