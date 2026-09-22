@@ -20,7 +20,7 @@ fn client(server: &MockServer) -> GitHubClient {
 }
 
 fn config() -> Config {
-    Config::from_toml(&format!(
+    Config::from_toml(
         r#"
 [budget]
 unlimited = true
@@ -47,8 +47,8 @@ provider = "openai"
 name = "t"
 input_price = 0.15
 output_price = 0.60
-"#
-    ))
+"#,
+    )
     .unwrap()
 }
 
@@ -236,8 +236,7 @@ async fn missing_review_permission_fails_without_publishing_a_check_run() {
         &[],
     )
     .await
-    .err()
-    .expect("publication should fail");
+    .expect_err("publication should fail");
     assert!(err.to_string().contains("permission"), "{err}");
     server.verify().await;
 }

@@ -12,6 +12,7 @@ const KEY_VALUE: &str = "sk-action-test-key";
 
 /// Build the job environment in a temp dir and run the action binary.
 struct Job {
+    #[allow(dead_code)]
     dir: tempfile::TempDir,
     summary_path: std::path::PathBuf,
 }
@@ -229,15 +230,6 @@ impl wiremock::Respond for ProviderSeq {
             "usage": {"prompt_tokens": 100, "completion_tokens": 20}
         }))
     }
-}
-
-fn rewrite(envs: Vec<std::ffi::OsString>, from: &str, to: &str) -> Vec<std::ffi::OsString> {
-    envs.into_iter()
-        .map(|env| {
-            let pair = env.to_string_lossy().replace(from, to);
-            std::ffi::OsString::from(pair)
-        })
-        .collect()
 }
 
 fn set_env(envs: Vec<std::ffi::OsString>, name: &str, value: &str) -> Vec<std::ffi::OsString> {

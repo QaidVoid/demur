@@ -488,7 +488,6 @@ mod tests {
         assert!(matches!(err, ProviderError::Request { .. }));
         server.verify().await;
     }
-    use super::*;
 
     #[tokio::test]
     async fn empty_content_error_reports_stop_reason_and_block_types() {

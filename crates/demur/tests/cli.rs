@@ -10,7 +10,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 const KEY_ENV: &str = "DEMUR_CLI_TEST_KEY";
 const KEY_VALUE: &str = "sk-cli-test-key";
 
-fn fixture_repo(name: &str, server_uri: &str) -> tempfile::TempDir {
+fn fixture_repo(_name: &str, server_uri: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     fs::write(repo.join("src.rs"), "fn one() {}\n").unwrap();
@@ -127,7 +127,7 @@ async fn approve_prints_json_and_exits_zero() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(parsed["verdict"], "approve");
-    assert!(parsed["spend"]["passes"].as_array().unwrap().len() >= 1);
+    assert!(!parsed["spend"]["passes"].as_array().unwrap().is_empty());
 }
 
 #[tokio::test]

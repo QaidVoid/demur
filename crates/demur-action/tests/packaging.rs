@@ -52,7 +52,7 @@ fn composite_action_declares_expected_surface() {
     // position is not something to assert on.
     let review = runs
         .iter()
-        .find(|step| step["name"] == Value::from("Run review"))
+        .find(|step| step["name"] == "Run review")
         .expect("a step that runs the review");
     let env = review["env"].as_mapping().expect("step env");
     assert!(env.contains_key(Value::from("GITHUB_TOKEN")));
