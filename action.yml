@@ -48,7 +48,9 @@ runs:
           *) echo "unsupported platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
         esac
         mkdir -p /tmp/demur-bin
-        url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${DEMUR_VERSION}/demur-${DEMUR_VERSION}-${target}.tar.gz"
+        # The release lives in demur's own repository. GITHUB_REPOSITORY
+        # here is the consuming repository, which hosts no releases.
+        url="https://github.com/QaidVoid/demur/releases/download/${DEMUR_VERSION}/demur-${DEMUR_VERSION}-${target}.tar.gz"
         curl --fail --silent --show-error --location "$url" | tar -xz -C /tmp/demur-bin
         chmod +x /tmp/demur-bin/demur-action
     - name: Restore review cache

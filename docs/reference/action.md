@@ -42,6 +42,7 @@ jobs:
 | `github_token` | the job token | Token used for the review event, the check run, and reading the diff. |
 | `demur_version` | current release tag | Release to download the binary from. |
 | `profile` | unset | Overrides `profile` in `.demur.toml` for this run: `quick`, `standard`, or `deep`. |
+| `cache` | `false` | Keep completed review passes between attempts of the same job, so a retried run does not pay twice. It can only change what a run costs, never what it concludes, and it is never read on a pull request from a fork. |
 
 The provider key is not an input. It is passed through `env` under whatever
 name your configuration's `key_env` declares, so the key never becomes an

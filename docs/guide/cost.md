@@ -105,15 +105,25 @@ first move if you ever suspect concurrency of anything.
 Every review ends with its own accounting:
 
 ```markdown
-### Coverage and spend
+### Coverage
 
 - deep dive (security) on src/big.rs: context was shrunk to the highest-risk content
+
+### Spend
+
 - triage spend: $0.0021
 - deep dive security on src/big.rs spend: $0.1087
 - deep dive correctness on src/util.rs spend: $0.1107
 - Total spend this run: $0.2215
 - Cumulative spend for this pull request: $0.6321 (earlier runs: $0.4106)
 ```
+
+A spend line carries a note when its figure is not the plain token price at
+the configured rates. `(agent-reported)` means the provider itself reported
+the figure. `(token-priced)` means the pass ran on an agent that reported no
+figure, so the configured rates priced its token counts instead.
+`(resumed from cache)` marks spend a previous attempt already paid, which is
+counted for honesty but billed to no one twice.
 
 Cached input is priced at the cached rate where the provider reports it
 separately, which matters because demur sends the same cluster context to

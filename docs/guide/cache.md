@@ -81,7 +81,7 @@ In particular:
 ## What a resumed run reports
 
 ```markdown
-### Coverage and spend
+### Spend
 
 - triage spend: $0.0021 (resumed from cache)
 - deep dive security on src/big.rs spend: $0.1087 (resumed from cache)

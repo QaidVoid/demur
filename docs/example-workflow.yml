@@ -25,7 +25,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: qaidvoid/review-bot@v0
+      - uses: qaidvoid/demur@v0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           demur_version: v0.1.0

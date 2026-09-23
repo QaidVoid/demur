@@ -61,8 +61,13 @@ party, and the migration it adds has no rollback path.
 ### Coverage and spend
 
 - Full coverage: every pass ran without degradation.
+
+### Spend
+
 - triage spend: $0.0021
 - deep dive security on src/auth/token.rs spend: $0.1087
+- cross-examination spend: $0.1099
+- verdict summary spend: $0.1211
 - Total spend this run: $0.3418
 - Cumulative spend for this pull request: $0.4106 (earlier runs: $0.0688)
 ```

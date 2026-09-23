@@ -33,7 +33,7 @@ shared application means trusting the person who owns it.
 
 **If you would rather not, register your own.** `client_id` is just
 configuration. Create an application under your own account, point demur at it,
-and everything works identically — you trade the shared mark for your own
+and everything works identically: you trade the shared mark for your own
 avatar. That is a real alternative, not a theoretical one, and it is why the
 shared application is a convenience rather than a requirement.
 

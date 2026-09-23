@@ -20,6 +20,7 @@ demur review --format json   # machine-readable output
 | `RANGE` | working copy | Revision range written `FROM..TO`. |
 | `--repo <PATH>` | current directory | Repository root to review. |
 | `--format <FMT>` | `markdown` | `markdown` or `json`. |
+| `--cache-dir <PATH>` | off | Reuse completed passes from this directory when a run is retried. Nothing is cached unless it names one. |
 
 History is read through jj when the repository has a `.jj` directory, and
 through git otherwise. The commit messages in the range stand in for a pull
@@ -44,6 +45,7 @@ demur pr 128 --publish
 | `--repo <PATH>` | current directory | Repository root, used to resolve the remote and load configuration. |
 | `--format <FMT>` | `markdown` | `markdown` or `json`. |
 | `--publish` | off | Post the review to GitHub under your own identity. |
+| `--cache-dir <PATH>` | off | Reuse completed passes from this directory when a run is retried. With `--publish`, it shares the Action's cache layout. |
 
 Without `--publish` nothing is written to GitHub. With it, the review is posted
 under the identity owning the token you supplied, not under a bot account, and

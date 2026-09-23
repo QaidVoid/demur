@@ -28,7 +28,7 @@ footer = "Disagree with a finding? Resolve the thread and say why."
 ```
 
 `header` and `footer` are rendered exactly as written. **Nothing is
-substituted** — a `$HEAD` or a `{verdict}` in your prose is published as those
+substituted**: a `$HEAD` or a `{verdict}` in your prose is published as those
 characters.
 
 That is deliberate. Interpolation does not stay small: first the head commit,
@@ -89,7 +89,7 @@ The `models` section is not in the default body and is worth adding:
 
 Passes are grouped by the model that actually ran them. If the budget
 downgraded a deep dive to the cheaper model, the model named is the one it
-used, not the one you configured — a run that quietly dropped to a smaller
+used, not the one you configured. A run that quietly dropped to a smaller
 model is exactly the run whose findings deserve a second look.
 
 Without this, the spend report tells you a deep dive cost eleven cents and

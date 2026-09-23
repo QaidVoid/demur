@@ -30,10 +30,10 @@ demur pr https://github.com/owner/repo/pull/42
 The target may be a pull request number inside a repository checkout or a
 full URL. The GitHub token comes from `GITHUB_TOKEN`, then `GH_TOKEN`, and
 finally from the GitHub CLI when it is authenticated (`gh auth login`). The
-CLI writes nothing unless you pass `--publish`. It still reads the bot's
-prior markers from GitHub, so a run after an Action review covers only the
-new commits, carries unresolved findings, and honors what earlier runs
-already spent against the cap.
+CLI writes nothing unless you pass `--publish`. A read-only run always
+reviews the pull request's full diff: delta scope, carried findings, and
+recorded spend are GitHub-held state, and reading or continuing them is a
+publishing concern.
 
 ## Progress logs
 

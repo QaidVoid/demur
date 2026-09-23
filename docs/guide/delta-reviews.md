@@ -68,6 +68,13 @@ Findings are fingerprinted by path, enclosing symbol context, and normalized
 message, so a finding survives its lines shifting up or down. A different
 message in the same area is a different finding and is raised normally.
 
+Suppression inherits the limits of that identity. A later run that words a
+still-standing defect very differently can escape the fingerprint and comment
+again, and two genuinely different defects that normalize to the same words at
+the same place would collapse into one. Normalization and the symbol context
+make both rare, and the design biases toward the visible failure: a duplicate
+comment, never a quietly swallowed one.
+
 After a large rebase, some fingerprints will not match and you may see a
 finding repeat once. That is the intended direction of the trade: fingerprint
 drift costs a duplicate comment, never a suppressed defect.
