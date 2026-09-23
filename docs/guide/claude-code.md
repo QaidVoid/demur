@@ -37,6 +37,7 @@ provider = "claude"
 name = "sonnet"
 input_price = 3.00
 output_price = 15.00
+effort = "high"
 
 [models.verdict]
 provider = "claude"
@@ -48,7 +49,10 @@ output_price = 15.00
 Roles may mix families: triage on your OpenAI key, deep dives through the
 subscription, and so on. The `name` field is the model alias passed to the
 CLI; the model disclosure in the review names the model that actually
-answered, which the CLI reports alongside its own cost figure.
+answered, which the CLI reports alongside its own cost figure. The optional
+`effort` key per role sets the CLI's effort level (`--effort`): low, medium,
+high, xhigh, or max. Deep dives benefit from it the most; triage usually
+does not need it.
 
 One prerequisite follows from the transport: whatever machine runs demur
 needs a Claude Code installation and a completed login under the user demur

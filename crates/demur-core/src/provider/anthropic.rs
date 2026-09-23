@@ -296,6 +296,7 @@ mod tests {
             output_price: 15.0,
             reasoning_effort: None,
             thinking_budget,
+            effort: None,
             extra_body: None,
             extra_headers: None,
             cached_input_price: None,

@@ -58,6 +58,7 @@ mod tests {
             output_price: output,
             reasoning_effort: None,
             thinking_budget: None,
+            effort: None,
             extra_body: None,
             extra_headers: None,
             cached_input_price: None,

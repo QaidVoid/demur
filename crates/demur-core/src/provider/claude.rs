@@ -61,6 +61,7 @@ fn child_env_allows(key: &str) -> bool {
 /// input, one JSON document out.
 pub struct ClaudeCodeClient {
     model: String,
+    effort: Option<String>,
     binary: std::path::PathBuf,
     #[cfg(test)]
     timeout: Duration,
@@ -72,6 +73,7 @@ impl ClaudeCodeClient {
     pub fn new(model: &crate::config::ModelDef) -> Self {
         ClaudeCodeClient {
             model: model.name.clone(),
+            effort: model.effort.clone(),
             binary: std::path::PathBuf::from(CLAUDE_BIN),
             #[cfg(test)]
             timeout: PASS_TIMEOUT,
@@ -82,9 +84,16 @@ impl ClaudeCodeClient {
     pub(crate) fn for_tests(binary: std::path::PathBuf, timeout: Duration) -> Self {
         ClaudeCodeClient {
             model: "test-model".to_string(),
+            effort: None,
             binary,
             timeout,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_effort(mut self, effort: &str) -> Self {
+        self.effort = Some(effort.to_string());
+        self
     }
 }
 
@@ -107,7 +116,11 @@ impl Provider for ClaudeCodeClient {
             .arg("--append-system-prompt")
             .arg(&request.system)
             .arg("--model")
-            .arg(&self.model)
+            .arg(&self.model);
+        if let Some(effort) = &self.effort {
+            command.arg("--effort").arg(effort);
+        }
+        command
             .arg("--max-turns")
             .arg("1")
             .arg("--tools")
@@ -429,6 +442,21 @@ mod tests {
         );
         let stdin = std::fs::read_to_string(dir.path().join("stdin")).unwrap();
         assert_eq!(stdin, "volatile data");
+    }
+
+    #[tokio::test]
+    async fn the_configured_effort_rides_the_command_line() {
+        let (script, dir) = fixture(
+            "effort",
+            &format!("printf '%s' {}", sh_quote(&result_document("{\"a\": 1}"))),
+        );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT).with_effort("xhigh");
+        complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap();
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
+        assert!(args.contains("--effort xhigh"), "{args}");
+        assert!(args.contains("--model test-model --effort xhigh"), "{args}");
     }
 
     #[tokio::test]

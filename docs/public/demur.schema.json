@@ -263,6 +263,13 @@
             "null"
           ]
         },
+        "effort": {
+          "description": "Claude Code effort level: low, medium, high, xhigh, or max.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "extra_body": {
           "additionalProperties": true,
           "default": null,

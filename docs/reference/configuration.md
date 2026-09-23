@@ -343,11 +343,13 @@ cached_input_price = 0.075   # optional; defaults to half the input price
 
 reasoning_effort = "high"    # openai family: minimal, low, medium, high
 thinking_budget = 8000       # anthropic family: tokens
+effort = "high"              # claude-code family: low, medium, high, xhigh, max
 
 [models.triage.extra_body]   # optional passthrough
 custom_sampling_control = 42
 ```
 
 `reasoning_effort` applies to the openai family only, `thinking_budget` to
-the anthropic family only, and the wrong combination fails validation.
-A model without a price fails the run closed.
+the anthropic family only, `effort` to the claude-code family only, and the
+wrong combination fails validation. A model without a price fails the run
+closed.

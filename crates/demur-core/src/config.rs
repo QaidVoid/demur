@@ -753,6 +753,8 @@ pub struct ModelDef {
     pub reasoning_effort: Option<String>,
     /// Anthropic thinking budget in tokens.
     pub thinking_budget: Option<u32>,
+    /// Claude Code effort level: low, medium, high, xhigh, or max.
+    pub effort: Option<String>,
     /// Extra body fields forwarded to the provider unmodified.
     #[serde(default)]
     #[schemars(with = "Option<std::collections::BTreeMap<String, serde_json::Value>>")]
@@ -1027,6 +1029,25 @@ fn validate(config: &Config) -> Result<(), ConfigError> {
                 return Err(ConfigError::Invalid {
                     field: format!("{role}.thinking_budget"),
                     message: "must be at least one token".to_string(),
+                });
+            }
+        }
+        if let Some(effort) = &model.effort {
+            if family != Family::ClaudeCode {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.effort"),
+                    message: "applies to the claude-code family; for openai-compatible \
+providers use reasoning_effort and for anthropic use thinking_budget"
+                        .to_string(),
+                });
+            }
+            let allowed = ["low", "medium", "high", "xhigh", "max"];
+            if !allowed.contains(&effort.as_str()) {
+                return Err(ConfigError::Invalid {
+                    field: format!("{role}.effort"),
+                    message: format!(
+                        "`{effort}` is not valid, allowed values: low, medium, high, xhigh, max"
+                    ),
                 });
             }
         }
@@ -1694,6 +1715,31 @@ output_price = 15.00
         );
         let text = err_text(&text);
         assert!(text.contains("models.deep.reasoning_effort"));
+    }
+
+    #[test]
+    fn effort_is_claude_code_only_and_value_checked() {
+        let text = subscription_only().replace(
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\n\n[models.verdict]",
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\neffort = \"xhigh\"\n\n[models.verdict]",
+        );
+        let config = Config::from_toml(&text).unwrap();
+        assert_eq!(config.models.deep.effort.as_deref(), Some("xhigh"));
+
+        let text = subscription_only().replace(
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\n\n[models.verdict]",
+            "name = \"claude-sonnet-4-5\"\ninput_price = 3.00\noutput_price = 15.00\neffort = \"maximum\"\n\n[models.verdict]",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.deep.effort"));
+        assert!(text.contains("low, medium, high, xhigh, max"));
+
+        let text = minimal().replace(
+            "name = \"gpt-4o-mini\"\ninput_price = 0.15\noutput_price = 0.60",
+            "name = \"gpt-4o-mini\"\ninput_price = 0.15\noutput_price = 0.60\neffort = \"high\"",
+        );
+        let text = err_text(&text);
+        assert!(text.contains("models.triage.effort"));
     }
 
     #[test]
