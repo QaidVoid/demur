@@ -351,8 +351,8 @@ pub async fn run(
     let store_ref: Option<&dyn crate::cache::Store> = store
         .as_ref()
         .map(|store| store as &dyn crate::cache::Store);
-    let triage_cache = PassCache::for_role(store_ref, config, &config.models.triage);
-    let deep_cache = PassCache::for_role(store_ref, config, &config.models.deep);
+    let triage_cache = PassCache::for_role(store_ref, &config.models.triage);
+    let deep_cache = PassCache::for_role(store_ref, &config.models.deep);
 
     let profile = config.profile.unwrap_or(Profile::Standard);
     let triage_price = ModelPrice::from_model(&config.models.triage);
@@ -912,7 +912,6 @@ established.";
                     .map(|store| store as &dyn crate::cache::Store);
                 let summary_cache = PassCache::for_role(
                     store_ref,
-                    config,
                     if downgrade {
                         &config.models.triage
                     } else {
@@ -1067,22 +1066,14 @@ pub struct PassCache<'a> {
 }
 
 impl<'a> PassCache<'a> {
-    /// A pass cache for one role. The agent family never participates: its
-    /// configured name cannot vouch for the model the login actually ran,
-    /// so a cache hit could answer with another model's work.
+    /// A pass cache for one role. Every family participates: the entry
+    /// records which model answered and what it reported, so a hit is
+    /// attributed to the work that was actually done.
     pub fn for_role(
         store: Option<&'a dyn crate::cache::Store>,
-        config: &Config,
         model: &'a crate::config::ModelDef,
     ) -> PassCache<'a> {
-        PassCache {
-            store: if config.role_is_agent(model) {
-                None
-            } else {
-                store
-            },
-            model,
-        }
+        PassCache { store, model }
     }
 }
 
@@ -1145,8 +1136,8 @@ Respond again with only a JSON object that matches it exactly."
                     output: parsed,
                     usage: entry.usage(),
                     resumed: true,
-                    reported_cost: None,
-                    reported_model: None,
+                    reported_cost: entry.reported_cost,
+                    reported_model: entry.observed_model.clone(),
                 });
             }
             Err(err) => {
@@ -1207,7 +1198,15 @@ retrying with {raised} output tokens"
                 // Only a completed, schema-valid pass is stored. A failure
                 // anywhere above leaves nothing behind to resume from.
                 if let (Some(store), Some(key)) = (cache.store, key.as_ref()) {
-                    store.put(key, &crate::cache::Entry::new(response.content, &usage));
+                    store.put(
+                        key,
+                        &crate::cache::Entry::new(
+                            response.content,
+                            &usage,
+                            add_cost(schema_reported, response.reported_cost),
+                            response.reported_model.clone(),
+                        ),
+                    );
                 }
                 return Ok(PassResult {
                     output: parsed,
@@ -1720,8 +1719,11 @@ fn settle_pass(
     reported_cost: Option<f64>,
 ) -> f64 {
     if resumed {
+        // The earlier attempt already paid, so this run charges nothing to
+        // the budget; the spend line still shows what the work cost when
+        // it was done, at the reported figure or at the configured rates.
         gate.release(hold);
-        price.cost_of_usage(usage)
+        reported_cost.unwrap_or_else(|| price.cost_of_usage(usage))
     } else {
         gate.settle(hold, usage, price, reported_cost)
     }

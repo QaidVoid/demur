@@ -112,10 +112,15 @@ configured rates and the Spend section says so. Budget estimates always
 use the configured prices, so the gate never waits for a child process to
 learn it cannot afford a pass.
 
-The family does not read or write the resume cache. The configured model
-name cannot vouch for the model the login actually ran, so a cache hit
-could answer with another model's work. Nothing is stored, so nothing
-stale can be served.
+The family participates in the resume cache like any other. An entry
+records which model actually answered and the cost that answer reported,
+so a resumed pass is attributed to the model that did the work and priced
+as it was priced the first time. The configured name is part of the cache
+key, but an alias can resolve differently between the run that stored an
+entry and the run that reuses it, so the Spend section names the model
+behind every resumed pass and drift is disclosed rather than silent.
+Budget estimates still use the configured prices, so the gate never waits
+for a child process to learn it cannot afford a pass.
 
 ## Fork pull requests
 

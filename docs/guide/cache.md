@@ -103,9 +103,10 @@ cold. See the [security model](/guide/security) for why.
 
 ## What is stored
 
-The parsed output of a completed pass and the token usage that call reported.
-Nothing else: no verdict, no configuration, no prompt, and no key. The key is a
-digest, so the cache holds answers rather than questions.
+The parsed output of a completed pass, the token usage that call reported,
+and, when the transport reports them, the cost figure and the model that
+produced it. Nothing else: no verdict, no configuration, no prompt, and no
+key. The key is a digest, so the cache holds answers rather than questions.
 
 Failed calls, truncated responses, and responses that failed schema validation
 are never stored, so a retry always re-runs what actually went wrong.

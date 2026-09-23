@@ -80,17 +80,32 @@ pub struct Entry {
     pub cached_input_tokens: u64,
     /// Output tokens the original call was billed for.
     pub output_tokens: u64,
+    /// What the original call said it cost, when the transport reports a
+    /// figure of its own. A resumed pass is priced as the first one was.
+    #[serde(default)]
+    pub reported_cost: Option<f64>,
+    /// The model that actually answered, when the transport names one.
+    /// The configured name is already in the key; this is who showed up.
+    #[serde(default)]
+    pub observed_model: Option<String>,
 }
 
 impl Entry {
     /// Build an entry for a completed pass.
-    pub fn new(content: serde_json::Value, usage: &TokenUsage) -> Entry {
+    pub fn new(
+        content: serde_json::Value,
+        usage: &TokenUsage,
+        reported_cost: Option<f64>,
+        observed_model: Option<String>,
+    ) -> Entry {
         Entry {
             version: ENTRY_VERSION,
             content,
             input_tokens: usage.input_tokens,
             cached_input_tokens: usage.cached_input_tokens,
             output_tokens: usage.output_tokens,
+            reported_cost,
+            observed_model,
         }
     }
 
@@ -242,6 +257,10 @@ mod tests {
         }
     }
 
+    fn entry(content: serde_json::Value) -> Entry {
+        Entry::new(content, &usage(), None, None)
+    }
+
     #[test]
     fn an_unchanged_request_reproduces_its_key() {
         assert_eq!(
@@ -323,10 +342,39 @@ mod tests {
         let store = FsStore::open(dir.path(), Duration::from_secs(3600), 1 << 20).unwrap();
         let key = CacheKey::new(&request(), &model());
         assert!(store.get(&key).is_none());
-        store.put(&key, &Entry::new(json!({"findings": []}), &usage()));
+        store.put(
+            &key,
+            &Entry::new(
+                json!({"findings": []}),
+                &usage(),
+                Some(0.0123),
+                Some("claude-haiku".to_string()),
+            ),
+        );
         let found = store.get(&key).expect("entry round trips");
         assert_eq!(found.content, json!({"findings": []}));
         assert_eq!(found.usage(), usage());
+        assert_eq!(found.reported_cost, Some(0.0123));
+        assert_eq!(found.observed_model.as_deref(), Some("claude-haiku"));
+    }
+
+    #[test]
+    fn an_entry_without_attribution_still_reads() {
+        // Entries written before the cost and model fields existed must
+        // keep resuming; they simply report no agent price.
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::open(dir.path(), Duration::from_secs(3600), 1 << 20).unwrap();
+        let key = CacheKey::new(&request(), &model());
+        std::fs::write(
+            dir.path().join(format!("{}.json", key.as_str())),
+            json!({"version": 1, "content": {}, "input_tokens": 1,
+                   "cached_input_tokens": 0, "output_tokens": 2})
+            .to_string(),
+        )
+        .unwrap();
+        let found = store.get(&key).expect("an old entry still resumes");
+        assert_eq!(found.reported_cost, None);
+        assert_eq!(found.observed_model, None);
     }
 
     #[test]
@@ -370,14 +418,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::open(dir.path(), Duration::from_secs(0), 1 << 20).unwrap();
         let key = CacheKey::new(&request(), &model());
-        store.put(&key, &Entry::new(json!({}), &usage()));
+        store.put(&key, &entry(json!({})));
         // Writing again evicts everything already past the age bound.
         let mut other = request();
         other.user = "different".to_string();
-        store.put(
-            &CacheKey::new(&other, &model()),
-            &Entry::new(json!({}), &usage()),
-        );
+        store.put(&CacheKey::new(&other, &model()), &entry(json!({})));
         assert!(store.get(&key).is_none());
     }
 
@@ -386,13 +431,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::open(dir.path(), Duration::from_secs(3600), 1).unwrap();
         let first = CacheKey::new(&request(), &model());
-        store.put(&first, &Entry::new(json!({"a": 1}), &usage()));
+        store.put(&first, &entry(json!({"a": 1})));
         let mut other = request();
         other.user = "different".to_string();
-        store.put(
-            &CacheKey::new(&other, &model()),
-            &Entry::new(json!({"b": 2}), &usage()),
-        );
+        store.put(&CacheKey::new(&other, &model()), &entry(json!({"b": 2})));
         assert!(store.get(&first).is_none());
     }
 }

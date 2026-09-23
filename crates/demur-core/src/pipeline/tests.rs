@@ -1085,13 +1085,17 @@ fn counting_claude_fixture(
 }
 
 #[tokio::test]
-async fn the_agent_family_does_no_cache_io() {
+async fn the_agent_family_resumes_from_the_cache_with_its_attribution() {
     let cache_dir = tempfile::tempdir().unwrap();
     let work_dir = tempfile::tempdir().unwrap();
     let calls = work_dir.path().join("calls.log");
+    // The transport names the model that actually answered and what it
+    // reported as its cost, so a stored entry can carry both forward.
     let triage_answer = serde_json::json!({
         "result": "{\"findings\": [], \"cluster_lens\": []}",
-        "is_error": false
+        "is_error": false,
+        "total_cost_usd": 0.0123,
+        "modelUsage": {"claude-sonnet-4-5-20260101": {"costUSD": 0.0123}}
     })
     .to_string();
     let verdict_answer = serde_json::json!({
@@ -1102,37 +1106,61 @@ async fn the_agent_family_does_no_cache_io() {
     let mut config = claude_config();
     config.cache.enabled = true;
     config.cache.dir = Some(cache_dir.path().to_path_buf());
+    let providers = || ProviderRegistry {
+        triage: crate::provider::AnyProvider::ClaudeCode(
+            crate::provider::ClaudeCodeClient::for_tests(
+                counting_claude_fixture("triage", &calls, &triage_answer),
+                std::time::Duration::from_secs(60),
+            ),
+        ),
+        deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
+        verdict: crate::provider::AnyProvider::ClaudeCode(
+            crate::provider::ClaudeCodeClient::for_tests(
+                counting_claude_fixture("verdict", &calls, &verdict_answer),
+                std::time::Duration::from_secs(60),
+            ),
+        ),
+    };
 
-    for _ in 0..2 {
-        let providers = ProviderRegistry {
-            triage: crate::provider::AnyProvider::ClaudeCode(
-                crate::provider::ClaudeCodeClient::for_tests(
-                    counting_claude_fixture("triage", &calls, &triage_answer),
-                    std::time::Duration::from_secs(60),
-                ),
-            ),
-            deep: crate::provider::AnyProvider::Recorded(RecordedProvider::new(vec![])),
-            verdict: crate::provider::AnyProvider::ClaudeCode(
-                crate::provider::ClaudeCodeClient::for_tests(
-                    counting_claude_fixture("verdict", &calls, &verdict_answer),
-                    std::time::Duration::from_secs(60),
-                ),
-            ),
-        };
-        crate::pipeline::run(&providers, &config, &input())
-            .await
-            .unwrap();
-    }
-    // Both runs reached the process transport: nothing was written by the
-    // first run for the second to resume, because the family never
-    // participates in the cache.
+    let RunOutcome::Review(cold) = crate::pipeline::run(&providers(), &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+    let RunOutcome::Review(warm) = crate::pipeline::run(&providers(), &config, &input())
+        .await
+        .unwrap()
+    else {
+        panic!("expected a review");
+    };
+
+    // The cold run called the process transport once per pass; the warm
+    // run resumed both from the cache and never reached it again.
     let calls_made = std::fs::read_to_string(&calls).unwrap().lines().count();
-    assert_eq!(calls_made, 4, "two passes per run, no resume");
+    assert_eq!(calls_made, 2, "only the cold run reaches the transport");
     let stored = std::fs::read_dir(cache_dir.path())
         .unwrap()
         .filter_map(|entry| entry.ok())
         .count();
-    assert_eq!(stored, 0, "no entry is ever written for the family");
+    assert_eq!(stored, 2, "one entry per pass");
+    let triage_spend = &warm.spend.passes[0];
+    assert_eq!(triage_spend.pass, "triage");
+    assert_eq!(triage_spend.model, "claude-sonnet-4-5-20260101");
+    assert_eq!(
+        triage_spend.cost_source,
+        crate::pipeline::CostSource::AgentReported
+    );
+    assert!(
+        warm.body
+            .contains("triage spend: $0.0123 (agent-reported) (resumed from cache)"),
+        "{}",
+        warm.body
+    );
+    assert!(
+        cold.spend.paid > 0.0,
+        "the cold run paid what the transport reported"
+    );
 }
 
 #[tokio::test]
