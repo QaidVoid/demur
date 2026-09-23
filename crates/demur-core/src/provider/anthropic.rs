@@ -133,28 +133,29 @@ impl Provider for AnthropicClient {
             })
             .collect::<Vec<_>>()
             .join("");
+        let usage = wire_usage(parsed.usage);
         if joined.trim().is_empty() {
             let detail = empty_content_detail(&text);
             if parsed.stop_reason.as_deref() == Some("max_tokens") {
                 return Err(truncated_error(
                     &format!("{detail}; no text was produced"),
-                    parsed.usage,
+                    usage,
                     &text,
                     &self.key,
                 ));
             }
             return Err(ProviderError::Malformed {
                 message: redact(&detail, &self.key),
-                usage: TokenUsage::default(),
+                usage,
             });
         }
-        let content = match parse_json_content(&joined) {
+        let content = match parse_json_content(&joined, usage) {
             Ok(value) => value,
             Err(err) => {
                 if parsed.stop_reason.as_deref() == Some("max_tokens") {
                     return Err(truncated_error(
                         &format!("{err}; the ceiling cut the JSON mid-output"),
-                        parsed.usage,
+                        usage,
                         &text,
                         &self.key,
                     ));
@@ -162,17 +163,9 @@ impl Provider for AnthropicClient {
                 return Err(err);
             }
         };
-        let usage = parsed.usage.unwrap_or_default();
-        let cache_reads = usage.cache_read_input_tokens.unwrap_or(0);
         Ok(CompletionResponse {
             content,
-            usage: TokenUsage {
-                input_tokens: usage
-                    .input_tokens
-                    .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
-                cached_input_tokens: cache_reads,
-                output_tokens: usage.output_tokens,
-            },
+            usage,
             reported_cost: None,
             reported_model: None,
         })
@@ -233,25 +226,26 @@ raw response excerpt: {}",
 
 /// Build an OutputTruncated error carrying the wasted call's usage so
 /// spend stays honest.
-fn truncated_error(
-    detail: &str,
-    usage: Option<WireUsage>,
-    raw_body: &str,
-    key: &str,
-) -> ProviderError {
+/// Convert the wire usage split, counting cache creation as full-price
+/// input and cache reads as the cached price.
+fn wire_usage(usage: Option<WireUsage>) -> TokenUsage {
     let usage = usage.unwrap_or_default();
+    TokenUsage {
+        input_tokens: usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
+        cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
+        output_tokens: usage.output_tokens,
+    }
+}
+
+fn truncated_error(detail: &str, usage: TokenUsage, raw_body: &str, key: &str) -> ProviderError {
     ProviderError::OutputTruncated {
         message: redact(
             &format!("{detail}; raw response excerpt: {}", body_excerpt(raw_body)),
             key,
         ),
-        usage: TokenUsage {
-            input_tokens: usage
-                .input_tokens
-                .saturating_add(usage.cache_creation_input_tokens.unwrap_or(0)),
-            cached_input_tokens: usage.cache_read_input_tokens.unwrap_or(0),
-            output_tokens: usage.output_tokens,
-        },
+        usage,
     }
 }
 

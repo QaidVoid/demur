@@ -118,7 +118,14 @@ pub async fn review_pull_request(
                 .collect();
             let marker =
                 state_only_marker(state.prior_marker.as_ref(), &state.dismissed, &run_spend);
-            let notice = failure_notice(&error, &spend, marker.is_some());
+            // Recorded is what the notice promises: spend is only counted
+            // by the next run when a marker small enough to publish
+            // actually carries it.
+            let recorded = marker
+                .as_ref()
+                .and_then(|marker| client.encode_marker(marker))
+                .is_some();
+            let notice = failure_notice(&error, &spend, recorded);
             if let Err(publish_err) = super::publish::publish_notice(
                 client,
                 number,
@@ -434,11 +441,12 @@ pub async fn publish_skip_notice(
     let blocking_violation = violations
         .iter()
         .any(|violation| violation.severity.rank() >= blocking_rank);
+    // The state-only marker has the new resolution states applied, so a
+    // dismissed or resolved carried finding no longer holds the gate red.
     let carried_blocker = blocking_violation
-        || state.prior_marker.as_ref().is_some_and(|prior| {
-            prior.findings.iter().any(|record| {
-                record.state == CarriedState::Unresolved
-                    && record.severity == crate::config::Severity::Blocker
+        || marker.as_ref().is_some_and(|marker| {
+            marker.findings.iter().any(|record| {
+                record.state == CarriedState::Unresolved && record.severity.rank() >= blocking_rank
             })
         });
     let conclusion = if carried_blocker {

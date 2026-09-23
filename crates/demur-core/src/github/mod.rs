@@ -181,6 +181,13 @@ impl GitHubClient {
         }
     }
 
+    /// Encode a marker signed with this run's credential, within the size
+    /// bound. None when the state cannot be carried at all, which makes
+    /// the next run a full review.
+    pub fn encode_marker(&self, marker: &Marker) -> Option<String> {
+        marker.encode_bounded(&self.token)
+    }
+
     fn redacted(&self, text: &str) -> String {
         redact(text, &self.token)
     }
@@ -435,22 +442,38 @@ impl GitHubClient {
         Ok(compare.status == "ahead" || compare.status == "identical")
     }
 
-    /// List reviews on the pull request.
+    /// List reviews on the pull request, following page links so a long
+    /// review history is never silently truncated: the oldest marker may
+    /// live on the last page.
     pub async fn reviews(&self, number: u64) -> Result<Vec<PriorReview>, GitHubError> {
-        let response = self
-            .get(
-                &format!("/repos/{}/{}/pulls/{number}/reviews", self.owner, self.repo),
-                "application/vnd.github+json",
-            )
-            .await?;
-        if !response.status().is_success() {
-            return Err(GitHubError::Request {
-                message: self.error_body(response).await,
-            });
+        let mut reviews = Vec::new();
+        let mut page = 1;
+        loop {
+            let response = self
+                .get(
+                    &format!(
+                        "/repos/{}/{}/pulls/{number}/reviews?per_page=100&page={page}",
+                        self.owner, self.repo
+                    ),
+                    "application/vnd.github+json",
+                )
+                .await?;
+            if !response.status().is_success() {
+                return Err(GitHubError::Request {
+                    message: self.error_body(response).await,
+                });
+            }
+            let batch: Vec<PriorReview> =
+                response.json().await.map_err(|err| GitHubError::Request {
+                    message: self.redacted(&err.to_string()),
+                })?;
+            let complete = batch.len() < 100;
+            reviews.extend(batch);
+            if complete {
+                return Ok(reviews);
+            }
+            page += 1;
         }
-        response.json().await.map_err(|err| GitHubError::Request {
-            message: self.redacted(&err.to_string()),
-        })
     }
 
     /// The newest marker this run's credential signed, chosen by the

@@ -149,29 +149,16 @@ impl Provider for ClaudeCodeClient {
         }
         let reported_model = parsed.observed_model();
         let result = parsed.result.take().unwrap_or_default();
-        let content = match super::openai::parse_json_content(&result) {
-            Ok(content) => content,
-            Err(mut err) => {
-                if let (Some(cli), ProviderError::Malformed { usage, .. }) =
-                    (parsed.usage.as_ref(), &mut err)
-                {
-                    *usage = TokenUsage {
-                        input_tokens: cli.input_tokens + cli.cache_creation_input_tokens,
-                        cached_input_tokens: cli.cache_read_input_tokens,
-                        output_tokens: cli.output_tokens,
-                    };
-                }
-                return Err(err);
-            }
+        let cli_usage = parsed.usage.take().unwrap_or_default();
+        let usage = TokenUsage {
+            input_tokens: cli_usage.input_tokens + cli_usage.cache_creation_input_tokens,
+            cached_input_tokens: cli_usage.cache_read_input_tokens,
+            output_tokens: cli_usage.output_tokens,
         };
-        let usage = parsed.usage.take().unwrap_or_default();
+        let content = super::openai::parse_json_content(&result, usage)?;
         Ok(CompletionResponse {
             content,
-            usage: TokenUsage {
-                input_tokens: usage.input_tokens + usage.cache_creation_input_tokens,
-                cached_input_tokens: usage.cache_read_input_tokens,
-                output_tokens: usage.output_tokens,
-            },
+            usage,
             reported_cost: parsed.total_cost_usd,
             reported_model,
         })
@@ -269,14 +256,14 @@ mod tests {
 
     /// A fixture script standing in for the CLI. It records its arguments
     /// and standard input beside itself, then answers per `behavior`.
-    fn fixture(name: &str, body: &str) -> (PathBuf, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("demur-claude-fixture-{name}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("claude");
+    fn fixture(name: &str, body: &str) -> (PathBuf, tempfile::TempDir) {
+        let dir = tempfile::TempDir::with_prefix(format!("demur-claude-{name}-")).unwrap();
+        let dir_path = dir.path();
+        let script = dir_path.join("claude");
         std::fs::write(
             &script,
             format!(
-                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir:?}/args\ncat > {dir:?}/stdin\n{body}\n"
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir_path:?}/args\ncat > {dir_path:?}/stdin\n{body}\n"
             ),
         )
         .unwrap();
@@ -375,7 +362,7 @@ mod tests {
                 output_tokens: 5,
             }
         );
-        let args = std::fs::read_to_string(dir.join("args")).unwrap();
+        let args = std::fs::read_to_string(dir.path().join("args")).unwrap();
         assert!(args.contains("--output-format json"), "{args}");
         assert!(args.contains("--json-schema"), "{args}");
         assert!(args.contains("--model test-model"), "{args}");
@@ -386,23 +373,20 @@ mod tests {
             !args.contains("volatile data"),
             "the prompt leaked onto the command line: {args}"
         );
-        let stdin = std::fs::read_to_string(dir.join("stdin")).unwrap();
+        let stdin = std::fs::read_to_string(dir.path().join("stdin")).unwrap();
         assert_eq!(stdin, "volatile data");
     }
 
     #[tokio::test]
     async fn a_schema_invalid_answer_is_retried_into_shape() {
-        let dir = std::env::temp_dir().join("demur-claude-fixture-corrected");
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("claude");
+        let dir = tempfile::TempDir::with_prefix("demur-claude-corrected-").unwrap();
+        let dir_path = dir.path();
+        let script = dir_path.join("claude");
         // First call answers in prose, the second in the expected shape.
-        // The marker is cleared at setup, not by the script, so repeated
-        // test runs stay idempotent.
-        let _ = std::fs::remove_file(dir.join("called"));
         std::fs::write(
             &script,
             format!(
-                "#!/bin/bash\ncat > /dev/null\nif [ -f {dir:?}/called ]; then\n  printf '%s' {}\nelse\n  touch {dir:?}/called\n  printf '%s' 'I cannot produce JSON today'\nfi\n",
+                "#!/bin/bash\ncat > /dev/null\nif [ -f {dir_path:?}/called ]; then\n  printf '%s' {}\nelse\n  touch {dir_path:?}/called\n  printf '%s' 'I cannot produce JSON today'\nfi\n",
                 sh_quote(&result_document("{\"a\": 1}"))
             ),
         )

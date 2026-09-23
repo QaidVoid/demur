@@ -623,8 +623,12 @@ you can already anchor to an exact file and line range with its concrete harm.";
         gate = gate_cell.into_inner().expect("budget gate lock");
 
         // Results are placed by position, so the sequence entering
-        // synthesis is the one a serial run would have produced.
+        // synthesis is the one a serial run would have produced. The dives
+        // ran concurrently, so a fatal failure in one says nothing about
+        // what the others billed: every outcome merges before a fatal
+        // error decides the run.
         let mut stood_down = false;
+        let mut fatal = None;
         for outcome in outcomes.into_iter().flatten() {
             spend.extend(outcome.spend);
             degradations.extend(outcome.degradations);
@@ -632,12 +636,15 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 stood_down = true;
             }
             all_findings.extend(outcome.findings);
-            if let Some(err) = outcome.fatal {
-                return Ok(RunOutcome::Failed {
-                    error: err.into(),
-                    spend: std::mem::take(&mut spend),
-                });
+            if fatal.is_none() {
+                fatal = outcome.fatal;
             }
+        }
+        if let Some(err) = fatal {
+            return Ok(RunOutcome::Failed {
+                error: err.into(),
+                spend: std::mem::take(&mut spend),
+            });
         }
         if stood_down {
             degradations.push(Degradation::SummaryOnly {
@@ -1167,7 +1174,7 @@ Respond again with only a JSON object that matches it exactly."
             match complete_with_retries(provider, &request, &RetryPolicy::default()).await {
                 Ok(response) => response,
                 Err(ProviderError::OutputTruncated { message, usage }) => {
-                    carried_usage = add_usage(carried_usage, usage);
+                    carried_usage = carried_usage.plus(usage);
                     if escalations >= MAX_CEILING_ESCALATIONS || ceiling >= MAX_OUTPUT_CEILING {
                         return Err(ProviderError::OutputTruncated {
                             message,
@@ -1184,10 +1191,10 @@ retrying with {raised} output tokens"
                     continue;
                 }
                 Err(ProviderError::Malformed { message, usage }) => {
-                    schema_usage = add_usage(schema_usage, usage);
+                    schema_usage = schema_usage.plus(usage);
                     return Err(ProviderError::Malformed {
                         message,
-                        usage: add_usage(schema_usage, carried_usage),
+                        usage: schema_usage.plus(carried_usage),
                     });
                 }
                 Err(err) => return Err(err),
@@ -1195,7 +1202,7 @@ retrying with {raised} output tokens"
         attempts += 1;
         match serde_json::from_value::<T>(response.content.clone()) {
             Ok(parsed) => {
-                let usage = add_usage(add_usage(response.usage, carried_usage), schema_usage);
+                let usage = response.usage.plus(carried_usage).plus(schema_usage);
                 // Only a completed, schema-valid pass is stored. A failure
                 // anywhere above leaves nothing behind to resume from.
                 if let (Some(store), Some(key)) = (cache.store, key.as_ref()) {
@@ -1210,7 +1217,7 @@ retrying with {raised} output tokens"
                 });
             }
             Err(err) => {
-                schema_usage = add_usage(schema_usage, response.usage);
+                schema_usage = schema_usage.plus(response.usage);
                 schema_reported = add_cost(schema_reported, response.reported_cost);
                 last_error = Some(err);
                 if attempts >= SCHEMA_ATTEMPTS {
@@ -1227,18 +1234,8 @@ retrying with {raised} output tokens"
                 .map(|err| err.to_string())
                 .unwrap_or_else(|| "unknown".to_string())
         ),
-        usage: add_usage(schema_usage, carried_usage),
+        usage: schema_usage.plus(carried_usage),
     })
-}
-
-/// Sum two usage figures. Discarded attempts only ever add.
-fn add_usage(mut left: TokenUsage, right: TokenUsage) -> TokenUsage {
-    left.input_tokens = left.input_tokens.saturating_add(right.input_tokens);
-    left.cached_input_tokens = left
-        .cached_input_tokens
-        .saturating_add(right.cached_input_tokens);
-    left.output_tokens = left.output_tokens.saturating_add(right.output_tokens);
-    left
 }
 
 /// Sum figures where absence is not zero: a cost is known only when some

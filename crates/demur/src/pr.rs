@@ -443,7 +443,11 @@ review ran against {}. The newer commit was not reviewed.\n",
                     &state.dismissed,
                     &run_spend,
                 );
-                let notice = demur_core::github::failure_notice(&error, &spend, marker.is_some());
+                let recorded = marker
+                    .as_ref()
+                    .and_then(|marker| client.encode_marker(marker))
+                    .is_some();
+                let notice = demur_core::github::failure_notice(&error, &spend, recorded);
                 publish_notice(
                     &client,
                     parsed.number,

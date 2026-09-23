@@ -122,6 +122,7 @@ impl Provider for OpenAiClient {
             .first()
             .and_then(|choice| choice.message.content.clone())
             .unwrap_or_default();
+        let usage = wire_usage(parsed.usage);
         if content.trim().is_empty() {
             return Err(truncated_or_malformed(
                 &format!(
@@ -129,19 +130,19 @@ impl Provider for OpenAiClient {
                     body_excerpt(&text)
                 ),
                 &finish_reason,
-                parsed.usage,
+                usage,
                 &text,
                 &self.key,
             ));
         }
-        let content = match parse_json_content(&content) {
+        let content = match parse_json_content(&content, usage) {
             Ok(value) => value,
             Err(err) => {
                 if finish_reason == "length" {
                     return Err(truncated_or_malformed(
                         &format!("{err}; the ceiling cut the JSON mid-output"),
                         &finish_reason,
-                        parsed.usage,
+                        usage,
                         &text,
                         &self.key,
                     ));
@@ -149,15 +150,9 @@ impl Provider for OpenAiClient {
                 return Err(err);
             }
         };
-        let usage = parsed.usage.unwrap_or_default();
-        let cached = usage.prompt_tokens_details.and_then(|d| d.cached_tokens);
         Ok(CompletionResponse {
             content,
-            usage: TokenUsage {
-                input_tokens: usage.prompt_tokens.saturating_sub(cached.unwrap_or(0)),
-                cached_input_tokens: cached.unwrap_or(0),
-                output_tokens: usage.completion_tokens,
-            },
+            usage,
             reported_cost: None,
             reported_model: None,
         })
@@ -211,7 +206,9 @@ pub(crate) fn body_excerpt(body: &str) -> String {
 }
 
 /// Parse the model's text answer as JSON, tolerating markdown fencing.
-pub(crate) fn parse_json_content(text: &str) -> Result<Value, ProviderError> {
+/// A violation is billed: the usage belongs to the attempt that produced
+/// the unusable answer.
+pub(crate) fn parse_json_content(text: &str, usage: TokenUsage) -> Result<Value, ProviderError> {
     let trimmed = text.trim();
     let stripped = if trimmed.starts_with("```") {
         let without_fence = trimmed
@@ -232,7 +229,7 @@ pub(crate) fn parse_json_content(text: &str) -> Result<Value, ProviderError> {
     };
     serde_json::from_str(stripped).map_err(|err| ProviderError::Malformed {
         message: format!("content is not a JSON object matching the schema: {err}"),
-        usage: TokenUsage::default(),
+        usage,
     })
 }
 
@@ -248,25 +245,30 @@ struct Choice {
     finish_reason: Option<String>,
 }
 
-/// OutputTruncated when the finish reason says the ceiling was hit,
-/// Malformed otherwise, carrying usage and a redacted excerpt either way.
-fn truncated_or_malformed(
-    detail: &str,
-    finish_reason: &str,
-    usage: Option<WireUsage>,
-    raw_body: &str,
-    key: &str,
-) -> ProviderError {
+/// Convert the wire usage split, separating cached input from full-price
+/// input.
+fn wire_usage(usage: Option<WireUsage>) -> TokenUsage {
     let usage = usage.unwrap_or_default();
     let cached = usage
         .prompt_tokens_details
         .and_then(|details| details.cached_tokens)
         .unwrap_or(0);
-    let usage = TokenUsage {
+    TokenUsage {
         input_tokens: usage.prompt_tokens.saturating_sub(cached),
         cached_input_tokens: cached,
         output_tokens: usage.completion_tokens,
-    };
+    }
+}
+
+/// OutputTruncated when the finish reason says the ceiling was hit,
+/// Malformed otherwise, carrying usage and a redacted excerpt either way.
+fn truncated_or_malformed(
+    detail: &str,
+    finish_reason: &str,
+    usage: TokenUsage,
+    raw_body: &str,
+    key: &str,
+) -> ProviderError {
     let message = redact(
         &format!("{detail}; raw response excerpt: {}", body_excerpt(raw_body)),
         key,
@@ -534,8 +536,28 @@ mod tests {
     }
 
     #[test]
-    fn parse_json_content_rejects_prose() {
-        let err = parse_json_content("here is my answer, not json").unwrap_err();
-        assert!(matches!(err, ProviderError::Malformed { .. }));
+    fn parse_json_content_rejects_prose_and_bills_it() {
+        let err = parse_json_content(
+            "here is my answer, not json",
+            TokenUsage {
+                input_tokens: 100,
+                cached_input_tokens: 0,
+                output_tokens: 7,
+            },
+        )
+        .unwrap_err();
+        match err {
+            ProviderError::Malformed { usage, .. } => {
+                assert_eq!(
+                    usage,
+                    TokenUsage {
+                        input_tokens: 100,
+                        cached_input_tokens: 0,
+                        output_tokens: 7
+                    }
+                );
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
     }
 }

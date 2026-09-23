@@ -32,9 +32,14 @@ pub async fn publish_review(
     let body_with_marker = match marker {
         // An oversized marker ships no marker at all, which makes the next
         // run a full review, rather than breaking publication.
-        Some(marker) => match marker.encode_bounded(&client.token) {
+        Some(marker) => match client.encode_marker(marker) {
             Some(encoded) => format!("{}\n\n{}", body, encoded),
-            None => body.to_string(),
+            None => {
+                log::warn!(
+                    "carried state exceeded the marker bound: the next run is a full review"
+                );
+                body.to_string()
+            }
         },
         None => body.to_string(),
     };
@@ -91,9 +96,14 @@ pub async fn publish_notice(
     conclusion: &'static str,
 ) -> Result<(), GitHubError> {
     let body_with_marker = match marker {
-        Some(marker) => match marker.encode_bounded(&client.token) {
+        Some(marker) => match client.encode_marker(marker) {
             Some(encoded) => format!("{}\n\n{}", body, encoded),
-            None => body.to_string(),
+            None => {
+                log::warn!(
+                    "carried state exceeded the marker bound: the next run is a full review"
+                );
+                body.to_string()
+            }
         },
         None => body.to_string(),
     };

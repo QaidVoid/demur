@@ -49,6 +49,16 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Sum two usage figures. Discarded attempts only ever add.
+    pub fn plus(mut self, right: TokenUsage) -> TokenUsage {
+        self.input_tokens = self.input_tokens.saturating_add(right.input_tokens);
+        self.cached_input_tokens = self
+            .cached_input_tokens
+            .saturating_add(right.cached_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(right.output_tokens);
+        self
+    }
+
     /// Cost in USD at the given per-million-token prices.
     pub fn cost_usd(&self, input_price: f64, output_price: f64, cached_price: f64) -> f64 {
         let uncached = self.input_tokens as f64 / 1_000_000.0 * input_price;
@@ -171,13 +181,16 @@ pub trait Provider {
     ) -> impl std::future::Future<Output = Result<CompletionResponse, ProviderError>> + Send;
 }
 
-/// Run a completion with bounded retries for retryable failures.
+/// Run a completion with bounded retries for retryable failures. Usage
+/// billed to discarded attempts rides on the final error, so a failed
+/// pass still reports everything it spent.
 pub async fn complete_with_retries<P: Provider>(
     provider: &P,
     request: &CompletionRequest,
     policy: &RetryPolicy,
 ) -> Result<CompletionResponse, ProviderError> {
     let mut attempt: u32 = 1;
+    let mut discarded = TokenUsage::default();
     loop {
         match provider.complete(request).await {
             Ok(response) => return Ok(response),
@@ -189,10 +202,21 @@ pub async fn complete_with_retries<P: Provider>(
                 attempt += 1;
             }
             Err(err) if is_retryable(&err) && attempt < policy.max_attempts => {
+                if let ProviderError::Malformed { usage, .. } = &err {
+                    discarded = discarded.plus(*usage);
+                }
                 tokio::time::sleep(backoff_delay(policy, attempt)).await;
                 attempt += 1;
             }
-            Err(err) => return Err(err),
+            Err(mut err) => {
+                let usage = match &mut err {
+                    ProviderError::Malformed { usage, .. }
+                    | ProviderError::OutputTruncated { usage, .. } => usage,
+                    _ => return Err(err),
+                };
+                *usage = discarded.plus(std::mem::take(usage));
+                return Err(err);
+            }
         }
     }
 }
@@ -396,6 +420,108 @@ mod tests {
         };
         let text = err.to_string();
         assert!(text.contains("key_env"));
+    }
+
+    /// Answers with each scripted failure in order, repeating the last
+    /// one.
+    struct Scripted {
+        steps: std::sync::Mutex<Vec<Step>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Step {
+        Malformed(u64, u64),
+        Truncated(u64, u64),
+    }
+
+    impl Provider for Scripted {
+        async fn complete(
+            &self,
+            _request: &CompletionRequest,
+        ) -> Result<CompletionResponse, ProviderError> {
+            let mut steps = self.steps.lock().unwrap();
+            let step = if steps.len() > 1 {
+                steps.remove(0)
+            } else {
+                steps[0]
+            };
+            match step {
+                Step::Malformed(input, output) => Err(malformed(usage(input, output))),
+                Step::Truncated(input, output) => Err(ProviderError::OutputTruncated {
+                    message: "cut".to_string(),
+                    usage: usage(input, output),
+                }),
+            }
+        }
+    }
+
+    fn usage(input: u64, output: u64) -> TokenUsage {
+        TokenUsage {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: output,
+        }
+    }
+
+    fn malformed(usage: TokenUsage) -> ProviderError {
+        ProviderError::Malformed {
+            message: "no".to_string(),
+            usage,
+        }
+    }
+
+    fn request() -> CompletionRequest {
+        CompletionRequest {
+            system: String::new(),
+            user: String::new(),
+            schema: serde_json::json!({"type": "object"}),
+            schema_name: "test_output".to_string(),
+            max_output_tokens: 100,
+        }
+    }
+
+    fn fast_policy() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 4,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn retries_bill_every_discarded_attempt_into_the_final_error() {
+        let provider = Scripted {
+            steps: std::sync::Mutex::new(vec![
+                Step::Malformed(10, 5),
+                Step::Malformed(20, 6),
+                Step::Malformed(40, 7),
+            ]),
+        };
+        let err = complete_with_retries(&provider, &request(), &fast_policy())
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::Malformed { usage: billed, .. } => {
+                assert_eq!(billed, usage(110, 25));
+            }
+            other => panic!("expected malformed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn discarded_malformed_attempts_ride_on_a_truncation() {
+        let provider = Scripted {
+            steps: std::sync::Mutex::new(vec![Step::Malformed(10, 5), Step::Truncated(30, 99)]),
+        };
+        let err = complete_with_retries(&provider, &request(), &fast_policy())
+            .await
+            .unwrap_err();
+        match err {
+            ProviderError::OutputTruncated { usage: billed, .. } => {
+                assert_eq!(billed, usage(40, 104));
+            }
+            other => panic!("expected truncated, got {other:?}"),
+        }
     }
 
     #[test]
