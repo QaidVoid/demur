@@ -21,6 +21,12 @@ that dominates the bill, which is why two separate dials bound it: the
 `limits.deep_calls` ceiling bounds the call count, and the budget bounds the
 money. Whichever binds first is disclosed in the review.
 
+Dives are held to grounding duties: a claim that a check is missing must name
+where that check would live and what was seen there, worked examples may only
+use states the shown code allows, and a harm the shown code cannot confirm
+must be downgraded or backed by retrieved context. A dive can only report
+findings in the file it was given.
+
 ### 3. Cross-examination
 
 Deep profile only. One call over the whole change that tries to defeat it as a
@@ -73,13 +79,15 @@ state marker, never a review that looks like one.
 
 Every published finding carries:
 
-- a file path and a line range that exist in the diff,
+- a file path and a line range inside the changed hunks,
 - exactly one severity: `blocker`, `warning`, or `note`,
 - the concrete harm merging would cause,
 - optionally a suggestion, rendered as a GitHub suggestion block.
 
-Findings that fail any of the first three are dropped at synthesis rather than
-published with a hedge. This is deliberate: a review padded with unanchored
+Findings that fail any of the first three are dropped at synthesis rather
+than published with a hedge. A finding whose lines sit outside every hunk of
+its file is dropped the same way, because a defect the diff does not touch is
+a defect the change did not cause. This is deliberate: a review padded with unanchored
 concerns trains people to skim it.
 
 ## Lenses

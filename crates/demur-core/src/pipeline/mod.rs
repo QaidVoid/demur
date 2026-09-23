@@ -362,12 +362,6 @@ pub async fn run(
     let mut degradations: Vec<Degradation> = Vec::new();
     let mut spend: Vec<PassSpend> = Vec::new();
     let mut all_findings: Vec<findings::Finding> = violations.clone();
-    let diff_paths: Vec<String> = input
-        .ingestion
-        .clusters
-        .iter()
-        .map(|cluster| cluster.path.clone())
-        .collect();
 
     if input.ingestion.clusters.is_empty() {
         for degradation in &degradations {
@@ -517,7 +511,7 @@ you can already anchor to an exact file and line range with its concrete harm.";
             .unwrap_or(0.0)
     );
     for raw in &triage_output.findings {
-        if let Some(finding) = findings::validate(raw, &diff_paths) {
+        if let Some(finding) = findings::validate(raw, &input.ingestion.clusters) {
             let hunks = input
                 .ingestion
                 .clusters
@@ -599,7 +593,6 @@ you can already anchor to an exact file and line range with its concrete harm.";
                 config,
                 registry,
                 input,
-                &diff_paths,
                 &gate_cell,
                 &deep_price,
                 &triage_price,
@@ -674,7 +667,11 @@ publishing coverage it could not establish",
         let task = "Cross-examine this pull request adversarially: adversarial inputs, \
 rollback safety, concurrency hazards, migration safety, and breaking interface \
 changes. Report only findings you can anchor to an exact file and line range \
-with their concrete harm.";
+with their concrete harm. Try to defeat each candidate before reporting it: \
+hunt the shown code for the validation or mechanism that makes the scenario \
+impossible, and drop what fails. A race claim needs both interleaved steps \
+visible in the code. Grade severity by the harm that survives this test, not \
+the harm a worst case would cause.";
         let cross_schema = prompt::findings_schema();
         let full_prompt = prompt::assemble(&context, task);
         let shrunk_prompt = prompt::assemble(&shrunk_context, task);
@@ -794,7 +791,7 @@ with their concrete harm.";
                 cross_started.elapsed()
             );
             for raw in &cross_output.findings {
-                if let Some(finding) = findings::validate(raw, &diff_paths) {
+                if let Some(finding) = findings::validate(raw, &input.ingestion.clusters) {
                     let hunks = input
                         .ingestion
                         .clusters
@@ -1255,7 +1252,13 @@ fn deep_dive_task(lens: &str) -> String {
     format!(
         "Deep dive this file cluster through the {lens} lens. Report only defects you \
 can anchor to exact lines in the diff, each with the concrete harm merging would \
-cause and a suggested fix when one can be expressed."
+cause and a suggested fix when one can be expressed. Ground every claim: a \
+claimed missing check must name where that check would live and what you saw \
+there, in the diff or the retrieved context, never an assumption. Worked \
+examples may only use states the shown code allows, so do not invent inputs, \
+names, or values a validation in the shown code would reject. If a harm \
+depends on behavior the shown code cannot confirm, request that context or \
+downgrade the finding to a note and say what was unverifiable."
     )
 }
 
@@ -1358,7 +1361,6 @@ async fn run_deep_dive(
     config: &Config,
     registry: &ProviderRegistry,
     input: &PipelineInput,
-    diff_paths: &[String],
     gate: &std::sync::Mutex<BudgetGate>,
     deep_price: &ModelPrice,
     triage_price: &ModelPrice,
@@ -1658,7 +1660,7 @@ async fn run_deep_dive(
     }
     let mut found = Vec::new();
     for raw in &result.output.findings {
-        if let Some(finding) = findings::validate(raw, diff_paths)
+        if let Some(finding) = findings::validate(raw, std::slice::from_ref(cluster))
             && !input
                 .suppress_fingerprints
                 .contains(&crate::delta::fingerprint(&finding, &cluster.hunks))

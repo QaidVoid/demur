@@ -149,17 +149,20 @@ const HARM_MARKERS: &[&str] = &[
     "tamper",
 ];
 
-/// Validate a model finding against the diff paths. Returns None for
-/// findings with no usable location or no concrete harm, and for praise or
-/// pure style remarks.
-pub fn validate(raw: &ModelFinding, diff_paths: &[String]) -> Option<Finding> {
-    if !diff_paths.iter().any(|path| path == &raw.file) {
-        return None;
-    }
+/// Validate a model finding against the diff. Returns None for findings
+/// with no usable location, a location the diff does not change, or no
+/// concrete harm, and for praise or pure style remarks. A dive passes only
+/// its own cluster, so a pass scoped to one file cannot publish a finding
+/// about another.
+pub fn validate(raw: &ModelFinding, clusters: &[crate::ingest::Cluster]) -> Option<Finding> {
+    let cluster = clusters.iter().find(|cluster| cluster.path == raw.file)?;
     if raw.start_line == 0 || raw.end_line < raw.start_line {
         return None;
     }
     if raw.end_line - raw.start_line > 500 {
+        return None;
+    }
+    if !anchors_in_diff(raw.start_line, raw.end_line, &cluster.hunks) {
         return None;
     }
     let harm = raw.harm.trim();
@@ -190,6 +193,24 @@ pub fn validate(raw: &ModelFinding, diff_paths: &[String]) -> Option<Finding> {
             .map(|text| text.trim().to_string())
             .filter(|text| !text.is_empty()),
         further_concerns: Vec::new(),
+    })
+}
+
+/// True when the cited range touches at least one changed region. Hunks
+/// span the shown window including its context lines, which is where a
+/// finding about the change can honestly point. A file with no hunks
+/// cannot be judged and passes.
+fn anchors_in_diff(start: u32, end: u32, hunks: &[crate::diff::Hunk]) -> bool {
+    if hunks.is_empty() {
+        return true;
+    }
+    hunks.iter().any(|hunk| {
+        let span_end = if hunk.new_lines == 0 {
+            hunk.new_start
+        } else {
+            hunk.new_start + hunk.new_lines - 1
+        };
+        start <= span_end && end >= hunk.new_start
     })
 }
 
@@ -353,8 +374,39 @@ fn messages_align(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn paths() -> Vec<String> {
-        vec!["src/main.rs".to_string()]
+    fn clusters() -> Vec<crate::ingest::Cluster> {
+        vec![crate::ingest::Cluster {
+            path: "src/main.rs".to_string(),
+            hunks: vec![crate::diff::Hunk {
+                old_start: 1,
+                old_lines: 130,
+                new_start: 1,
+                new_lines: 130,
+                lines: Vec::new(),
+            }],
+            risk: 0.5,
+            is_new_file: false,
+            is_deleted: false,
+            old_path: None,
+        }]
+    }
+
+    #[test]
+    fn anchors_outside_the_changed_hunks_are_dropped() {
+        let mut far = raw();
+        far.start_line = 200;
+        far.end_line = 210;
+        assert!(validate(&far, &clusters()).is_none());
+        // The hunk spans lines 1 to 130: its end line anchors, and a range
+        // that merely reaches into it anchors too.
+        let mut at_the_end = raw();
+        at_the_end.start_line = 130;
+        at_the_end.end_line = 132;
+        assert!(validate(&at_the_end, &clusters()).is_some());
+        let mut reaching = raw();
+        reaching.start_line = 125;
+        reaching.end_line = 131;
+        assert!(validate(&reaching, &clusters()).is_some());
     }
 
     fn raw() -> ModelFinding {
@@ -371,7 +423,7 @@ mod tests {
 
     #[test]
     fn valid_finding_passes_validation() {
-        let finding = validate(&raw(), &paths()).unwrap();
+        let finding = validate(&raw(), &clusters()).unwrap();
         assert_eq!(finding.location(), "src/main.rs:3-5");
     }
 
@@ -379,16 +431,16 @@ mod tests {
     fn unanchored_findings_are_dropped() {
         let mut unknown_file = raw();
         unknown_file.file = "src/unknown.rs".to_string();
-        assert!(validate(&unknown_file, &paths()).is_none());
+        assert!(validate(&unknown_file, &clusters()).is_none());
 
         let mut zero_line = raw();
         zero_line.start_line = 0;
-        assert!(validate(&zero_line, &paths()).is_none());
+        assert!(validate(&zero_line, &clusters()).is_none());
 
         let mut inverted = raw();
         inverted.start_line = 9;
         inverted.end_line = 3;
-        assert!(validate(&inverted, &paths()).is_none());
+        assert!(validate(&inverted, &clusters()).is_none());
     }
 
     #[test]
@@ -396,19 +448,19 @@ mod tests {
         let mut praise = raw();
         praise.message = "great design choice".to_string();
         praise.harm = "This is an excellent and elegant approach to the problem.".to_string();
-        assert!(validate(&praise, &paths()).is_none());
+        assert!(validate(&praise, &clusters()).is_none());
 
         let mut style = raw();
         style.message = "naming".to_string();
         style.harm = "short".to_string();
-        assert!(validate(&style, &paths()).is_none());
+        assert!(validate(&style, &clusters()).is_none());
     }
 
     #[test]
     fn harm_wording_survives_even_with_positive_words() {
         let mut mixed = raw();
         mixed.harm = "Looks clean, but the exposed token lets attackers bypass login.".to_string();
-        assert!(validate(&mixed, &paths()).is_some());
+        assert!(validate(&mixed, &clusters()).is_some());
     }
 
     #[test]
@@ -428,9 +480,9 @@ mod tests {
         let mut nearby = raw();
         nearby.message = "off by one in the retry loop".to_string();
         let findings = vec![
-            validate(&first, &paths()).unwrap(),
-            validate(&duplicate, &paths()).unwrap(),
-            validate(&nearby, &paths()).unwrap(),
+            validate(&first, &clusters()).unwrap(),
+            validate(&duplicate, &clusters()).unwrap(),
+            validate(&nearby, &clusters()).unwrap(),
         ];
         let deduped = dedupe(findings);
         assert_eq!(deduped.len(), 2);
@@ -461,8 +513,8 @@ policies onto another schema and the dry run labels it an ordinary move."
 rules it was enforced by."
             .to_string();
         let prepared = prepare(vec![
-            validate(&lead, &paths()).unwrap(),
-            validate(&echo, &paths()).unwrap(),
+            validate(&lead, &clusters()).unwrap(),
+            validate(&echo, &clusters()).unwrap(),
         ]);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].further_concerns.len(), 1);
@@ -484,8 +536,8 @@ credentials to the log sink where anyone with read access can replay them."
 deploy cannot be rolled back without manual database surgery."
             .to_string();
         let prepared = prepare(vec![
-            validate(&logged, &paths()).unwrap(),
-            validate(&migration, &paths()).unwrap(),
+            validate(&logged, &clusters()).unwrap(),
+            validate(&migration, &clusters()).unwrap(),
         ]);
         assert_eq!(prepared.len(), 2);
     }
@@ -502,8 +554,8 @@ deploy cannot be rolled back without manual database surgery."
 checks whether the resource is canonical somewhere else."
             .to_string();
         let prepared = prepare(vec![
-            validate(&first, &paths()).unwrap(),
-            validate(&second, &paths()).unwrap(),
+            validate(&first, &clusters()).unwrap(),
+            validate(&second, &clusters()).unwrap(),
         ]);
         assert_eq!(prepared.len(), 2);
     }
@@ -520,13 +572,13 @@ leaves the tenant half migrated."
         echo.message = "The mapping table is rebuilt without a transaction. A failed run \
 leaves half the mappings applied and the tenant broken."
             .to_string();
-        let mut echo = validate(&echo, &paths()).unwrap();
+        let mut echo = validate(&echo, &clusters()).unwrap();
         echo.further_concerns = vec![Concern {
             message: "the rebuild also runs per tenant".to_string(),
             harm: "one bad tenant stops every later one.".to_string(),
             suggestion: None,
         }];
-        let prepared = prepare(vec![validate(&lead, &paths()).unwrap(), echo]);
+        let prepared = prepare(vec![validate(&lead, &clusters()).unwrap(), echo]);
         assert_eq!(prepared.len(), 1);
         assert_eq!(prepared[0].further_concerns.len(), 2);
     }
@@ -535,15 +587,15 @@ leaves half the mappings applied and the tenant broken."
     fn blank_statement_findings_are_dropped() {
         let mut blank = raw();
         blank.message = "   ".to_string();
-        assert!(validate(&blank, &paths()).is_none());
+        assert!(validate(&blank, &clusters()).is_none());
     }
 
     #[test]
     fn ranking_orders_by_severity_then_fix_availability() {
-        let mut note = validate(&raw(), &paths()).unwrap();
+        let mut note = validate(&raw(), &clusters()).unwrap();
         note.severity = Severity::Note;
-        let blocker_no_fix = validate(&raw(), &paths()).unwrap();
-        let mut warning_with_fix = validate(&raw(), &paths()).unwrap();
+        let blocker_no_fix = validate(&raw(), &clusters()).unwrap();
+        let mut warning_with_fix = validate(&raw(), &clusters()).unwrap();
         warning_with_fix.severity = Severity::Warning;
         warning_with_fix.suggestion = Some("fix".to_string());
         let mut findings = vec![note, warning_with_fix, blocker_no_fix];

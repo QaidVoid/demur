@@ -281,7 +281,8 @@ fn finding_item_schema() -> Value {
             "start_line": {"type": "integer", "minimum": 1},
             "end_line": {"type": "integer", "minimum": 1},
             "severity": {"type": "string", "enum": ["blocker", "warning", "note"]},
-            "message": {"type": "string"},
+            "message": {"type": "string", "description": "State the defect itself in the \
+    first sentence; later sentences may elaborate."},
             "harm": {"type": "string"},
             "suggestion": {"type": "string"},
         },

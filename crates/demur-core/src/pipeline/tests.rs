@@ -99,9 +99,13 @@ fn triage_response() -> serde_json::Value {
 }
 
 fn dive_response(message: &str) -> serde_json::Value {
+    dive_on("src/auth/token.rs", message)
+}
+
+fn dive_on(file: &str, message: &str) -> serde_json::Value {
     json!({
         "findings": [{
-            "file": "src/auth/token.rs",
+            "file": file,
             "start_line": 2,
             "end_line": 3,
             "severity": "blocker",
@@ -151,7 +155,7 @@ async fn standard_profile_adds_deep_dives_and_no_cross_examination() {
         vec![triage_response()],
         vec![
             dive_response("hardcoded credential"),
-            dive_response("second"),
+            dive_on("src/util.rs", "second"),
         ],
         vec![summary_response()],
     ]);
@@ -932,10 +936,7 @@ fn cached_config(dir: &std::path::Path) -> Config {
 fn steps() -> Vec<Vec<serde_json::Value>> {
     vec![
         vec![triage_response()],
-        vec![
-            dive_response("hardcoded credential"),
-            dive_response("second"),
-        ],
+        vec![dive_response("second"), dive_response("second")],
         vec![summary_response()],
     ]
 }
@@ -1044,7 +1045,7 @@ async fn a_failed_pass_leaves_nothing_to_resume() {
 
     // The second dive failed, so a retry must call the provider for it
     // again. Only the successful passes are served from cache.
-    let retry = registry_results(vec![], vec![Ok(dive_response("second"))], vec![]);
+    let retry = registry_results(vec![], vec![Ok(dive_on("src/util.rs", "second"))], vec![]);
     let RunOutcome::Review(review) = crate::pipeline::run(&retry, &config, &input())
         .await
         .expect("the retry resumes what completed and re-runs what failed")
@@ -1148,10 +1149,7 @@ async fn a_changed_model_is_not_served_from_cache() {
     // answer a question this run is not asking.
     let providers = registry(vec![
         vec![],
-        vec![
-            dive_response("hardcoded credential"),
-            dive_response("second"),
-        ],
+        vec![dive_response("second"), dive_response("second")],
         vec![],
     ]);
     crate::pipeline::run(&providers, &changed, &input())
@@ -2051,10 +2049,7 @@ fn templated(sections: &[&str], header: Option<&str>, footer: Option<&str>) -> C
 fn standard_steps() -> Vec<Vec<serde_json::Value>> {
     vec![
         vec![triage_response()],
-        vec![
-            dive_response("hardcoded credential"),
-            dive_response("second"),
-        ],
+        vec![dive_response("second"), dive_response("second")],
         vec![summary_response()],
     ]
 }
@@ -2343,10 +2338,7 @@ async fn the_verdict_prompt_never_sees_a_duplicated_defect() {
     let config = config_with("standard", "");
     let providers = registry(vec![
         vec![triage],
-        vec![
-            dive_response("hardcoded credential"),
-            dive_response("second"),
-        ],
+        vec![dive_response("second"), dive_response("second")],
         vec![summary_response()],
     ]);
     let outcome = crate::pipeline::run(&providers, &config, &input())
