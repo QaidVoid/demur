@@ -82,6 +82,9 @@ pub struct PullRequest {
     /// such in prompts.
     #[serde(default)]
     pub body: Option<String>,
+    /// The pull request author, when the API returns one.
+    #[serde(default)]
+    pub user: Option<User>,
     /// Head commit SHA.
     #[serde(rename = "head")]
     head_refs: HeadRefs,
@@ -450,13 +453,13 @@ impl GitHubClient {
         })
     }
 
-    /// The newest decodable marker from the bot's own prior reviews,
-    /// chosen by the highest recorded run count, ties broken toward the
-    /// later review, so the result does not depend on the API's list
-    /// order. Ties are real: a skip or failure notice marker keeps the
-    /// run count of the full marker it succeeds. Reviews without a
-    /// decodable marker are ignored, so stripped or tampered bodies
-    /// degrade to a full review.
+    /// The newest marker this run's credential signed, chosen by the
+    /// highest recorded run count, ties broken toward the later review,
+    /// so the result does not depend on the API's list order. Ties are
+    /// real: a skip or failure notice marker keeps the run count of the
+    /// full marker it succeeds. Bodies carrying no marker, or one signed
+    /// by a different credential, decode as absent, so planted or
+    /// tampered state degrades to a full review.
     pub async fn prior_marker(&self, number: u64) -> Result<Option<Marker>, GitHubError> {
         let reviews = self.reviews(number).await?;
         Ok(reviews
@@ -466,24 +469,28 @@ impl GitHubClient {
                 review
                     .body
                     .as_deref()
-                    .and_then(Marker::decode)
+                    .and_then(|body| Marker::decode(body, &self.token))
                     .map(|marker| (index, marker))
             })
             .max_by_key(|(index, marker)| (marker.run_count, *index))
             .map(|(_, marker)| marker))
     }
 
-    /// The fingerprints of findings whose review threads a human resolved.
-    /// When resolution state cannot be read, the set is empty, which treats
-    /// every finding as unresolved: a repeated comment is safer than a
-    /// silently cleared gate.
-    pub async fn dismissed_fingerprints(&self, number: u64) -> HashSet<String> {
+    /// The fingerprints of findings whose review threads were resolved by
+    /// someone other than the pull request author. An author resolving
+    /// their own finding is not a verdict on it, and neither is a
+    /// resolution GitHub does not attribute. When resolution state cannot
+    /// be read, the set is empty, which treats every finding as
+    /// unresolved: a repeated comment is safer than a silently cleared
+    /// gate.
+    pub async fn dismissed_fingerprints(&self, number: u64, author_login: &str) -> HashSet<String> {
         let query = r#"query($owner:String!,$repo:String!,$number:Int!){
             repository(owner:$owner,name:$repo){
                 pullRequest(number:$number){
                     reviewThreads(first:100){
                         nodes{
                             isResolved
+                            resolvedBy{login}
                             comments(first:1){nodes{body}}
                         }
                     }
@@ -530,7 +537,13 @@ impl GitHubClient {
         struct GraphQlThread {
             #[serde(rename = "isResolved")]
             is_resolved: bool,
+            #[serde(rename = "resolvedBy")]
+            resolved_by: Option<GraphQlUser>,
             comments: GraphQlComments,
+        }
+        #[derive(Deserialize)]
+        struct GraphQlUser {
+            login: Option<String>,
         }
         #[derive(Deserialize)]
         struct GraphQlComments {
@@ -554,6 +567,14 @@ impl GitHubClient {
         {
             for thread in threads.nodes {
                 if !thread.is_resolved {
+                    continue;
+                }
+                let dismissed_by_others = thread
+                    .resolved_by
+                    .as_ref()
+                    .and_then(|user| user.login.as_deref())
+                    .is_some_and(|login| !login.eq_ignore_ascii_case(author_login));
+                if !dismissed_by_others {
                     continue;
                 }
                 for comment in thread.comments.nodes {

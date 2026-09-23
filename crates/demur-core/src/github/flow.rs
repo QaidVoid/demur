@@ -53,7 +53,12 @@ pub async fn review_pull_request(
         pr.draft
     );
 
-    let state = pull_request_state(client, number, &head_sha, config).await?;
+    let author_login = pr
+        .user
+        .as_ref()
+        .and_then(|user| user.login.as_deref())
+        .unwrap_or("");
+    let state = pull_request_state(client, number, &head_sha, author_login, config).await?;
 
     let input = PipelineInput {
         meta: PullRequestMeta {
@@ -271,11 +276,13 @@ pub struct PullRequestState {
 /// Derive the review state for one pull request head: prior marker and
 /// dismissed threads from GitHub, the scope from the marker's head, the
 /// diff that scope covers, and the carried findings and suppress set that
-/// state implies.
+/// state implies. The author login attributes thread resolutions, so an
+/// author clearing their own finding is not a dismissal.
 pub async fn pull_request_state(
     client: &GitHubClient,
     number: u64,
     head_sha: &str,
+    author_login: &str,
     config: &Config,
 ) -> Result<PullRequestState, FlowError> {
     let prior_marker = client.prior_marker(number).await?;
@@ -306,7 +313,7 @@ pub async fn pull_request_state(
         diff_text.lines().count(),
         diff_started.elapsed()
     );
-    let dismissed = client.dismissed_fingerprints(number).await;
+    let dismissed = client.dismissed_fingerprints(number, author_login).await;
     if !dismissed.is_empty() {
         log::info!("dismissed fingerprints: {}", dismissed.len());
     }

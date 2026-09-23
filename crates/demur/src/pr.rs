@@ -256,8 +256,13 @@ pub async fn review_pr(
     // and continues the run and spend history. A printed review covers
     // the full input every time and touches no state.
     let state = if publish {
+        let author = pr
+            .user
+            .as_ref()
+            .and_then(|user| user.login.as_deref())
+            .unwrap_or("");
         Some(
-            pull_request_state(&client, parsed.number, pr.head_sha(), &config)
+            pull_request_state(&client, parsed.number, pr.head_sha(), author, &config)
                 .await
                 .map_err(|e| e.to_string())?,
         )

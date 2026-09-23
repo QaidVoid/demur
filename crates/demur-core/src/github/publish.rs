@@ -32,7 +32,7 @@ pub async fn publish_review(
     let body_with_marker = match marker {
         // An oversized marker ships no marker at all, which makes the next
         // run a full review, rather than breaking publication.
-        Some(marker) => match marker.encode_bounded() {
+        Some(marker) => match marker.encode_bounded(&client.token) {
             Some(encoded) => format!("{}\n\n{}", body, encoded),
             None => body.to_string(),
         },
@@ -91,7 +91,7 @@ pub async fn publish_notice(
     conclusion: &'static str,
 ) -> Result<(), GitHubError> {
     let body_with_marker = match marker {
-        Some(marker) => match marker.encode_bounded() {
+        Some(marker) => match marker.encode_bounded(&client.token) {
             Some(encoded) => format!("{}\n\n{}", body, encoded),
             None => body.to_string(),
         },

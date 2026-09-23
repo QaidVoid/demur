@@ -88,7 +88,7 @@ impl Marker {
     /// A fresh marker for a first review.
     pub fn new(head_sha: &str) -> Marker {
         Marker {
-            v: 1,
+            v: 2,
             head_sha: head_sha.to_string(),
             run_count: 1,
             spend: BTreeMap::new(),
@@ -104,20 +104,24 @@ impl Marker {
             .unwrap_or_else(|| self.spend.values().sum())
     }
 
-    /// Encode into the hidden HTML comment form.
-    pub fn encode(&self) -> String {
+    /// Encode into the signed hidden HTML comment form. The key is the
+    /// credential the run publishes with, so a marker only decodes for a
+    /// later run holding the same credential, and a pull request author
+    /// cannot plant one that narrows the next review.
+    pub fn encode(&self, key: &str) -> String {
         let json = serde_json::to_string(self).expect("marker serializes");
-        format!("{MARKER_PREFIX}{json}{MARKER_SUFFIX}")
+        let signature = marker_signature(key, &json);
+        format!("{MARKER_PREFIX}{json} {signature}{MARKER_SUFFIX}")
     }
 
     /// Encode within the size bound, pruning resolved fingerprints, then
     /// old notes and warnings, and never an unresolved blocker. Returns
     /// None when the bound cannot be met, which means the next run falls
     /// back to a full review.
-    pub fn encode_bounded(&self) -> Option<String> {
+    pub fn encode_bounded(&self, key: &str) -> Option<String> {
         let mut pruned = self.clone();
-        if pruned.encode().len() <= MAX_MARKER_BYTES {
-            return Some(pruned.encode());
+        if pruned.encode(key).len() <= MAX_MARKER_BYTES {
+            return Some(pruned.encode(key));
         }
         // Resolved first, oldest run index first.
         let mut resolved: Vec<CarriedFinding> = pruned
@@ -131,8 +135,8 @@ impl Marker {
         pruned
             .findings
             .retain(|f| !resolved_ids.contains(&f.fingerprint));
-        if pruned.encode().len() <= MAX_MARKER_BYTES {
-            return Some(pruned.encode());
+        if pruned.encode(key).len() <= MAX_MARKER_BYTES {
+            return Some(pruned.encode(key));
         }
         // Then notes, then warnings, oldest first. Never an unresolved
         // blocker.
@@ -147,24 +151,33 @@ impl Marker {
             pruned
                 .findings
                 .retain(|f| !droppable.contains(&f.fingerprint));
-            if pruned.encode().len() <= MAX_MARKER_BYTES {
-                return Some(pruned.encode());
+            if pruned.encode(key).len() <= MAX_MARKER_BYTES {
+                return Some(pruned.encode(key));
             }
         }
         None
     }
 
-    /// Decode a marker from a review body. Any absence, stripping,
-    /// malformation, or tampering decodes as None so callers fall back to
-    /// a full review and never narrow scope on bad state.
-    pub fn decode(body: &str) -> Option<Marker> {
-        let start = body.find(MARKER_PREFIX)?;
-        let payload_start = start + MARKER_PREFIX.len();
-        let rest = &body[payload_start..];
+    /// Decode the last marker in a review body, and only when its
+    /// signature verifies against the key. Any absence, stripping,
+    /// malformation, tampering, a foreign credential's signature, or
+    /// impossible figures decodes as None, so callers fall back to a full
+    /// review and never narrow scope on state they cannot trust.
+    pub fn decode(body: &str, key: &str) -> Option<Marker> {
+        let start = body.rfind(MARKER_PREFIX)?;
+        let rest = &body[start + MARKER_PREFIX.len()..];
         let end = rest.find(MARKER_SUFFIX)?;
-        let json = &rest[..end];
+        let payload = &rest[..end];
+        let (json, signature) = payload.rsplit_once(' ')?;
+        if marker_signature(key, json) != signature {
+            return None;
+        }
         let marker: Marker = serde_json::from_str(json).ok()?;
-        if marker.v != 1 {
+        if marker.v != 2 || marker.run_count == 0 {
+            return None;
+        }
+        let mut figures = marker.spend.values().chain(marker.total_spend.iter());
+        if figures.any(|figure| !figure.is_finite() || *figure < 0.0) {
             return None;
         }
         Some(marker)
@@ -183,12 +196,24 @@ impl Marker {
 
 /// FNV-1a: a tiny stable hash for persistent fingerprints.
 fn fnv1a(data: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in data.as_bytes() {
+    format!("{:016x}", fnv1a_bytes(0xcbf29ce484222325, data.as_bytes()))
+}
+
+fn fnv1a_bytes(mut hash: u64, bytes: &[u8]) -> u64 {
+    for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    format!("{hash:016x}")
+    hash
+}
+
+/// Sign a marker payload by chaining the key into the hash before it.
+/// The hash is not cryptographic and need not be: a forger can read
+/// every published marker but cannot guess the credential the
+/// signature derives from, and a u64 leaves nothing to invert.
+fn marker_signature(key: &str, payload: &str) -> String {
+    let keyed = fnv1a_bytes(0xcbf29ce484222325, key.as_bytes());
+    format!("{:016x}", fnv1a_bytes(keyed, payload.as_bytes()))
 }
 
 /// Compute a finding fingerprint from path, enclosing symbol, and the
@@ -526,6 +551,8 @@ pub fn build_marker(
 mod tests {
     use super::*;
 
+    const KEY: &str = "test-token";
+
     fn finding(file: &str, message: &str, severity: Severity) -> Finding {
         Finding {
             file: file.to_string(),
@@ -569,8 +596,8 @@ mod tests {
             CarriedState::Unresolved,
             1,
         ));
-        let body = format!("## review\n\n{}\n", marker.encode());
-        let decoded = Marker::decode(&body).unwrap();
+        let body = format!("## review\n\n{}\n", marker.encode(KEY));
+        let decoded = Marker::decode(&body, KEY).unwrap();
         assert_eq!(decoded.head_sha, "abc1234");
         assert_eq!(decoded.spend.get("triage"), Some(&0.0021));
         assert_eq!(decoded.findings.len(), 1);
@@ -578,17 +605,62 @@ mod tests {
     }
 
     #[test]
-    fn stripped_or_malformed_markers_decode_as_absent() {
-        assert!(Marker::decode("no marker here").is_none());
-        assert!(Marker::decode("<!-- demur:state {not json} -->").is_none());
-        assert!(Marker::decode("<!-- demur:state {\"v\":2} -->").is_none());
+    fn foreign_or_forged_signatures_decode_as_absent() {
+        let mut marker = Marker::new("abc1234");
+        marker.spend.insert("triage".to_string(), 0.01);
+        let encoded = marker.encode(KEY);
+        assert!(Marker::decode(&encoded, "another-token").is_none());
+        // A planted marker without a signature, even one copying a real
+        // payload, fails verification.
+        let json = serde_json::to_string(&marker).unwrap();
+        let planted = format!("{MARKER_PREFIX}{json} 0123456789abcdef{MARKER_SUFFIX}");
+        assert!(Marker::decode(&planted, KEY).is_none());
+        assert!(Marker::decode(&encoded.replace("abc1234", "zzz"), KEY).is_none());
+    }
+
+    #[test]
+    fn the_last_marker_in_a_body_wins() {
+        let planted = Marker::new("planted");
+        let real = Marker::new("real");
+        let body = format!(
+            "a review{}\n\nlater text{}\n",
+            planted.encode(KEY),
+            real.encode(KEY)
+        );
+        let decoded = Marker::decode(&body, KEY).unwrap();
+        assert_eq!(decoded.head_sha, "real");
+    }
+
+    #[test]
+    fn impossible_figures_decode_as_absent() {
         let mut marker = Marker::new("abc");
-        let encoded = marker.encode();
+        marker.run_count = 0;
+        assert!(Marker::decode(&marker.encode(KEY), KEY).is_none());
+        let mut marker = Marker::new("abc");
+        marker.spend.insert("triage".to_string(), -0.5);
+        assert!(Marker::decode(&marker.encode(KEY), KEY).is_none());
+    }
+
+    #[test]
+    fn stripped_or_malformed_markers_decode_as_absent() {
+        assert!(Marker::decode("no marker here", KEY).is_none());
+        assert!(Marker::decode("<!-- demur:state {not json} -->", KEY).is_none());
+        // A legacy unsigned marker predating signatures falls back to a
+        // full review once, and the next run writes a signed one.
+        assert!(
+            Marker::decode(
+                "<!-- demur:state {\"v\":1,\"head_sha\":\"abc\",\"run_count\":1,\"spend\":{},\"findings\":[]} -->",
+                KEY
+            )
+            .is_none()
+        );
+        let mut marker = Marker::new("abc");
+        let encoded = marker.encode(KEY);
         marker.head_sha = "tampered".to_string();
         let tampered = encoded.replace("abc", "zzz");
         assert!(
-            Marker::decode(&tampered).is_none()
-                || Marker::decode(&tampered).unwrap().head_sha == "zzz"
+            Marker::decode(&tampered, KEY).is_none()
+                || Marker::decode(&tampered, KEY).unwrap().head_sha == "zzz"
         );
     }
 
@@ -617,9 +689,9 @@ mod tests {
             CarriedState::Unresolved,
             0,
         ));
-        let encoded = marker.encode_bounded().expect("bound is reachable");
+        let encoded = marker.encode_bounded(KEY).expect("bound is reachable");
         assert!(encoded.len() <= MAX_MARKER_BYTES);
-        let decoded = Marker::decode(&encoded).unwrap();
+        let decoded = Marker::decode(&encoded, KEY).unwrap();
         assert!(
             decoded
                 .findings
@@ -651,7 +723,7 @@ mod tests {
                 index,
             ));
         }
-        assert!(marker.encode_bounded().is_none());
+        assert!(marker.encode_bounded(KEY).is_none());
     }
 
     #[test]

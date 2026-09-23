@@ -68,7 +68,7 @@ fn prior_marker_body(head: &str, run_count: u32) -> String {
         first_seen: 1,
         aliases: Vec::new(),
     });
-    marker.encode()
+    marker.encode(TOKEN)
 }
 
 const UNRELATED_DIFF: &str = "\
@@ -160,6 +160,39 @@ async fn client_fetches_pull_request_diff_and_reviews() {
 }
 
 #[tokio::test]
+async fn a_marker_signed_by_another_credential_is_not_prior_state() {
+    let server = MockServer::start().await;
+    let forged = Marker::new("oldhead").encode("attacker-token");
+    let ours = prior_marker_body("oldhead", 1);
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "user": {"login": "prauthor"}, "body": forged, "state": "COMMENTED"},
+            {"id": 2, "user": {"login": "github-actions[bot]"}, "body": ours, "state": "COMMENTED"}
+        ])))
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let marker = client.prior_marker(7).await.unwrap().expect("ours decodes");
+    assert_eq!(marker.head_sha, "oldhead");
+}
+
+#[tokio::test]
+async fn a_planted_only_marker_degrades_to_no_prior_state() {
+    let server = MockServer::start().await;
+    let forged = Marker::new("oldhead").encode("attacker-token");
+    Mock::given(method("GET"))
+        .and(path("/repos/owner/repo/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 1, "user": {"login": "prauthor"}, "body": forged, "state": "COMMENTED"}
+        ])))
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    assert!(client.prior_marker(7).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn ancestry_check_distinguishes_fast_forward_from_force_push() {
     let server = MockServer::start().await;
     for (sha, status) in [("old1", "ahead"), ("old2", "diverged")] {
@@ -179,10 +212,10 @@ async fn dismissed_fingerprints_read_from_resolved_threads() {
     let server = MockServer::start().await;
     let threads_json = r#"{
         "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
-            {"isResolved": true, "comments": {"nodes": [
+            {"isResolved": true, "resolvedBy": {"login": "maintainer"}, "comments": {"nodes": [
                 {"body": "looks fixed <!-- demur:fp fp-dismissed -->"}
             ]}},
-            {"isResolved": false, "comments": {"nodes": [
+            {"isResolved": false, "resolvedBy": null, "comments": {"nodes": [
                 {"body": "still standing <!-- demur:fp fp-open -->"}
             ]}}
         ]}}}}}
@@ -194,9 +227,33 @@ async fn dismissed_fingerprints_read_from_resolved_threads() {
         .mount(&server)
         .await;
     let client = client(&server);
-    let dismissed = client.dismissed_fingerprints(7).await;
+    let dismissed = client.dismissed_fingerprints(7, "prauthor").await;
     assert!(dismissed.contains("fp-dismissed"));
     assert!(!dismissed.contains("fp-open"));
+}
+
+#[tokio::test]
+async fn a_thread_the_author_resolved_is_not_a_dismissal() {
+    let server = MockServer::start().await;
+    let threads_json = r#"{
+        "data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": [
+            {"isResolved": true, "resolvedBy": {"login": "PRAuthor"}, "comments": {"nodes": [
+                {"body": "self-cleared <!-- demur:fp fp-self -->"}
+            ]}},
+            {"isResolved": true, "comments": {"nodes": [
+                {"body": "unattributed <!-- demur:fp fp-ghost -->"}
+            ]}}
+        ]}}}}}
+    "#;
+    let threads: serde_json::Value = serde_json::from_str(threads_json).unwrap();
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(threads))
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    let dismissed = client.dismissed_fingerprints(7, "prauthor").await;
+    assert!(dismissed.is_empty());
 }
 
 #[tokio::test]
@@ -208,7 +265,12 @@ async fn unreadable_resolution_state_treats_findings_as_unresolved() {
         .mount(&server)
         .await;
     let client = client(&server);
-    assert!(client.dismissed_fingerprints(7).await.is_empty());
+    assert!(
+        client
+            .dismissed_fingerprints(7, "prauthor")
+            .await
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -1166,7 +1228,7 @@ diff --git a/src/old.rs b/src/old.rs
         aliases: Vec::new(),
     });
     let server = MockServer::start().await;
-    let prior_body = prior.encode();
+    let prior_body = prior.encode(TOKEN);
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/pulls/7"))
         .and(header("accept", "application/vnd.github+json"))
@@ -1261,7 +1323,7 @@ fn spend_only_marker_body(head: &str, run_count: u32) -> String {
     let mut marker = Marker::new(head);
     marker.run_count = run_count;
     marker.spend.insert("triage".to_string(), 0.01);
-    marker.encode()
+    marker.encode(TOKEN)
 }
 
 async fn spend_prior_mocks(server: &MockServer, prior_body: String) {
@@ -1467,7 +1529,7 @@ diff --git a/src/old.rs b/src/old.rs
         aliases: Vec::new(),
     });
     let server = MockServer::start().await;
-    let prior_body = prior.encode();
+    let prior_body = prior.encode(TOKEN);
     Mock::given(method("GET"))
         .and(path("/repos/owner/repo/pulls/7"))
         .and(header("accept", "application/vnd.github+json"))
