@@ -40,8 +40,28 @@ The `claude-code` family could not launch its headless process. In order:
   and finish its sign-in, then rerun demur.
 
 The same three apply when every pass fails with
-`claude exited with <status>`: read the stderr excerpt in the error, which
-is usually the CLI naming an expired or missing login.
+`claude exited with <status>`: read the detail in the error, which is the
+CLI naming the cause, taken from its result document on standard output
+when standard error is silent.
+
+## `claude exited with exit status: 1: Not logged in`
+
+The headless CLI found no login under the config directory it looked at.
+Two causes, in order:
+
+- The login lives under a `CLAUDE_CONFIG_DIR` that the process running
+  demur does not have set. The child inherits only an allowlist of
+  variables, and `CLAUDE_CONFIG_DIR` is on it, but only when the parent
+  has it. Export it in the shell, hook, or workflow step that runs demur.
+- There is no login at all. Run `claude` once interactively as the same
+  user and finish its sign-in, then rerun demur.
+
+Verify which one applies by running the same command demur runs, from the
+same environment:
+
+```bash
+echo 'ok' | claude -p --model haiku --max-turns 1
+```
 
 ## `prompt exceeds the model context window`
 

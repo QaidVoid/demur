@@ -106,46 +106,60 @@ impl Provider for ClaudeCodeClient {
         // a `.claude` directory whose settings and hooks execute commands,
         // so the working directory is the neutral temporary directory and
         // the environment is the allowlist above.
-        let mut command = Command::new(&self.binary);
-        command
-            .arg("-p")
-            .arg("--output-format")
-            .arg("json")
-            .arg("--json-schema")
-            .arg(request.schema.to_string())
-            .arg("--append-system-prompt")
-            .arg(&request.system)
-            .arg("--model")
-            .arg(&self.model);
-        if let Some(effort) = &self.effort {
-            command.arg("--effort").arg(effort);
-        }
-        command
-            .arg("--max-turns")
-            .arg("1")
-            .arg("--tools")
-            .arg("")
-            .env_clear();
-        for (key, value) in std::env::vars_os() {
-            if child_env_allows(&key.to_string_lossy()) {
-                command.env(key, value);
-            }
-        }
-        command.current_dir(std::env::temp_dir());
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|err| ProviderError::Rejected {
-                message: format!(
-                    "could not start {CLAUDE_BIN}: {err}\n\
+        let spawn_error = |err: std::io::Error| ProviderError::Rejected {
+            message: format!(
+                "could not start {CLAUDE_BIN}: {err}\n\
 install Claude Code (npm install -g @anthropic-ai/claude-code), make sure \
 `{CLAUDE_BIN}` is on the PATH of this process, and run it once \
 interactively to complete its login"
-                ),
-            })?;
+            ),
+        };
+        // A test fixture writes its stand-in moments before exec, and some
+        // filesystems hold a fresh executable open for a beat, failing the
+        // exec with Text file busy. The real binary is a stable
+        // installation, so the retry exists for the test build alone.
+        let build = || {
+            let mut command = Command::new(&self.binary);
+            command
+                .arg("-p")
+                .arg("--output-format")
+                .arg("json")
+                .arg("--json-schema")
+                .arg(request.schema.to_string())
+                .arg("--append-system-prompt")
+                .arg(&request.system)
+                .arg("--model")
+                .arg(&self.model);
+            if let Some(effort) = &self.effort {
+                command.arg("--effort").arg(effort);
+            }
+            command
+                .arg("--max-turns")
+                .arg("1")
+                .arg("--tools")
+                .arg("")
+                .env_clear();
+            for (key, value) in std::env::vars_os() {
+                if child_env_allows(&key.to_string_lossy()) {
+                    command.env(key, value);
+                }
+            }
+            command.current_dir(std::env::temp_dir());
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            command
+        };
+        let mut child = match build().spawn() {
+            Ok(child) => child,
+            Err(err) if cfg!(test) && err.raw_os_error() == Some(26) => {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                build().spawn().map_err(spawn_error)?
+            }
+            Err(err) => return Err(spawn_error(err)),
+        };
 
         let user = request.user.clone();
         #[cfg(test)]
@@ -179,11 +193,7 @@ interactively to complete its login"
         // be trusted to produce.
         if !output.status.success() {
             return Err(ProviderError::Request {
-                message: format!(
-                    "{CLAUDE_BIN} exited with {}: {}",
-                    output.status,
-                    stderr_tail(&output.stderr)
-                ),
+                message: child_failure(&output.status, &output.stderr, &output.stdout),
             });
         }
         let wrote = match tokio::time::timeout(timeout, stdin_task).await {
@@ -236,6 +246,46 @@ fn stderr_tail(stderr: &[u8]) -> String {
     let chars: Vec<char> = text.chars().collect();
     let start = chars.len().saturating_sub(STDERR_TAIL_CHARS);
     chars[start..].iter().collect()
+}
+
+/// Name why the child failed. Stderr wins when it said anything; the
+/// headless CLI otherwise reports its failures as JSON on standard output
+/// (a missing login, a rate limit, an API error), and an empty detail
+/// after the exit status names nothing. A missing login gets setup
+/// guidance, because from the outside it looks like a broken install.
+fn child_failure(status: &std::process::ExitStatus, stderr: &[u8], stdout: &[u8]) -> String {
+    let tail = stderr_tail(stderr);
+    let detail = if tail.trim().is_empty() {
+        stdout_reason(stdout)
+    } else {
+        tail
+    };
+    let mut message = format!("{CLAUDE_BIN} exited with {status}: {detail}");
+    let lowered = detail.to_lowercase();
+    if lowered.contains("not logged in") || lowered.contains("/login") {
+        message.push_str(
+            "\nthe headless CLI holds no login. Run `claude` once interactively to log in; \
+if your login lives under a CLAUDE_CONFIG_DIR, that variable must be set for \
+the process that runs demur as well, since the child inherits only an \
+allowlist of variables and this is one of them",
+        );
+    }
+    message
+}
+
+/// Extract the failure reason from the child's JSON result document.
+fn stdout_reason(stdout: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stdout);
+    serde_json::from_str::<Value>(text.trim())
+        .ok()
+        .and_then(|document| {
+            document
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or_else(|| "no reason reported on standard error or in its result document".into())
 }
 
 /// Feed the prompt while the answer is drained, so a child that stops
@@ -330,7 +380,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir_path:?}/args\ncat > {dir_path:?}/stdin\npwd > {dir_path:?}/cwd\nenv | grep -E '^DEMUR_TEST_[A-Z_]+=' > {dir_path:?}/childenv || true\n{body}\n"
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir_path:?}/args\ncat > {dir_path:?}/stdin\npwd > {dir_path:?}/cwd\nenv | grep -E '^(DEMUR_TEST_[A-Z_]+|CLAUDE_CONFIG_DIR)=' > {dir_path:?}/childenv || true\n{body}\n"
             ),
         )
         .unwrap();
@@ -463,6 +513,7 @@ mod tests {
     async fn the_child_runs_scrubbed_outside_the_checkout() {
         use std::env;
         unsafe { env::set_var("DEMUR_TEST_SENTINEL", "secret-from-the-checkout") };
+        unsafe { env::set_var("CLAUDE_CONFIG_DIR", "/demur-test-claude-config") };
         let (script, dir) = fixture(
             "scrubbed",
             &format!("printf '%s' {}", sh_quote(&result_document("{\"a\": 1}"))),
@@ -475,6 +526,10 @@ mod tests {
         assert!(
             !childenv.contains("DEMUR_TEST_SENTINEL"),
             "the child saw an unlisted variable: {childenv}"
+        );
+        assert!(
+            childenv.contains("CLAUDE_CONFIG_DIR=/demur-test-claude-config"),
+            "the child lost the config dir: {childenv}"
         );
         let cwd = std::fs::read_to_string(dir.path().join("cwd")).unwrap();
         let checkout = std::env::current_dir().unwrap();
@@ -534,6 +589,50 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("exited with"), "{text}");
         assert!(text.contains("provider auth expired"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_silent_stderr_falls_back_to_the_result_document() {
+        let document = serde_json::json!({
+            "subtype": "success",
+            "is_error": true,
+            "terminal_reason": "api_error",
+            "result": "rate limit reached, try again later"
+        })
+        .to_string();
+        let (script, _dir) = fixture(
+            "stdout-failure",
+            &format!("printf '%s' {}\nexit 1\n", sh_quote(&document)),
+        );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        let err = complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("exited with"), "{text}");
+        assert!(text.contains("rate limit reached"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_missing_login_gets_setup_guidance() {
+        let document = serde_json::json!({
+            "subtype": "success",
+            "is_error": true,
+            "result": "Not logged in · Please run /login"
+        })
+        .to_string();
+        let (script, _dir) = fixture(
+            "logged-out",
+            &format!("printf '%s' {}\nexit 1\n", sh_quote(&document)),
+        );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        let err = complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("Not logged in"), "{text}");
+        assert!(text.contains("interactively to log in"), "{text}");
+        assert!(text.contains("CLAUDE_CONFIG_DIR"), "{text}");
     }
 
     #[tokio::test]
