@@ -22,6 +22,41 @@ const PASS_TIMEOUT: Duration = Duration::from_secs(600);
 /// How much of the child's stderr a failure message may carry.
 const STDERR_TAIL_CHARS: usize = 400;
 
+/// Environment variables the headless child may inherit. Everything else
+/// is scrubbed: the working directory the run started in is untrusted
+/// checkout data, and the child must not read configuration, hooks, or
+/// secrets out of its environment.
+const CHILD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "CLAUDE_CONFIG_DIR",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "NODE_EXTRA_CA_CERTS",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+];
+
+fn child_env_allows(key: &str) -> bool {
+    CHILD_ENV.contains(&key) || key.starts_with("XDG_")
+}
+
 /// Runs one pass through one headless `claude` process: prompt on standard
 /// input, one JSON document out.
 pub struct ClaudeCodeClient {
@@ -58,7 +93,12 @@ impl Provider for ClaudeCodeClient {
         &self,
         request: &CompletionRequest,
     ) -> Result<CompletionResponse, ProviderError> {
-        let mut child = Command::new(&self.binary)
+        // The child never runs from the checkout: a pull request can ship
+        // a `.claude` directory whose settings and hooks execute commands,
+        // so the working directory is the neutral temporary directory and
+        // the environment is the allowlist above.
+        let mut command = Command::new(&self.binary);
+        command
             .arg("-p")
             .arg("--output-format")
             .arg("json")
@@ -72,13 +112,26 @@ impl Provider for ClaudeCodeClient {
             .arg("1")
             .arg("--tools")
             .arg("")
+            .env_clear();
+        for (key, value) in std::env::vars_os() {
+            if child_env_allows(&key.to_string_lossy()) {
+                command.env(key, value);
+            }
+        }
+        command.current_dir(std::env::temp_dir());
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .map_err(|err| ProviderError::Rejected {
-                message: format!("could not start {CLAUDE_BIN}: {err}"),
+                message: format!(
+                    "could not start {CLAUDE_BIN}: {err}\n\
+install Claude Code (npm install -g @anthropic-ai/claude-code), make sure \
+`{CLAUDE_BIN}` is on the PATH of this process, and run it once \
+interactively to complete its login"
+                ),
             })?;
 
         let user = request.user.clone();
@@ -254,8 +307,9 @@ mod tests {
         }
     }
 
-    /// A fixture script standing in for the CLI. It records its arguments
-    /// and standard input beside itself, then answers per `behavior`.
+    /// A fixture script standing in for the CLI. It records its arguments,
+    /// standard input, working directory, and the test environment
+    /// variables it received, then answers per `behavior`.
     fn fixture(name: &str, body: &str) -> (PathBuf, tempfile::TempDir) {
         let dir = tempfile::TempDir::with_prefix(format!("demur-claude-{name}-")).unwrap();
         let dir_path = dir.path();
@@ -263,7 +317,7 @@ mod tests {
         std::fs::write(
             &script,
             format!(
-                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir_path:?}/args\ncat > {dir_path:?}/stdin\n{body}\n"
+                "#!/bin/bash\nprintf '%s\\n' \"$*\" > {dir_path:?}/args\ncat > {dir_path:?}/stdin\npwd > {dir_path:?}/cwd\nenv | grep -E '^DEMUR_TEST_[A-Z_]+=' > {dir_path:?}/childenv || true\n{body}\n"
             ),
         )
         .unwrap();
@@ -375,6 +429,32 @@ mod tests {
         );
         let stdin = std::fs::read_to_string(dir.path().join("stdin")).unwrap();
         assert_eq!(stdin, "volatile data");
+    }
+
+    #[tokio::test]
+    async fn the_child_runs_scrubbed_outside_the_checkout() {
+        use std::env;
+        unsafe { env::set_var("DEMUR_TEST_SENTINEL", "secret-from-the-checkout") };
+        let (script, dir) = fixture(
+            "scrubbed",
+            &format!("printf '%s' {}", sh_quote(&result_document("{\"a\": 1}"))),
+        );
+        let client = ClaudeCodeClient::for_tests(script, PASS_TIMEOUT);
+        complete_with_retries(&client, &request(), &fast_policy())
+            .await
+            .unwrap();
+        let childenv = std::fs::read_to_string(dir.path().join("childenv")).unwrap();
+        assert!(
+            !childenv.contains("DEMUR_TEST_SENTINEL"),
+            "the child saw an unlisted variable: {childenv}"
+        );
+        let cwd = std::fs::read_to_string(dir.path().join("cwd")).unwrap();
+        let checkout = std::env::current_dir().unwrap();
+        assert_ne!(
+            PathBuf::from(cwd.trim()),
+            checkout,
+            "the child ran from the checkout: {cwd}"
+        );
     }
 
     #[tokio::test]

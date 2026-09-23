@@ -27,6 +27,22 @@ native endpoint to confirm.
 A rejection on the verdict summary pass no longer costs you the run: the review
 publishes without the summary paragraph and says so.
 
+## `could not start claude`
+
+The `claude-code` family could not launch its headless process. In order:
+
+- Claude Code is not installed. Install it with
+  `npm install -g @anthropic-ai/claude-code`.
+- `claude` is not on the `PATH` of the process that runs demur. In the
+  Action, install Claude Code in an earlier step of the same job; locally,
+  check which `PATH` your shell hands to demur.
+- The CLI has no login. Run `claude` once interactively as the same user
+  and finish its sign-in, then rerun demur.
+
+The same three apply when every pass fails with
+`claude exited with <status>`: read the stderr excerpt in the error, which
+is usually the CLI naming an expired or missing login.
+
 ## `prompt exceeds the model context window`
 
 demur shrinks the context to the highest-risk hunk and retries once. If that

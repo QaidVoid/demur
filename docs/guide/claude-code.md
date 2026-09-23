@@ -50,6 +50,15 @@ subscription, and so on. The `name` field is the model alias passed to the
 CLI; the model disclosure in the review names the model that actually
 answered, which the CLI reports alongside its own cost figure.
 
+One prerequisite follows from the transport: whatever machine runs demur
+needs a Claude Code installation and a completed login under the user demur
+runs as. On a workstation that is usually already true. On a GitHub Actions
+runner it never is, so the workflow must install Claude Code in a step
+before the demur step, and the subscription must be reachable from the
+runner's own login flow, which the hosted runners do not provide. The
+claude-code family is therefore at home on self-hosted runners and
+workstations, not on the hosted Action runners.
+
 ## What the transport guarantees
 
 The command is fixed in the bot. It never comes from configuration and
@@ -63,6 +72,14 @@ never from model output. Each pass:
   before demur reads it;
 - disables tools and follow-up turns (`--tools ""`, `--max-turns 1`): a
   pass is one prompt in and one answer out;
+- runs the process outside your checkout. A pull request can ship a
+  `.claude` directory whose settings and hooks execute commands, so the
+  child's working directory is the neutral temporary directory, never the
+  repository being reviewed;
+- inherits only an allowlist of environment variables (`PATH`, `HOME`,
+  proxy and TLS settings, locale, and similar). Everything else is
+  scrubbed, so the child reads no secrets and no configuration a pull
+  request could aim at;
 - gives each spawned process 600 seconds. A process that exceeds the
   bound is killed and the request retried within the usual retry bound;
   a pass that keeps failing fails as an ordinary request error and the
@@ -71,6 +88,12 @@ never from model output. Each pass:
 A schema-invalid answer follows the same corrective retry path as any
 other family. A run that exceeds its budget still skips or shrinks with a
 disclosure, exactly as it would over HTTP.
+
+If the child cannot start at all, the run fails fast with setup
+guidance: `claude` must be installed, on the `PATH` of the process that
+runs demur, and logged in. On a GitHub Actions runner that means the
+workflow installs Claude Code before the demur step; on a workstation it
+usually means running `claude` once interactively to complete the login.
 
 The CLI's own output ceiling is not carried per request. demur's
 `limits.max_tokens` prices and gates the pass; the CLI applies whatever
