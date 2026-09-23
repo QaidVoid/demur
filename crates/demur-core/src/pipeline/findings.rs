@@ -28,9 +28,6 @@ pub struct ModelFinding {
 pub struct TriageOutput {
     /// Findings the triage model raised directly.
     pub findings: Vec<ModelFinding>,
-    /// Repository context the pass says it needs. Unused by triage today.
-    #[serde(default)]
-    pub context_requests: Vec<String>,
     /// Suggested review lenses per cluster path.
     pub cluster_lens: Vec<ClusterLens>,
 }

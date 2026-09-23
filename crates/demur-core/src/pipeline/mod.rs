@@ -14,7 +14,6 @@ use std::collections::HashSet;
 
 use crate::config::{Config, Lenses, Profile};
 use crate::cost::{ModelPrice, estimate_tokens};
-use crate::diff::Hunk;
 use crate::ingest::Ingestion;
 use crate::provider::{
     CompletionRequest, CompletionResponse, ProviderError, ProviderRegistry, RetryPolicy,
@@ -860,19 +859,24 @@ async fn synthesize_review(
         let findings_text = all
             .iter()
             .map(|finding| {
-                format!(
+                let mut line = format!(
                     "- [{}] {}: {}",
                     severity_word(finding.severity),
                     finding.location(),
                     finding.message
-                )
+                );
+                for concern in &finding.further_concerns {
+                    line.push_str(&format!("\n  - {}: {}", concern.message, concern.harm));
+                }
+                line
             })
             .collect::<Vec<_>>()
             .join("\n");
         let context = prompt::repository_context(&input.meta, &findings_text);
         let task = "Draft a two sentence summary of the strongest case against merging, \
-based only on the findings listed above. If no findings are listed, state that \
-coverage was complete and no defect was established.";
+based only on the findings listed above, including their sub-concerns. If no \
+findings are listed, state that coverage was complete and no defect was \
+established.";
         let cheap_verdict_price = ModelPrice::from_model(&config.models.triage);
         let summary_prompt = prompt::assemble(&context, task);
         let summary_schema = summary_schema();
@@ -1289,22 +1293,25 @@ fn select_lenses(
 /// one heading per cluster, then its hunks. The raw diff text never
 /// enters a prompt.
 fn rendered_clusters(input: &PipelineInput) -> String {
-    prompt::clusters_text(
-        input
-            .ingestion
-            .clusters
-            .iter()
-            .map(|cluster| (cluster.path.as_str(), cluster.hunks.as_slice())),
-    )
+    prompt::clusters_text(&input.ingestion.clusters)
 }
 
 fn shrunk_diff_text(input: &PipelineInput) -> String {
-    prompt::clusters_text(input.ingestion.clusters.iter().take(5).map(|cluster| {
-        let width = cluster.hunks.len().min(2);
-        (cluster.path.as_str(), &cluster.hunks[..width])
-    }))
+    let shrunk: Vec<crate::ingest::Cluster> = input
+        .ingestion
+        .clusters
+        .iter()
+        .take(5)
+        .map(|cluster| {
+            let width = cluster.hunks.len().min(2);
+            crate::ingest::Cluster {
+                hunks: cluster.hunks[..width].to_vec(),
+                ..cluster.clone()
+            }
+        })
+        .collect();
+    prompt::clusters_text(&shrunk)
 }
-
 /// Open the resume cache when configuration asks for one. A location that
 /// cannot be opened yields no cache rather than an error, because a cache
 /// is never worth failing a run over.
@@ -1378,9 +1385,12 @@ async fn run_deep_dive(
 
     let cluster = dive.cluster;
     let lens = &dive.lens;
-    let context = prompt::cluster_context(&input.meta, &cluster.path, &cluster.hunks);
-    let shrunk_hunks: Vec<Hunk> = cluster.hunks.iter().take(1).cloned().collect();
-    let shrunk = prompt::cluster_context(&input.meta, &cluster.path, &shrunk_hunks);
+    let context = prompt::cluster_context(&input.meta, cluster);
+    let shrunk_cluster = crate::ingest::Cluster {
+        hunks: cluster.hunks.iter().take(1).cloned().collect(),
+        ..cluster.clone()
+    };
+    let shrunk = prompt::cluster_context(&input.meta, &shrunk_cluster);
     let task = deep_dive_task(lens);
     let schema = prompt::findings_schema();
     let full_prompt = prompt::assemble(&context, &task);
@@ -1541,7 +1551,10 @@ async fn run_deep_dive(
     // Retrieval rounds. The pass named what it wanted; the bot decides
     // what each name means and whether it is willing to read it.
     let mut result = result;
-    let mut carried_prompt = base_prompt;
+    // Every resolution ever attached, latest state per label, so a round's
+    // prompt is the base prompt plus one current attachment section: a
+    // refusal from an earlier round never outlives its answer.
+    let mut attached_context: Vec<crate::retrieval::Resolution> = Vec::new();
     if let Some(retriever) = retriever {
         let rounds = config.retrieval.max_rounds;
         for round in 1..=rounds {
@@ -1550,19 +1563,28 @@ async fn run_deep_dive(
                 break;
             }
             let resolved = resolve_requests(retriever, &requested, retrieval_budget);
-            let attached = resolved
+            let found = resolved
                 .iter()
                 .filter(|r| matches!(r, crate::retrieval::Resolution::Found { .. }))
                 .count();
+            for resolution in resolved {
+                match attached_context
+                    .iter_mut()
+                    .find(|existing| existing.label() == resolution.label())
+                {
+                    Some(existing) => *existing = resolution,
+                    None => attached_context.push(resolution),
+                }
+            }
             log::info!(
-                "deep dive [{}]: round {round} asked for {} item(s), {attached} attached",
+                "deep dive [{}]: round {round} asked for {} item(s), {found} attached",
                 lens,
                 requested.len()
             );
-            // Attachments accumulate, so a later round still sees what an
-            // earlier one attached. Only on the last permitted round must
-            // the pass stop asking.
-            let round_prompt = prompt::with_retrieved(&carried_prompt, &resolved, round == rounds);
+            // Each round reads the base prompt with the whole ledger, so
+            // only the last permitted round must stop the pass asking.
+            let round_prompt =
+                prompt::with_retrieved(&base_prompt, &attached_context, round == rounds);
             let decision = {
                 let mut gate = gate.lock().expect("budget gate lock");
                 gate.authorize(PassEstimate {
@@ -1617,11 +1639,10 @@ async fn run_deep_dive(
                     });
                     degradations.push(Degradation::ContextRetrieved {
                         pass: format!("deep dive ({lens}) on {}", cluster.path),
-                        items: resolved.iter().map(|r| r.label().to_string()).collect(),
-                        attached,
+                        items: requested.to_vec(),
+                        attached: found,
                     });
                     result = next;
-                    carried_prompt = round_prompt;
                 }
                 Err(err) => {
                     gate.lock().expect("budget gate lock").release(round_hold);

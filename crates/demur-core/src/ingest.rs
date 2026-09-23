@@ -14,6 +14,10 @@ pub struct Cluster {
     pub risk: f64,
     /// True when the diff adds this file.
     pub is_new_file: bool,
+    /// True when the diff deletes this file.
+    pub is_deleted: bool,
+    /// Path before the change, when renamed.
+    pub old_path: Option<String>,
 }
 
 /// Why a file was excluded from review.
@@ -175,6 +179,8 @@ pub fn ingest(files: &[FileDiff], config: &Config) -> Ingestion {
             hunks,
             risk: risk_score(file, &name),
             is_new_file: file.is_new,
+            is_deleted: file.is_deleted,
+            old_path: file.old_path.clone(),
         });
     }
     clusters.sort_by(|a, b| {
