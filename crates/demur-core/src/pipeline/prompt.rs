@@ -273,22 +273,6 @@ pub fn findings_schema() -> Value {
     })
 }
 
-/// Schema for the cross-examination pass, which reports findings only.
-pub fn cross_examination_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "findings": {
-                "type": "array",
-                "items": finding_item_schema(),
-            },
-            "context_requests": context_requests_schema(),
-        },
-        "required": ["findings"],
-        "additionalProperties": false,
-    })
-}
-
 fn finding_item_schema() -> Value {
     json!({
         "type": "object",
@@ -337,23 +321,6 @@ mod tests {
             serde_json::from_value(response).unwrap();
         assert_eq!(parsed.findings.len(), 1);
         assert_eq!(parsed.cluster_lens[0].lenses, vec!["security"]);
-    }
-
-    #[test]
-    fn cross_examination_schema_round_trips() {
-        let response = json!({
-            "findings": [{
-                "file": "src/db.rs",
-                "start_line": 10,
-                "end_line": 10,
-                "severity": "warning",
-                "message": "missing rollback path",
-                "harm": "A failed migration leaves the database unusable on deploy."
-            }]
-        });
-        let parsed: crate::pipeline::findings::ModelFindings =
-            serde_json::from_value(response).unwrap();
-        assert_eq!(parsed.findings.len(), 1);
     }
 
     #[test]

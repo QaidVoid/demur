@@ -43,8 +43,8 @@ const MAX_OUTPUT_CEILING: u32 = 64_000;
 /// treated as broken rather than degraded.
 const MAX_FAILED_DIVES: u32 = 2;
 
-/// A provider replaying recorded responses. Used by the fixture harness for
-/// end-to-end pipeline tests and for offline replay runs.
+/// A provider replaying recorded responses. Used by the fixture harness
+/// for end-to-end pipeline tests.
 pub struct RecordedProvider {
     steps: std::sync::Mutex<std::collections::VecDeque<Result<Value, ProviderError>>>,
     /// Responses matched to a marker in the request rather than to call
@@ -675,7 +675,7 @@ publishing coverage it could not establish",
 rollback safety, concurrency hazards, migration safety, and breaking interface \
 changes. Report only findings you can anchor to an exact file and line range \
 with their concrete harm.";
-        let cross_schema = prompt::cross_examination_schema();
+        let cross_schema = prompt::findings_schema();
         let full_prompt = prompt::assemble(&context, task);
         let shrunk_prompt = prompt::assemble(&shrunk_context, task);
         let estimate = PassEstimate {
@@ -861,7 +861,7 @@ async fn synthesize_review(
             .map(|finding| {
                 let mut line = format!(
                     "- [{}] {}: {}",
-                    severity_word(finding.severity),
+                    finding.severity.name(),
                     finding.location(),
                     finding.message
                 );
@@ -1747,14 +1747,6 @@ fn estimate_prompt(prompt: &prompt::Prompt, schema: &serde_json::Value) -> u64 {
         + estimate_tokens(&schema.to_string())
 }
 
-fn severity_word(severity: crate::config::Severity) -> &'static str {
-    match severity {
-        crate::config::Severity::Blocker => "blocker",
-        crate::config::Severity::Warning => "warning",
-        crate::config::Severity::Note => "note",
-    }
-}
-
 fn skip_notice(
     input: &PipelineInput,
     gate: &BudgetGate,
@@ -1807,7 +1799,7 @@ fn render_violations(violations: &[findings::Finding]) -> String {
     for violation in violations {
         out.push_str(&format!(
             "- **[{}]** `{}`: {}\n",
-            severity_word(violation.severity),
+            violation.severity.name(),
             violation.file,
             violation.message
         ));

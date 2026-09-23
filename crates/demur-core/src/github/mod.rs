@@ -629,9 +629,9 @@ impl GitHubClient {
         Ok(user.login)
     }
 
-    /// Submit one review event with a body and inline comments. Returns
-    /// false when the identity may not submit approvals, in which case the
-    /// caller falls back to a comment review.
+    /// Submit one review event with a body and inline comments. A refusal
+    /// of the event itself surfaces as `GitHubError::Refused`, so the
+    /// caller can fall back to a comment review without losing the body.
     pub async fn create_review(
         &self,
         number: u64,

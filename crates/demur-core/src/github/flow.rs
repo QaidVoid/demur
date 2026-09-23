@@ -81,7 +81,6 @@ pub async fn review_pull_request(
         repo_root: std::env::current_dir().ok(),
     };
 
-    // Run the pipeline.
     let outcome = crate::pipeline::run(registry, config, &input).await;
     let review = match outcome {
         Ok(RunOutcome::Review(review)) => *review,
@@ -571,12 +570,12 @@ fn anchored_lines(ingestion: &crate::ingest::Ingestion, path: &str) -> Option<BT
 }
 
 fn render_comment(finding: &Finding, fingerprint: &str) -> String {
-    let severity = match finding.severity {
-        crate::config::Severity::Blocker => "blocker",
-        crate::config::Severity::Warning => "warning",
-        crate::config::Severity::Note => "note",
-    };
-    let mut body = format!("**[{severity}]** {}\n\n{}\n", finding.message, finding.harm);
+    let mut body = format!(
+        "**[{}]** {}\n\n{}\n",
+        finding.severity.name(),
+        finding.message,
+        finding.harm
+    );
     if let Some(suggestion) = &finding.suggestion {
         body.push_str("```suggestion\n");
         body.push_str(suggestion);

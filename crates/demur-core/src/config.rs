@@ -240,6 +240,15 @@ impl Severity {
             Severity::Blocker => 2,
         }
     }
+
+    /// The lowercase name findings render under.
+    pub fn name(self) -> &'static str {
+        match self {
+            Severity::Blocker => "blocker",
+            Severity::Warning => "warning",
+            Severity::Note => "note",
+        }
+    }
 }
 
 /// The parsed `.demur.toml` configuration.

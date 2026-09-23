@@ -230,7 +230,7 @@ impl Body<'_> {
                         };
                         body.push_str(&format!(
                             "- **[{}]** `{}`: {}{}\n",
-                            severity_name(finding.severity),
+                            finding.severity.name(),
                             finding.location(),
                             finding.message,
                             further
@@ -344,7 +344,7 @@ fn render_finding(index: usize, finding: &Finding) -> String {
     let mut out = format!(
         "{}. **[{}]** `{}`: {}\n",
         index,
-        severity_name(finding.severity),
+        finding.severity.name(),
         finding.location(),
         finding.message
     );
@@ -371,14 +371,6 @@ fn render_finding(index: usize, finding: &Finding) -> String {
         }
     }
     out
-}
-
-fn severity_name(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Blocker => "blocker",
-        Severity::Warning => "warning",
-        Severity::Note => "note",
-    }
 }
 
 #[cfg(test)]

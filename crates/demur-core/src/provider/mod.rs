@@ -380,7 +380,6 @@ pub fn redact(message: &str, secret: &str) -> String {
 /// Convert configured passthrough body fields to JSON.
 pub(crate) fn extra_body_json(
     extra: &Option<toml::Table>,
-    key: &str,
 ) -> Result<Option<BTreeMap<String, Value>>, ProviderError> {
     let Some(table) = extra else {
         return Ok(None);
@@ -392,7 +391,6 @@ pub(crate) fn extra_body_json(
         })?;
         map.insert(field.clone(), json);
     }
-    let _ = key;
     Ok(Some(map))
 }
 

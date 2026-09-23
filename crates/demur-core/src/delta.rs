@@ -11,7 +11,7 @@ use crate::pipeline::findings::Finding;
 
 /// Maximum marker size in bytes, leaving room for the review body inside
 /// GitHub's limit.
-pub const MAX_MARKER_BYTES: usize = 32_000;
+const MAX_MARKER_BYTES: usize = 32_000;
 
 /// The hidden state embedded in every published review.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -181,16 +181,6 @@ impl Marker {
             return None;
         }
         Some(marker)
-    }
-
-    /// The fingerprint strings of unresolved findings, including the
-    /// earlier fingerprints merged records still carry.
-    pub fn unresolved_fingerprints(&self) -> HashSet<String> {
-        self.findings
-            .iter()
-            .filter(|finding| finding.state == CarriedState::Unresolved)
-            .flat_map(|finding| finding.fingerprints())
-            .collect()
     }
 }
 

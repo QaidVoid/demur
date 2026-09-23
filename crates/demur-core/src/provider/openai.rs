@@ -27,7 +27,7 @@ impl OpenAiClient {
         model: &crate::config::ModelDef,
         key: String,
     ) -> Result<Self, ProviderError> {
-        let extra_body = super::extra_body_json(&provider.extra_body, &provider.key_env)?;
+        let extra_body = super::extra_body_json(&provider.extra_body)?;
         Ok(OpenAiClient {
             http: http_client(),
             base_url: provider.base_url.trim_end_matches('/').to_string(),
