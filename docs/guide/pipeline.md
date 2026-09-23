@@ -32,8 +32,11 @@ held to the same contract as every other pass.
 
 Findings are deduplicated and force ranked by the harm they argue. Anything
 missing a location or arguing no concrete harm is dropped here. Findings that
-cite the same location are then reconciled into one: a line yields one comment
-carrying every concern raised about it, and nothing is dropped in the merge.
+cite the same location are then reconciled into one, as are findings on one
+file whose ranges overlap and whose opening statements argue the same defect
+in different words, which is what two passes reporting one defect look like.
+A line yields one comment carrying every concern raised about it, and
+nothing is dropped in the merge.
 The comment budget bounds locations to read, not arguments made, and the body
 states how many locations were omitted when the budget binds.
 

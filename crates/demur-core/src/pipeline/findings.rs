@@ -243,9 +243,12 @@ pub fn prepare(mut findings: Vec<Finding>) -> Vec<Finding> {
 }
 
 /// Reconcile findings that cite the same location into one finding
-/// carrying every concern raised about it. Merges and never discards: the
-/// leading concern is the first, which is the highest-ranked, and the
-/// severity is the most severe present. Deterministic.
+/// carrying every concern raised about it, and fold near-duplicates:
+/// findings on one file whose ranges overlap and whose opening statements
+/// argue the same defect in different words are one defect reported by two
+/// passes. Merges and never discards: the leading concern is the first,
+/// which is the highest-ranked, and the severity is the most severe
+/// present. Deterministic.
 pub fn reconcile(findings: Vec<Finding>) -> Vec<Finding> {
     let mut groups: Vec<Finding> = Vec::new();
     let mut index: std::collections::HashMap<(String, u32), usize> =
@@ -270,7 +273,80 @@ pub fn reconcile(findings: Vec<Finding>) -> Vec<Finding> {
             }
         }
     }
-    groups
+    let mut folded: Vec<Finding> = Vec::new();
+    for finding in groups {
+        match folded.iter_mut().find(|lead| {
+            lead.file == finding.file
+                && ranges_overlap(lead, &finding)
+                && messages_align(&lead.message, &finding.message)
+        }) {
+            Some(lead) => {
+                if finding.severity.rank() > lead.severity.rank() {
+                    lead.severity = finding.severity;
+                }
+                lead.further_concerns.push(Concern {
+                    message: finding.message,
+                    harm: finding.harm,
+                    suggestion: finding.suggestion,
+                });
+                lead.further_concerns.extend(finding.further_concerns);
+            }
+            None => folded.push(finding),
+        }
+    }
+    folded
+}
+
+/// True when two cited ranges share at least one line.
+fn ranges_overlap(a: &Finding, b: &Finding) -> bool {
+    a.start_line <= b.end_line && b.start_line <= a.end_line
+}
+
+/// The opening statement of a message, where a finding states its defect.
+/// Two passes reporting one defect diverge later into different worked
+/// examples; their openings say the same thing.
+fn opening_statement(text: &str) -> &str {
+    match text.find(['.', '!', '?']) {
+        Some(end) => &text[..=end],
+        None => text,
+    }
+}
+
+/// Content words of a text: lowercased, punctuation split, stopwords and
+/// single letters dropped.
+fn content_tokens(text: &str) -> std::collections::HashSet<String> {
+    const STOPWORDS: &[&str] = &[
+        "the", "a", "an", "is", "are", "was", "be", "been", "to", "of", "and", "or", "in", "on",
+        "for", "with", "as", "by", "at", "from", "it", "its", "that", "this", "those", "these",
+        "not", "no", "so", "when", "then", "than", "which", "would", "could", "should", "into",
+        "onto", "all", "every", "each", "any", "also", "but",
+    ];
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .map(|word| word.to_lowercase())
+        .filter(|word| word.len() > 1 && !STOPWORDS.contains(&word.as_str()))
+        .collect()
+}
+
+/// True when the shorter opening's content words mostly appear in the
+/// longer one: the same defect claim stated twice. Measured on a real
+/// duplicate pair at 0.8 and on distinct findings at 0.0, so the
+/// threshold sits far from both.
+fn messages_align(a: &str, b: &str) -> bool {
+    const THRESHOLD: f64 = 0.6;
+    let (left, right) = (
+        content_tokens(opening_statement(a)),
+        content_tokens(opening_statement(b)),
+    );
+    let (small, large) = if left.len() <= right.len() {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    if small.is_empty() {
+        return false;
+    }
+    let shared = small.iter().filter(|word| large.contains(*word)).count();
+    shared as f64 / small.len() as f64 >= THRESHOLD
 }
 
 #[cfg(test)]
@@ -358,6 +434,101 @@ mod tests {
         ];
         let deduped = dedupe(findings);
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn paraphrased_findings_on_overlapping_ranges_merge() {
+        let mut lead = raw();
+        lead.start_line = 78;
+        lead.end_line = 94;
+        lead.message = "The mappings are built from each schema name alone. Nothing checks \
+whether oldResource is also the live canonical resource of a different schema. \
+The plan would move every policy to the wrong schema."
+            .to_string();
+        lead.harm = "Policies land on a schema nobody authorized, invisible in the dry \
+run."
+            .to_string();
+        lead.suggestion =
+            Some("Build the set of canonical slugs first and refuse conflicts.".into());
+        let mut echo = raw();
+        echo.start_line = 75;
+        echo.end_line = 123;
+        echo.message = "Mappings are built from each schema's legacy slug alone, with no \
+check that the legacy resource belongs to a different schema. The plan moves \
+policies onto another schema and the dry run labels it an ordinary move."
+            .to_string();
+        echo.harm = "The target schema gains rules nobody wrote and the source loses the \
+rules it was enforced by."
+            .to_string();
+        let prepared = prepare(vec![
+            validate(&lead, &paths()).unwrap(),
+            validate(&echo, &paths()).unwrap(),
+        ]);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].further_concerns.len(), 1);
+        assert_eq!(prepared[0].suggestion, lead.suggestion);
+    }
+
+    #[test]
+    fn overlapping_findings_with_distinct_defects_stay_separate() {
+        let mut logged = raw();
+        logged.start_line = 40;
+        logged.end_line = 44;
+        logged.message = "The issued token is logged at info level. Merging ships live \
+credentials to the log sink where anyone with read access can replay them."
+            .to_string();
+        let mut migration = raw();
+        migration.start_line = 41;
+        migration.end_line = 49;
+        migration.message = "The migration adds an index with no down migration. A failed \
+deploy cannot be rolled back without manual database surgery."
+            .to_string();
+        let prepared = prepare(vec![
+            validate(&logged, &paths()).unwrap(),
+            validate(&migration, &paths()).unwrap(),
+        ]);
+        assert_eq!(prepared.len(), 2);
+    }
+
+    #[test]
+    fn one_defect_on_disjoint_ranges_stays_separate() {
+        let mut first = raw();
+        first.start_line = 10;
+        first.end_line = 20;
+        let mut second = raw();
+        second.start_line = 100;
+        second.end_line = 200;
+        second.message = "The mappings are built from each schema name alone, and nothing \
+checks whether the resource is canonical somewhere else."
+            .to_string();
+        let prepared = prepare(vec![
+            validate(&first, &paths()).unwrap(),
+            validate(&second, &paths()).unwrap(),
+        ]);
+        assert_eq!(prepared.len(), 2);
+    }
+
+    #[test]
+    fn folding_flattens_the_echoed_concerns() {
+        let mut lead = raw();
+        lead.message = "The mapping table is rebuilt without a transaction. A failed run \
+leaves the tenant half migrated."
+            .to_string();
+        let mut echo = raw();
+        echo.start_line = 3;
+        echo.end_line = 30;
+        echo.message = "The mapping table is rebuilt without a transaction. A failed run \
+leaves half the mappings applied and the tenant broken."
+            .to_string();
+        let mut echo = validate(&echo, &paths()).unwrap();
+        echo.further_concerns = vec![Concern {
+            message: "the rebuild also runs per tenant".to_string(),
+            harm: "one bad tenant stops every later one.".to_string(),
+            suggestion: None,
+        }];
+        let prepared = prepare(vec![validate(&lead, &paths()).unwrap(), echo]);
+        assert_eq!(prepared.len(), 1);
+        assert_eq!(prepared[0].further_concerns.len(), 2);
     }
 
     #[test]
